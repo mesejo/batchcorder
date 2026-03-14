@@ -158,6 +158,25 @@ def test_c_stream_replays_from_start_each_call(tmp_path):
     assert pa.RecordBatchReader.from_stream(ds).read_all().equals(table)
 
 
+def test_source_reader_advances_as_dataset_ingests(tmp_path):
+    # CachedDataset owns the source reader and pulls from it during ingestion.
+    # Reading via a from_stream wrapper advances the source reader position.
+    table = _make_table(n_batches=4, rows_per_batch=3)
+    reader = table.to_reader(max_chunksize=3)
+    ds = CachedDataset(
+        reader,
+        memory_capacity=16 * 1024 * 1024,
+        disk_path=str(tmp_path),
+        disk_capacity=64 * 1024 * 1024,
+    )
+    wrapper = pa.RecordBatchReader.from_stream(ds)
+    first = wrapper.read_next_batch()
+    assert first.equals(table.slice(0, 3).to_batches()[0])
+    # The source reader has been advanced past the batch the dataset consumed.
+    second = reader.read_next_batch()
+    assert second.equals(table.slice(3, 3).to_batches()[0])
+
+
 # ── reader lifecycle ──────────────────────────────────────────────────────────
 
 def test_reader_closed_after_c_stream_export(tmp_path):
