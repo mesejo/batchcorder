@@ -1,9 +1,13 @@
 """DuckDB self-join integration test for CachedDataset.
 
 Validates the core value proposition: a single upstream RecordBatchReader
-can be wrapped once in a CachedDataset, and two independent reader handles
-can be registered as separate DuckDB virtual tables — each replaying the
-same cached data without re-draining the source.
+wrapped in a CachedDataset can be registered as one DuckDB virtual table
+and self-joined — DuckDB calls __arrow_c_stream__ once per table scan, and
+each call replays the cached data without re-draining the source.
+
+The TestBareReaderFailure class documents the silent correctness bug that
+occurs without CachedDataset: the first scan exhausts the stream, the second
+scan sees nothing, and the join silently returns zero rows.
 """
 
 import pyarrow as pa
@@ -40,7 +44,7 @@ class CountingReader:
         return reader.__arrow_c_stream__(requested_schema)
 
 
-# ── fixture ───────────────────────────────────────────────────────────────────
+# ── fixtures / shared data ────────────────────────────────────────────────────
 
 SCHEMA = pa.schema([
     ("id", pa.int64()),
@@ -66,7 +70,7 @@ TOTAL_BATCHES = len(BATCHES)  # 2
 
 @pytest.fixture()
 def employee_dataset(tmp_path):
-    """Yield a (CachedDataset, CountingReader) pair backed by the employee data."""
+    """Return a (CachedDataset, CountingReader) pair backed by the employee data."""
     source = CountingReader(BATCHES, SCHEMA)
     ds = CachedDataset(
         source,
@@ -80,18 +84,24 @@ def employee_dataset(tmp_path):
 # ── tests ─────────────────────────────────────────────────────────────────────
 
 class TestDuckDBSelfJoin:
+    """Self-join against a single registered CachedDataset table.
+
+    The CachedDataset is registered once under the name ``employees``.
+    DuckDB calls ``__arrow_c_stream__`` on it for each side of the join;
+    each call returns a fresh reader replaying from the cache.
+    """
+
     def test_self_join_results(self, employee_dataset):
         """The self-join resolves each employee's manager name correctly."""
         ds, _ = employee_dataset
 
         con = duckdb.connect()
-        con.register("employees", ds.reader())
-        con.register("managers", ds.reader())
+        con.register("employees", ds)
 
         rows = con.execute("""
             SELECT e.name AS employee, m.name AS manager
             FROM employees e
-            JOIN managers m ON e.manager_id = m.id
+            JOIN employees m ON e.manager_id = m.id
             ORDER BY e.name
         """).fetchall()
 
@@ -104,7 +114,7 @@ class TestDuckDBSelfJoin:
         ]
 
     def test_source_consumed_exactly_once(self, employee_dataset):
-        """The upstream reader is drained only once regardless of reader count.
+        """The upstream reader is drained only once regardless of scan count.
 
         Uses both the CountingReader wrapper (batch-level) and the dataset's
         built-in ``ingested_count`` property to verify this from two angles.
@@ -112,17 +122,16 @@ class TestDuckDBSelfJoin:
         ds, source = employee_dataset
 
         con = duckdb.connect()
-        con.register("employees", ds.reader())
-        con.register("managers", ds.reader())
+        con.register("employees", ds)
 
         con.execute("""
             SELECT e.name, m.name
             FROM employees e
-            JOIN managers m ON e.manager_id = m.id
+            JOIN employees m ON e.manager_id = m.id
         """).fetchall()
 
         # The counting wrapper proves the upstream generator was iterated
-        # exactly TOTAL_BATCHES times — not 2× for each reader.
+        # exactly TOTAL_BATCHES times — not once per DuckDB table scan.
         assert source.batches_read == TOTAL_BATCHES, (
             f"Expected upstream to be read {TOTAL_BATCHES} times, "
             f"got {source.batches_read}"
@@ -137,15 +146,14 @@ class TestDuckDBSelfJoin:
         ds, _ = employee_dataset
 
         con = duckdb.connect()
-        con.register("employees", ds.reader())
-        con.register("managers", ds.reader())
+        con.register("employees", ds)
 
         employees_in_result = [
             row[0]
             for row in con.execute("""
                 SELECT e.name
                 FROM employees e
-                JOIN managers m ON e.manager_id = m.id
+                JOIN employees m ON e.manager_id = m.id
             """).fetchall()
         ]
 
@@ -156,15 +164,14 @@ class TestDuckDBSelfJoin:
         ds, _ = employee_dataset
 
         con = duckdb.connect()
-        con.register("employees", ds.reader())
-        con.register("managers", ds.reader())
+        con.register("employees", ds)
 
         result_names = {
             row[0]
             for row in con.execute("""
                 SELECT e.name
                 FROM employees e
-                JOIN managers m ON e.manager_id = m.id
+                JOIN employees m ON e.manager_id = m.id
             """).fetchall()
         }
 
@@ -175,33 +182,32 @@ class TestBareReaderFailure:
     """Documents the failure mode that CachedDataset is designed to prevent.
 
     A bare ``pa.RecordBatchReader`` is a single-use stream: once DuckDB scans
-    it for the first virtual table, it is exhausted.  The second virtual table
+    it for the first side of the join, it is exhausted.  The second side
     therefore sees zero rows, and the join silently returns no results — a
     correctness bug that is easy to miss because no exception is raised.
     """
 
     def test_bare_reader_self_join_returns_empty(self):
-        """Registering the same RecordBatchReader twice yields 0 join rows.
+        """Registering a bare RecordBatchReader and self-joining it yields 0 rows.
 
-        DuckDB scans ``employees`` first, draining the stream entirely.
-        When it then scans ``managers``, the reader is already exhausted so
-        the join finds no matching rows on either side.
+        DuckDB calls ``__arrow_c_stream__`` for each side of the join.  The
+        first call drains the stream; the second call returns an already-
+        exhausted reader, so the join finds no matching rows on either side.
         """
         reader = pa.RecordBatchReader.from_batches(SCHEMA, iter(BATCHES))
 
         con = duckdb.connect()
         con.register("employees", reader)
-        con.register("managers", reader)
 
         rows = con.execute("""
             SELECT e.name AS employee, m.name AS manager
             FROM employees e
-            JOIN managers m ON e.manager_id = m.id
+            JOIN employees m ON e.manager_id = m.id
             ORDER BY e.name
         """).fetchall()
 
         # Contrast with the 5-row result produced by CachedDataset.
         assert rows == [], (
-            "Expected the bare-reader join to return no rows because the "
-            "stream is exhausted after the first scan, but got: {rows!r}"
+            f"Expected the bare-reader join to return no rows because the "
+            f"stream is exhausted after the first scan, but got: {rows!r}"
         )
