@@ -4,19 +4,20 @@ import threading
 
 import pyarrow as pa
 import pytest
-
-from multirecord import CachedDataset
-
+from batchcorder import CachedDataset
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
+
 def _make_table(n_batches: int = 4, rows_per_batch: int = 3) -> pa.Table:
     n = n_batches * rows_per_batch
-    return pa.table({
-        "id":    list(range(n)),
-        "value": [float(i) * 1.5 for i in range(n)],
-        "label": [f"row_{i}" for i in range(n)],
-    })
+    return pa.table(
+        {
+            "id": list(range(n)),
+            "value": [float(i) * 1.5 for i in range(n)],
+            "label": [f"row_{i}" for i in range(n)],
+        }
+    )
 
 
 def _dataset(tmp_path, table=None, batch_size=3, mem_mb=16, disk_mb=64):
@@ -34,10 +35,12 @@ def _schema_from_capsule(capsule) -> pa.Schema:
     class _Wrap:
         def __arrow_c_schema__(self):
             return capsule
+
     return pa.schema(_Wrap())
 
 
 # ── construction ──────────────────────────────────────────────────────────────
+
 
 def test_basic_construction(tmp_path):
     assert _dataset(tmp_path) is not None
@@ -63,6 +66,7 @@ def test_upstream_not_exhausted_initially(tmp_path):
 
 # ── schema ────────────────────────────────────────────────────────────────────
 
+
 def test_schema_via_c_schema_capsule(tmp_path):
     table = _make_table()
     schema = _schema_from_capsule(_dataset(tmp_path, table).__arrow_c_schema__())
@@ -81,9 +85,12 @@ def test_reader_schema_matches_dataset(tmp_path):
 
 # ── data integrity ────────────────────────────────────────────────────────────
 
+
 def test_reader_returns_correct_data(tmp_path):
     table = _make_table(n_batches=4, rows_per_batch=3)
-    result = pa.RecordBatchReader.from_stream(_dataset(tmp_path, table).reader()).read_all()
+    result = pa.RecordBatchReader.from_stream(
+        _dataset(tmp_path, table).reader()
+    ).read_all()
     assert result.equals(table)
 
 
@@ -95,13 +102,17 @@ def test_dataset_c_stream_returns_correct_data(tmp_path):
 
 def test_single_batch(tmp_path):
     table = pa.table({"x": [1, 2, 3]})
-    result = pa.RecordBatchReader.from_stream(_dataset(tmp_path, table, batch_size=100)).read_all()
+    result = pa.RecordBatchReader.from_stream(
+        _dataset(tmp_path, table, batch_size=100)
+    ).read_all()
     assert result.equals(table)
 
 
 def test_many_small_batches(tmp_path):
     table = _make_table(n_batches=20, rows_per_batch=1)
-    result = pa.RecordBatchReader.from_stream(_dataset(tmp_path, table, batch_size=1)).read_all()
+    result = pa.RecordBatchReader.from_stream(
+        _dataset(tmp_path, table, batch_size=1)
+    ).read_all()
     assert result.equals(table)
 
 
@@ -113,27 +124,34 @@ def test_empty_table(tmp_path):
 
 
 def test_various_dtypes(tmp_path):
-    table = pa.table({
-        "i32":  pa.array([1, 2, 3],              type=pa.int32()),
-        "f64":  pa.array([1.0, 2.0, 3.0],        type=pa.float64()),
-        "utf8": pa.array(["a", "b", "c"],         type=pa.string()),
-        "bool": pa.array([True, False, True],      type=pa.bool_()),
-        "bin":  pa.array([b"x", b"y", b"z"],      type=pa.binary()),
-    })
+    table = pa.table(
+        {
+            "i32": pa.array([1, 2, 3], type=pa.int32()),
+            "f64": pa.array([1.0, 2.0, 3.0], type=pa.float64()),
+            "utf8": pa.array(["a", "b", "c"], type=pa.string()),
+            "bool": pa.array([True, False, True], type=pa.bool_()),
+            "bin": pa.array([b"x", b"y", b"z"], type=pa.binary()),
+        }
+    )
     result = pa.RecordBatchReader.from_stream(_dataset(tmp_path, table)).read_all()
     assert result.equals(table)
 
 
 def test_nullable_columns(tmp_path):
-    table = pa.table({
-        "x": pa.array([1, None, 3], type=pa.int64()),
-        "y": pa.array(["a", None, "c"], type=pa.string()),
-    })
-    result = pa.RecordBatchReader.from_stream(_dataset(tmp_path, table, batch_size=2)).read_all()
+    table = pa.table(
+        {
+            "x": pa.array([1, None, 3], type=pa.int64()),
+            "y": pa.array(["a", None, "c"], type=pa.string()),
+        }
+    )
+    result = pa.RecordBatchReader.from_stream(
+        _dataset(tmp_path, table, batch_size=2)
+    ).read_all()
     assert result.equals(table)
 
 
 # ── multiple readers ──────────────────────────────────────────────────────────
+
 
 def test_two_readers_return_same_data(tmp_path):
     table = _make_table(n_batches=4, rows_per_batch=3)
@@ -195,6 +213,7 @@ def test_source_reader_advances_as_dataset_ingests(tmp_path):
 
 # ── reader lifecycle ──────────────────────────────────────────────────────────
 
+
 def test_reader_closed_after_c_stream_export(tmp_path):
     ds = _dataset(tmp_path)
     r = ds.reader()
@@ -221,18 +240,28 @@ def test_reader_c_schema_raises_after_consumed(tmp_path):
 
 # ── frontier reader ───────────────────────────────────────────────────────────
 
+
 def test_frontier_reader_empty_after_full_ingest(tmp_path):
     table = _make_table(n_batches=4, rows_per_batch=3)
     ds = _dataset(tmp_path, table)
     ds.ingest_all()
-    assert pa.RecordBatchReader.from_stream(ds.reader(from_start=False)).read_all().num_rows == 0
+    assert (
+        pa.RecordBatchReader.from_stream(ds.reader(from_start=False))
+        .read_all()
+        .num_rows
+        == 0
+    )
 
 
 def test_from_start_replay_after_full_ingest(tmp_path):
     table = _make_table(n_batches=4, rows_per_batch=3)
     ds = _dataset(tmp_path, table)
     ds.ingest_all()
-    assert pa.RecordBatchReader.from_stream(ds.reader(from_start=True)).read_all().equals(table)
+    assert (
+        pa.RecordBatchReader.from_stream(ds.reader(from_start=True))
+        .read_all()
+        .equals(table)
+    )
 
 
 def test_frontier_reader_mid_stream(tmp_path):
@@ -248,8 +277,14 @@ def test_frontier_reader_mid_stream(tmp_path):
 
 # ── ingestion ─────────────────────────────────────────────────────────────────
 
+
 def test_ingest_all_returns_batch_count(tmp_path):
-    assert _dataset(tmp_path, _make_table(n_batches=5, rows_per_batch=2), batch_size=2).ingest_all() == 5
+    assert (
+        _dataset(
+            tmp_path, _make_table(n_batches=5, rows_per_batch=2), batch_size=2
+        ).ingest_all()
+        == 5
+    )
 
 
 def test_ingested_count_increments_lazily(tmp_path):
@@ -273,6 +308,7 @@ def test_ingest_all_idempotent(tmp_path):
 
 
 # ── threading ─────────────────────────────────────────────────────────────────
+
 
 def test_concurrent_readers(tmp_path):
     table = _make_table(n_batches=8, rows_per_batch=5)

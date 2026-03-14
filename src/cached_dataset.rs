@@ -219,7 +219,7 @@ impl Drop for CachedDatasetReaderImpl {
 /// The inner reader is wrapped in `Mutex<Option<…>>` following the arro3
 /// pattern: it can be consumed once (by `__arrow_c_stream__`) and is marked
 /// closed afterwards.
-#[pyclass(module = "multirecord", name = "CachedDatasetReader", frozen)]
+#[pyclass(module = "batchcorder", name = "CachedDatasetReader", frozen)]
 pub struct PyCachedDatasetReader(Mutex<Option<CachedDatasetReaderImpl>>);
 
 impl PyCachedDatasetReader {
@@ -341,7 +341,7 @@ impl PyCachedDatasetReader {
 /// r1 = ds.reader()
 /// r2 = ds.reader()
 /// ```
-#[pyclass(module = "multirecord", name = "CachedDataset", frozen)]
+#[pyclass(module = "batchcorder", name = "CachedDataset", frozen)]
 pub struct PyCachedDataset {
     /// Arrow schema stored outside the cache for O(1) access.
     schema: SchemaRef,

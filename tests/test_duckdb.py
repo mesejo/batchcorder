@@ -5,25 +5,33 @@ Each test asserts both sides of the same scenario:
   - A bare pa.RecordBatchReader fails silently (the motivating failure)
 """
 
-import pyarrow as pa
 import duckdb
-
-from multirecord import CachedDataset
-
+import pyarrow as pa
+from batchcorder import CachedDataset
 
 # ── shared data ───────────────────────────────────────────────────────────────
 
-EMPLOYEE_SCHEMA = pa.schema([
-    ("id",         pa.int64()),
-    ("name",       pa.string()),
-    ("manager_id", pa.int64()),  # null for root employees
-])
+EMPLOYEE_SCHEMA = pa.schema(
+    [
+        ("id", pa.int64()),
+        ("name", pa.string()),
+        ("manager_id", pa.int64()),  # null for root employees
+    ]
+)
 
 EMPLOYEE_BATCHES = [
-    pa.record_batch({"id": [1, 2, 3], "name": ["Alice", "Bob",   "Carol"],
-                     "manager_id": [None, 1, 1]}, schema=EMPLOYEE_SCHEMA),
-    pa.record_batch({"id": [4, 5, 6], "name": ["Dave",  "Eve",   "Frank"],
-                     "manager_id": [2, 2, 3]},    schema=EMPLOYEE_SCHEMA),
+    pa.record_batch(
+        {
+            "id": [1, 2, 3],
+            "name": ["Alice", "Bob", "Carol"],
+            "manager_id": [None, 1, 1],
+        },
+        schema=EMPLOYEE_SCHEMA,
+    ),
+    pa.record_batch(
+        {"id": [4, 5, 6], "name": ["Dave", "Eve", "Frank"], "manager_id": [2, 2, 3]},
+        schema=EMPLOYEE_SCHEMA,
+    ),
 ]
 
 LARGE_SCHEMA = pa.schema([("id", pa.int64()), ("value", pa.float64())])
@@ -34,10 +42,20 @@ LARGE_TOTAL_ROWS = LARGE_ROWS_PER_BATCH * LARGE_TOTAL_BATCHES  # 1 000
 
 def _large_batches() -> list[pa.RecordBatch]:
     return [
-        pa.record_batch({
-            "id":    list(range(i * LARGE_ROWS_PER_BATCH, (i + 1) * LARGE_ROWS_PER_BATCH)),
-            "value": [float(j) for j in range(i * LARGE_ROWS_PER_BATCH, (i + 1) * LARGE_ROWS_PER_BATCH)],
-        }, schema=LARGE_SCHEMA)
+        pa.record_batch(
+            {
+                "id": list(
+                    range(i * LARGE_ROWS_PER_BATCH, (i + 1) * LARGE_ROWS_PER_BATCH)
+                ),
+                "value": [
+                    float(j)
+                    for j in range(
+                        i * LARGE_ROWS_PER_BATCH, (i + 1) * LARGE_ROWS_PER_BATCH
+                    )
+                ],
+            },
+            schema=LARGE_SCHEMA,
+        )
         for i in range(LARGE_TOTAL_BATCHES)
     ]
 
@@ -59,10 +77,14 @@ class CountingReader:
             for batch in self._batches:
                 self.batches_read += 1
                 yield batch
-        return pa.RecordBatchReader.from_batches(self._schema, _gen()).__arrow_c_stream__(requested_schema)
+
+        return pa.RecordBatchReader.from_batches(
+            self._schema, _gen()
+        ).__arrow_c_stream__(requested_schema)
 
 
 # ── self-join ─────────────────────────────────────────────────────────────────
+
 
 def test_self_join(tmp_path):
     """CachedDataset: self-join returns the correct manager mapping.
@@ -87,10 +109,10 @@ def test_self_join(tmp_path):
 
     # CachedDataset: correct result
     assert rows == [
-        ("Bob",   "Alice"),
+        ("Bob", "Alice"),
         ("Carol", "Alice"),
-        ("Dave",  "Bob"),
-        ("Eve",   "Bob"),
+        ("Dave", "Bob"),
+        ("Eve", "Bob"),
         ("Frank", "Carol"),
     ]
     assert "Alice" not in {r[0] for r in rows}  # root employee excluded
@@ -116,6 +138,7 @@ def test_self_join(tmp_path):
 
 
 # ── partial consumption under LIMIT ──────────────────────────────────────────
+
 
 def test_limit_does_not_exhaust_upstream(tmp_path):
     """CachedDataset: a LIMIT query leaves the upstream open for further reads.

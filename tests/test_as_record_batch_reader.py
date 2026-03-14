@@ -10,12 +10,10 @@ import io
 import arro3.core as ac
 import pyarrow as pa
 import pyarrow.ipc
-import pytest
-
-from multirecord import CachedDataset
-
+from batchcorder import CachedDataset
 
 # ── helpers ───────────────────────────────────────────────────────────────────
+
 
 def _ds(tmp_path, table, batch_size=3):
     return CachedDataset(
@@ -26,13 +24,16 @@ def _ds(tmp_path, table, batch_size=3):
     )
 
 
-TABLE = pa.table({
-    "id":    pa.array([1, 2, 3, 4, 5, 6], type=pa.int64()),
-    "label": pa.array(["a", "b", "c", "d", "e", "f"], type=pa.utf8()),
-})
+TABLE = pa.table(
+    {
+        "id": pa.array([1, 2, 3, 4, 5, 6], type=pa.int64()),
+        "label": pa.array(["a", "b", "c", "d", "e", "f"], type=pa.utf8()),
+    }
+)
 
 
 # ── pa.table() constructor ────────────────────────────────────────────────────
+
 
 def test_pa_table_from_dataset(tmp_path):
     """pa.table(ds) should materialise all rows correctly."""
@@ -45,6 +46,7 @@ def test_pa_table_from_reader(tmp_path):
 
 
 # ── pa.RecordBatchReader interop ──────────────────────────────────────────────
+
 
 def test_pa_record_batch_reader_from_stream_dataset(tmp_path):
     """`pa.RecordBatchReader.from_stream` accepts CachedDataset directly."""
@@ -70,6 +72,7 @@ def test_batch_iteration_yields_correct_batches(tmp_path):
 
 # ── schema metadata preservation ─────────────────────────────────────────────
 
+
 def test_schema_metadata_preserved_through_cache(tmp_path):
     """Schema metadata survives the IPC serialisation round-trip inside the cache."""
     metadata = {b"author": b"test", b"version": b"1"}
@@ -90,6 +93,7 @@ def test_schema_metadata_preserved_through_reader(tmp_path):
 
 # ── requested_schema (C stream protocol type casting) ────────────────────────
 
+
 def test_requested_schema_casts_column_type_on_dataset(tmp_path):
     """Passing a requested_schema to __arrow_c_stream__ triggers a cast.
 
@@ -98,10 +102,12 @@ def test_requested_schema_casts_column_type_on_dataset(tmp_path):
     transparently.
     """
     ds = _ds(tmp_path, TABLE)
-    requested = pa.schema([
-        pa.field("id",    pa.int64()),
-        pa.field("label", pa.large_utf8()),
-    ])
+    requested = pa.schema(
+        [
+            pa.field("id", pa.int64()),
+            pa.field("label", pa.large_utf8()),
+        ]
+    )
     result = pa.RecordBatchReader.from_stream(ds, schema=requested).read_all()
     assert result.schema.field("label").type == pa.large_utf8()
     assert result.column("label").to_pylist() == TABLE.column("label").to_pylist()
@@ -110,15 +116,18 @@ def test_requested_schema_casts_column_type_on_dataset(tmp_path):
 def test_requested_schema_casts_column_type_on_reader(tmp_path):
     """Same requested_schema negotiation works on a CachedDatasetReader."""
     r = _ds(tmp_path, TABLE).reader()
-    requested = pa.schema([
-        pa.field("id",    pa.int64()),
-        pa.field("label", pa.large_utf8()),
-    ])
+    requested = pa.schema(
+        [
+            pa.field("id", pa.int64()),
+            pa.field("label", pa.large_utf8()),
+        ]
+    )
     result = pa.RecordBatchReader.from_stream(r, schema=requested).read_all()
     assert result.schema.field("label").type == pa.large_utf8()
 
 
 # ── IPC round-trip ────────────────────────────────────────────────────────────
+
 
 def test_ipc_stream_round_trip_dataset(tmp_path):
     """CachedDataset can be piped into an IPC stream writer and read back."""
@@ -144,6 +153,7 @@ def test_ipc_stream_round_trip_reader(tmp_path):
 
 # ── arro3 interop ─────────────────────────────────────────────────────────────
 
+
 def test_arro3_from_stream_dataset(tmp_path):
     """`arro3.core.RecordBatchReader.from_stream` accepts CachedDataset."""
     arro3_reader = ac.RecordBatchReader.from_stream(_ds(tmp_path, TABLE))
@@ -162,4 +172,7 @@ def test_arro3_schema_metadata_preserved(tmp_path):
     table = TABLE.replace_schema_metadata(metadata)
 
     arro3_reader = ac.RecordBatchReader.from_stream(_ds(tmp_path, table))
-    assert pa.RecordBatchReader.from_stream(arro3_reader).read_all().schema.metadata == metadata
+    assert (
+        pa.RecordBatchReader.from_stream(arro3_reader).read_all().schema.metadata
+        == metadata
+    )

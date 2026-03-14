@@ -3,7 +3,7 @@ requires = ["maturin>=1.7,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "multirecord"
+name = "batchcorder"
 requires-python = ">=3.8"
 classifiers = [
     "Programming Language :: Rust",
@@ -11,13 +11,35 @@ classifiers = [
     "Programming Language :: Python :: Implementation :: PyPy",
 ]
 dynamic = ["version"]
-[project.optional-dependencies]
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+
+[dependency-groups]
 dev = [
     "pyarrow>=14",
     "arro3-core>=0.4",
     "pytest>=8",
     "duckdb>=1.0",
+    "ruff>=0.15.6",
 ]
 
-[tool.maturin]
-features = ["pyo3/extension-module"]
+[tool.ruff.lint]
+extend-select = [
+    "I",      # isort
+    "ICN",    # import conventions
+    "B",      # flake8-bugbear: mutable default args, exception chaining, etc.
+    "C4",     # flake8-comprehensions: unnecessary list/dict/set comprehensions
+    "FURB",   # refurb: modernize Python code
+    "PLC0415",  # import-outside-toplevel: imports must be at module level
+]
+ignore = [
+    "B018",  # useless-expression: side-effect property access is intentional
+    "B019",  # cached-instance-method: @cache on methods is intentional
+    "B905",  # zip-without-explicit-strict: not enforced project-wide
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["batchcorder"]
+section-order = ["future", "standard-library", "third-party", "first-party", "local-folder"]
+lines-after-imports = 2
