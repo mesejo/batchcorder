@@ -158,6 +158,22 @@ def test_c_stream_replays_from_start_each_call(tmp_path):
     assert pa.RecordBatchReader.from_stream(ds).read_all().equals(table)
 
 
+def test_dataset_iterable(tmp_path):
+    table = _make_table(n_batches=4, rows_per_batch=3)
+    ds = _dataset(tmp_path, table)
+    batches = list(ds)
+    assert len(batches) == 4
+    assert sum(b.num_rows for b in batches) == table.num_rows
+
+
+def test_reader_iterable(tmp_path):
+    table = _make_table(n_batches=4, rows_per_batch=3)
+    ds = _dataset(tmp_path, table)
+    batches = list(ds.reader())
+    assert len(batches) == 4
+    assert sum(b.num_rows for b in batches) == table.num_rows
+
+
 def test_source_reader_advances_as_dataset_ingests(tmp_path):
     # CachedDataset owns the source reader and pulls from it during ingestion.
     # Reading via a from_stream wrapper advances the source reader position.

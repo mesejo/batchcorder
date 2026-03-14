@@ -31,7 +31,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyCapsule;
 use pyo3_arrow::error::{PyArrowError, PyArrowResult};
 use pyo3_arrow::ffi::{to_schema_pycapsule, to_stream_pycapsule, ArrayIterator};
-use pyo3_arrow::export::Arro3Schema;
+use pyo3_arrow::export::{Arro3RecordBatch, Arro3Schema};
 use pyo3_arrow::{PyRecordBatchReader, PySchema};
 use tokio::runtime::Runtime;
 
@@ -292,6 +292,23 @@ impl PyCachedDatasetReader {
     fn closed(&self) -> bool {
         self.0.lock().unwrap().is_none()
     }
+
+    fn __iter__(slf: Py<Self>) -> Py<Self> {
+        slf
+    }
+
+    fn __next__(&self) -> PyArrowResult<Option<Arro3RecordBatch>> {
+        let mut guard = self.0.lock().unwrap();
+        let impl_ = match guard.as_mut() {
+            None => return Err(PyArrowError::PyErr(PyIOError::new_err("Reader already consumed"))),
+            Some(r) => r,
+        };
+        match impl_.next() {
+            None => Ok(None),
+            Some(Err(e)) => Err(PyArrowError::ArrowError(e)),
+            Some(Ok(batch)) => Ok(Some(Arro3RecordBatch::from(batch))),
+        }
+    }
 }
 
 // ── PyCachedDataset ──────────────────────────────────────────────────────────
@@ -438,6 +455,13 @@ impl PyCachedDataset {
             consumer_id,
             runtime: self.runtime.clone(),
         }))
+    }
+
+    /// Iterate over this dataset's batches from the start.
+    ///
+    /// Creates a fresh reader at batch 0 and returns it as the iterator.
+    pub fn __iter__(&self) -> PyResult<PyCachedDatasetReader> {
+        self.reader(true)
     }
 
     /// Export this dataset as an Arrow C Stream PyCapsule.
