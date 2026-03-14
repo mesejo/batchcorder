@@ -30,8 +30,8 @@ use pyo3::exceptions::PyIOError;
 use pyo3::prelude::*;
 use pyo3::types::PyCapsule;
 use pyo3_arrow::error::{PyArrowError, PyArrowResult};
-use pyo3_arrow::ffi::{to_schema_pycapsule, to_stream_pycapsule, ArrayIterator};
 use pyo3_arrow::export::{Arro3RecordBatch, Arro3Schema};
+use pyo3_arrow::ffi::{to_schema_pycapsule, to_stream_pycapsule, ArrayIterator};
 use pyo3_arrow::{PyRecordBatchReader, PySchema};
 use tokio::runtime::Runtime;
 
@@ -39,10 +39,7 @@ use tokio::runtime::Runtime;
 
 /// Wrap an arbitrary `Display` message as an [`ArrowError`].
 fn other_arrow_err(msg: impl std::fmt::Display) -> ArrowError {
-    ArrowError::ExternalError(Box::new(std::io::Error::new(
-        std::io::ErrorKind::Other,
-        msg.to_string(),
-    )))
+    ArrowError::ExternalError(Box::new(std::io::Error::other(msg.to_string())))
 }
 
 // ── IPC serialization ────────────────────────────────────────────────────────
@@ -54,8 +51,7 @@ fn other_arrow_err(msg: impl std::fmt::Display) -> ArrowError {
 fn serialize_batch(batch: &RecordBatch) -> Result<Vec<u8>, ArrowError> {
     let mut buf = Vec::new();
     {
-        let mut writer =
-            arrow_ipc::writer::StreamWriter::try_new(&mut buf, batch.schema_ref())?;
+        let mut writer = arrow_ipc::writer::StreamWriter::try_new(&mut buf, batch.schema_ref())?;
         writer.write(batch)?;
         writer.finish()?;
     }
@@ -153,9 +149,7 @@ impl Iterator for CachedDatasetReaderImpl {
         let cache = {
             let mut inner = match self.inner.lock() {
                 Ok(g) => g,
-                Err(e) => {
-                    return Some(Err(other_arrow_err(format!("Mutex poisoned: {e}"))))
-                }
+                Err(e) => return Some(Err(other_arrow_err(format!("Mutex poisoned: {e}")))),
             };
             match inner.ingest_up_to(&self.runtime, idx) {
                 Err(e) => return Some(Err(e)),
@@ -259,12 +253,10 @@ impl PyCachedDatasetReader {
         py: Python<'py>,
         requested_schema: Option<Bound<'py, PyCapsule>>,
     ) -> PyArrowResult<Bound<'py, PyCapsule>> {
-        let reader = self
-            .0
-            .lock()
-            .unwrap()
-            .take()
-            .ok_or_else(|| PyArrowError::PyErr(PyIOError::new_err("Reader already consumed")))?;
+        let reader =
+            self.0.lock().unwrap().take().ok_or_else(|| {
+                PyArrowError::PyErr(PyIOError::new_err("Reader already consumed"))
+            })?;
         Self::to_stream_pycapsule(py, reader, requested_schema)
     }
 
@@ -300,7 +292,11 @@ impl PyCachedDatasetReader {
     fn __next__(&self) -> PyArrowResult<Option<Arro3RecordBatch>> {
         let mut guard = self.0.lock().unwrap();
         let impl_ = match guard.as_mut() {
-            None => return Err(PyArrowError::PyErr(PyIOError::new_err("Reader already consumed"))),
+            None => {
+                return Err(PyArrowError::PyErr(PyIOError::new_err(
+                    "Reader already consumed",
+                )))
+            }
             Some(r) => r,
         };
         match impl_.next() {
@@ -398,9 +394,7 @@ impl PyCachedDataset {
                     .build()
                     .await
             })
-            .map_err(|e| {
-                PyIOError::new_err(format!("Failed to build Foyer hybrid cache: {e}"))
-            })?;
+            .map_err(|e| PyIOError::new_err(format!("Failed to build Foyer hybrid cache: {e}")))?;
 
         let inner = DatasetInner {
             cache: Arc::new(cache),
@@ -441,11 +435,7 @@ impl PyCachedDataset {
         let consumer_id = inner.next_consumer_id;
         inner.next_consumer_id += 1;
 
-        let start_index = if from_start {
-            0
-        } else {
-            inner.ingested_count
-        };
+        let start_index = if from_start { 0 } else { inner.ingested_count };
         inner.consumer_positions.insert(consumer_id, start_index);
 
         Ok(PyCachedDatasetReader::new(CachedDatasetReaderImpl {
@@ -475,9 +465,7 @@ impl PyCachedDataset {
         py: Python<'py>,
         requested_schema: Option<Bound<'py, PyCapsule>>,
     ) -> PyArrowResult<Bound<'py, PyCapsule>> {
-        let reader = self
-            .reader(true)
-            .map_err(|e| PyArrowError::PyErr(e))?;
+        let reader = self.reader(true).map_err(PyArrowError::PyErr)?;
         let impl_ = reader
             .0
             .lock()
