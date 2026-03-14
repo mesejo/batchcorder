@@ -32,9 +32,10 @@ extend-select = [
     "C4",     # flake8-comprehensions: unnecessary list/dict/set comprehensions
     "FURB",   # refurb: modernize Python code
     "PLC0415",  # import-outside-toplevel: imports must be at module level
+    "SIM",
 ]
 ignore = [
-    "B018",  # useless-expression: side-effect property access is intentional
+    "B018",  # useless-expression: side effect property access is intentional
     "B019",  # cached-instance-method: @cache on methods is intentional
     "B905",  # zip-without-explicit-strict: not enforced project-wide
 ]

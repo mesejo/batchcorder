@@ -7,7 +7,9 @@ Each test asserts both sides of the same scenario:
 
 import duckdb
 import pyarrow as pa
+
 from batchcorder import CachedDataset
+
 
 # ── shared data ───────────────────────────────────────────────────────────────
 

@@ -4,7 +4,9 @@ import threading
 
 import pyarrow as pa
 import pytest
+
 from batchcorder import CachedDataset
+
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 

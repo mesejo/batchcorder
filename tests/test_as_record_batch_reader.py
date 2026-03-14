@@ -9,8 +9,9 @@ import io
 
 import arro3.core as ac
 import pyarrow as pa
-import pyarrow.ipc
+
 from batchcorder import CachedDataset
+
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -173,6 +174,6 @@ def test_arro3_schema_metadata_preserved(tmp_path):
 
     arro3_reader = ac.RecordBatchReader.from_stream(_ds(tmp_path, table))
     assert (
-        pa.RecordBatchReader.from_stream(arro3_reader).read_all().schema.metadata
-        == metadata
+            pa.RecordBatchReader.from_stream(arro3_reader).read_all().schema.metadata
+            == metadata
     )
