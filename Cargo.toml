@@ -1,0 +1,24 @@
+[package]
+name = "multirecord"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "multirecord"
+crate-type = ["cdylib"]
+
+[dependencies]
+# Python bindings
+pyo3 = { version = "0.28", features = ["macros"] }
+pyo3-arrow = "0.17"
+
+# Arrow types and IPC serialization
+arrow-array = { version = "58", features = ["ffi"] }
+arrow-schema = "58"
+arrow-ipc = "58"
+
+# Hybrid memory+disk cache (foyer serde feature auto-implements Code for Vec<u8>, u64, etc.)
+foyer = { version = "0.22", features = ["serde"] }
+
+# Async runtime required by foyer's async API
+tokio = { version = "1", features = ["rt-multi-thread", "io-util", "time"] }
