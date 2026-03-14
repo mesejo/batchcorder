@@ -169,3 +169,39 @@ class TestDuckDBSelfJoin:
         }
 
         assert result_names == {"Bob", "Carol", "Dave", "Eve", "Frank"}
+
+
+class TestBareReaderFailure:
+    """Documents the failure mode that CachedDataset is designed to prevent.
+
+    A bare ``pa.RecordBatchReader`` is a single-use stream: once DuckDB scans
+    it for the first virtual table, it is exhausted.  The second virtual table
+    therefore sees zero rows, and the join silently returns no results — a
+    correctness bug that is easy to miss because no exception is raised.
+    """
+
+    def test_bare_reader_self_join_returns_empty(self):
+        """Registering the same RecordBatchReader twice yields 0 join rows.
+
+        DuckDB scans ``employees`` first, draining the stream entirely.
+        When it then scans ``managers``, the reader is already exhausted so
+        the join finds no matching rows on either side.
+        """
+        reader = pa.RecordBatchReader.from_batches(SCHEMA, iter(BATCHES))
+
+        con = duckdb.connect()
+        con.register("employees", reader)
+        con.register("managers", reader)
+
+        rows = con.execute("""
+            SELECT e.name AS employee, m.name AS manager
+            FROM employees e
+            JOIN managers m ON e.manager_id = m.id
+            ORDER BY e.name
+        """).fetchall()
+
+        # Contrast with the 5-row result produced by CachedDataset.
+        assert rows == [], (
+            "Expected the bare-reader join to return no rows because the "
+            "stream is exhausted after the first scan, but got: {rows!r}"
+        )
