@@ -1,14 +1,9 @@
-"""Unit tests for CachedDataset and CachedDatasetReader."""
-
 import threading
 
 import pyarrow as pa
 import pytest
 
 from batchcorder import CachedDataset
-
-
-# ── helpers ───────────────────────────────────────────────────────────────────
 
 
 def _make_table(n_batches: int = 4, rows_per_batch: int = 3) -> pa.Table:
@@ -41,9 +36,6 @@ def _schema_from_capsule(capsule) -> pa.Schema:
     return pa.schema(_Wrap())
 
 
-# ── construction ──────────────────────────────────────────────────────────────
-
-
 def test_basic_construction(tmp_path):
     assert _dataset(tmp_path) is not None
 
@@ -66,9 +58,6 @@ def test_upstream_not_exhausted_initially(tmp_path):
     assert _dataset(tmp_path).upstream_exhausted is False
 
 
-# ── schema ────────────────────────────────────────────────────────────────────
-
-
 def test_schema_via_c_schema_capsule(tmp_path):
     table = _make_table()
     schema = _schema_from_capsule(_dataset(tmp_path, table).__arrow_c_schema__())
@@ -83,9 +72,6 @@ def test_schema_property_matches_source(tmp_path):
 def test_reader_schema_matches_dataset(tmp_path):
     table = _make_table()
     assert pa.schema(_dataset(tmp_path, table).reader().schema) == table.schema
-
-
-# ── data integrity ────────────────────────────────────────────────────────────
 
 
 def test_reader_returns_correct_data(tmp_path):
@@ -152,9 +138,6 @@ def test_nullable_columns(tmp_path):
     assert result.equals(table)
 
 
-# ── multiple readers ──────────────────────────────────────────────────────────
-
-
 def test_two_readers_return_same_data(tmp_path):
     table = _make_table(n_batches=4, rows_per_batch=3)
     ds = _dataset(tmp_path, table)
@@ -213,9 +196,6 @@ def test_source_reader_advances_as_dataset_ingests(tmp_path):
     assert second.equals(table.slice(3, 3).to_batches()[0])
 
 
-# ── reader lifecycle ──────────────────────────────────────────────────────────
-
-
 def test_reader_closed_after_c_stream_export(tmp_path):
     ds = _dataset(tmp_path)
     r = ds.reader()
@@ -238,9 +218,6 @@ def test_reader_c_schema_raises_after_consumed(tmp_path):
     pa.RecordBatchReader.from_stream(r).read_all()
     with pytest.raises(Exception, match="consumed|closed"):
         r.__arrow_c_schema__()
-
-
-# ── frontier reader ───────────────────────────────────────────────────────────
 
 
 def test_frontier_reader_empty_after_full_ingest(tmp_path):
@@ -277,9 +254,6 @@ def test_frontier_reader_mid_stream(tmp_path):
     assert result.num_rows == 6  # remaining 3 batches × 2 rows
 
 
-# ── ingestion ─────────────────────────────────────────────────────────────────
-
-
 def test_ingest_all_returns_batch_count(tmp_path):
     assert (
         _dataset(
@@ -307,9 +281,6 @@ def test_ingest_all_idempotent(tmp_path):
     table = _make_table(n_batches=4, rows_per_batch=3)
     ds = _dataset(tmp_path, table)
     assert ds.ingest_all() == ds.ingest_all() == 4
-
-
-# ── threading ─────────────────────────────────────────────────────────────────
 
 
 def test_concurrent_readers(tmp_path):
