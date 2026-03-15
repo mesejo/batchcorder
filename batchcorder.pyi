@@ -16,49 +16,50 @@ class CachedDataset:
     r"""
     A hybrid memory+disk cached Arrow dataset.
 
-    Wraps an upstream Arrow stream source (any Python object implementing
-    `__arrow_c_stream__`) and stores each `RecordBatch` in a Foyer hybrid
-    cache keyed by a monotonic `u64` batch index.  Batches are ingested
-    lazily: the upstream is only read when a reader requests a batch that has
-    not been ingested yet.
+    Wraps any Arrow stream source and caches each ``RecordBatch`` in a Foyer
+    hybrid cache keyed by a monotonic batch index.  Multiple independent
+    :class:`CachedDatasetReader` handles can replay the full stream from any
+    position; the upstream source is ingested lazily on demand.
 
-    Multiple independent `CachedDatasetReader` handles can be obtained via
-    `reader()`, each starting at a configurable position.
+    Parameters
+    ----------
+    reader : object
+        Any object implementing ``__arrow_c_stream__`` (e.g.
+        :class:`pyarrow.Table`, :class:`pyarrow.RecordBatchReader`,
+        :class:`arro3.core.RecordBatchReader`).
+    memory_capacity : int
+        In-memory cache tier size in bytes.
+    disk_path : str
+        Directory for the on-disk cache tier.  Created on first use.
+    disk_capacity : int
+        On-disk cache tier size in bytes.
 
-    Example::
+    Notes
+    -----
+    Foyer may evict cache entries under memory/disk pressure.  If a batch is
+    evicted before a reader reaches it the reader raises an error.  Size both
+    tiers so they can hold all live reader positions simultaneously.
 
-        import pyarrow as pa
-        from batchcorder import CachedDataset
-
-        table = pa.table({"x": [1, 2, 3]})
-        ds = CachedDataset(table, memory_capacity=64*1024*1024,
-                          disk_path="/tmp/cache", disk_capacity=512*1024*1024)
-
-        # Use directly as an Arrow stream:
-        result = pa.RecordBatchReader.from_stream(ds).read_all()
-
-        # Or get independent replay handles:
-        r1 = ds.reader()
-        r2 = ds.reader()
+    Examples
+    --------
+    >>> import tempfile
+    >>> import pyarrow as pa
+    >>> from batchcorder import CachedDataset
+    >>> table = pa.table({"id": [1, 2, 3], "val": [0.5, 1.0, 1.5]})
+    >>> tmp = tempfile.mkdtemp()
+    >>> ds = CachedDataset(table, memory_capacity=16 << 20, disk_path=tmp, disk_capacity=64 << 20)
+    >>> pa.RecordBatchReader.from_stream(ds).read_all().equals(table)
+    True
+    >>> ds.upstream_exhausted
+    True
     """
-
     def __new__(
         cls,
         reader: typing.Any,
         memory_capacity: builtins.int,
         disk_path: builtins.str,
         disk_capacity: builtins.int,
-    ) -> CachedDataset:
-        r"""
-        Create a new `CachedDataset`.
-
-        Args:
-            reader: Any Python object implementing ``__arrow_c_stream__``
-                (e.g. a PyArrow table/reader, an arro3 RecordBatchReader, etc.)
-            memory_capacity: In-memory cache tier size in bytes.
-            disk_path: Directory in which Foyer stores the disk cache files.
-            disk_capacity: Disk cache tier size in bytes.
-        """
+    ) -> CachedDataset: ...
     @property
     def schema(self) -> arro3.core.Schema:
         r"""
@@ -67,34 +68,85 @@ class CachedDataset:
     @property
     def ingested_count(self) -> builtins.int:
         r"""
-        Number of batches ingested from the upstream so far.
+        Number of batches pulled from the upstream source so far.
+
+        Increments lazily as readers consume batches.
+
+        Returns
+        -------
+        int
         """
     @property
     def upstream_exhausted(self) -> builtins.bool:
         r"""
-        `True` if the upstream reader has been fully consumed.
+        ``True`` once the upstream source has been fully consumed.
+
+        Returns
+        -------
+        bool
         """
     def reader(self, from_start: builtins.bool = ...) -> CachedDatasetReader:
         r"""
-        Create a new `CachedDatasetReader` handle.
+        Return a new :class:`CachedDatasetReader` handle.
 
-        Args:
-            from_start: If ``True`` (default), the reader starts at batch
-                index 0 and replays the full stream.  If ``False``, the
-                reader starts at the current ingestion frontier.
+        Parameters
+        ----------
+        from_start : bool, optional
+            If ``True`` (default), the reader starts at batch 0 and replays the
+            full stream.  If ``False``, it starts at the current ingestion
+            frontier and yields only batches ingested after this call.
+
+        Returns
+        -------
+        CachedDatasetReader
+
+        Examples
+        --------
+        >>> import tempfile, pyarrow as pa
+        >>> from batchcorder import CachedDataset
+        >>> table = pa.table({"x": [1, 2, 3]})
+        >>> tmp = tempfile.mkdtemp()
+        >>> ds = CachedDataset(table, 16 << 20, tmp, 64 << 20)
+        >>> r1 = ds.reader()
+        >>> r2 = ds.reader()
+        >>> r1.closed, r2.closed
+        (False, False)
         """
     def __iter__(self) -> CachedDatasetReader:
         r"""
-        Iterate over this dataset's batches from the start.
+        Iterate over all batches from the start.
 
-        Creates a fresh reader at batch 0 and returns it as the iterator.
+        Creates a fresh :class:`CachedDatasetReader` starting at batch 0 and
+        returns it as the iterator.
+
+        Returns
+        -------
+        CachedDatasetReader
         """
     def ingest_all(self) -> builtins.int:
         r"""
-        Eagerly ingest all remaining batches from the upstream reader into the cache.
+        Eagerly ingest all batches from the upstream source into the cache.
 
-        After this call, `upstream_exhausted` is `True` and the upstream object
-        is released.  Subsequent readers will be served entirely from the cache.
+        After this call ``upstream_exhausted`` is ``True`` and the upstream
+        reference is released.  Subsequent reads are served entirely from cache.
+        Calling this method more than once is safe and idempotent.
+
+        Returns
+        -------
+        int
+            Total number of batches ingested (including any ingested previously).
+
+        Examples
+        --------
+        >>> import tempfile, pyarrow as pa
+        >>> from batchcorder import CachedDataset
+        >>> table = pa.table({"x": [1, 2, 3]})
+        >>> tmp = tempfile.mkdtemp()
+        >>> ds = CachedDataset(table, 16 << 20, tmp, 64 << 20)
+        >>> ds.ingest_all()
+        1
+        >>> ds.upstream_exhausted
+        True
         """
     def __arrow_c_stream__(self, requested_schema: typing.Any = None) -> typing.Any: ...
     def __arrow_c_schema__(self) -> typing.Any: ...
@@ -102,25 +154,30 @@ class CachedDataset:
 @typing.final
 class CachedDatasetReader:
     r"""
-    A single-use reader handle for a `CachedDataset`.
+    A single-use iterator handle for a :class:`CachedDataset`.
 
-    Maintains an independent read position.  Multiple readers backed by the
-    same dataset share the underlying cache; the upstream is ingested lazily as
-    needed.
+    Maintains an independent read position.  Multiple handles backed by the
+    same dataset share the underlying cache; the upstream source is ingested
+    lazily as needed.
 
-    The reader is consumed once exported via ``__arrow_c_stream__`` and is
-    marked closed afterwards.
+    Once consumed via ``__arrow_c_stream__`` or by exhausting iteration the
+    reader is marked closed and raises an error on further use.
+
+    Notes
+    -----
+    Obtain a handle from :meth:`CachedDataset.reader` rather than constructing
+    one directly.
     """
-
     @property
-    def schema(self) -> arro3.core.Schema:
-        r"""
-        The Arrow schema of this reader.
-        """
+    def schema(self) -> arro3.core.Schema: ...
     @property
     def closed(self) -> builtins.bool:
         r"""
-        `True` if the underlying stream has been consumed.
+        ``True`` if this reader has been consumed.
+
+        Returns
+        -------
+        bool
         """
     def __iter__(self) -> CachedDatasetReader: ...
     def __next__(self) -> arro3.core.RecordBatch: ...
