@@ -315,7 +315,8 @@ def test_ingest_all_idempotent(tmp_path):
 def test_concurrent_readers(tmp_path):
     table = _make_table(n_batches=8, rows_per_batch=5)
     ds = _dataset(tmp_path, table, batch_size=5)
-    results, errors = [None] * 4, []
+    results: list[pa.Table | None] = [None] * 4
+    errors: list[Exception] = []
 
     def read(i):
         try:
@@ -331,4 +332,5 @@ def test_concurrent_readers(tmp_path):
 
     assert not errors
     for res in results:
+        assert res is not None
         assert res.equals(table)

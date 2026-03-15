@@ -5,12 +5,17 @@ edition = "2021"
 
 [lib]
 name = "batchcorder"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "stub_gen"
+path = "src/bin/stub_gen.rs"
 
 [dependencies]
 # Python bindings
 pyo3 = { version = "0.28", features = ["macros"] }
 pyo3-arrow = "0.17"
+pyo3-stub-gen = { version = "0.19", default-features = false }
 
 # Arrow types and IPC serialization
 arrow-array = { version = "58", features = ["ffi"] }

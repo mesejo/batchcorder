@@ -166,7 +166,9 @@ def test_limit_does_not_exhaust_upstream(tmp_path):
     assert ds.upstream_exhausted is False
 
     # A follow-up full scan still gets every row (cache + remaining upstream)
-    total = con.execute("SELECT COUNT(*) FROM data").fetchone()[0]
+    row = con.execute("SELECT COUNT(*) FROM data").fetchone()
+    assert row is not None
+    total = row[0]
     assert total == LARGE_TOTAL_ROWS
     assert ds.upstream_exhausted is True
 
@@ -180,5 +182,7 @@ def test_limit_does_not_exhaust_upstream(tmp_path):
 
     # After the LIMIT query the stream is partially spent; the second query
     # cannot recover the discarded batches and sees fewer than LARGE_TOTAL_ROWS.
-    bare_total = con_bare.execute("SELECT COUNT(*) FROM data").fetchone()[0]
+    bare_row = con_bare.execute("SELECT COUNT(*) FROM data").fetchone()
+    assert bare_row is not None
+    bare_total = bare_row[0]
     assert bare_total < LARGE_TOTAL_ROWS

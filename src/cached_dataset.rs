@@ -33,6 +33,7 @@ use pyo3_arrow::error::{PyArrowError, PyArrowResult};
 use pyo3_arrow::export::{Arro3RecordBatch, Arro3Schema};
 use pyo3_arrow::ffi::{to_schema_pycapsule, to_stream_pycapsule, ArrayIterator};
 use pyo3_arrow::{PyRecordBatchReader, PySchema};
+use pyo3_stub_gen::derive::*;
 use tokio::runtime::Runtime;
 
 // ── error helpers ────────────────────────────────────────────────────────────
@@ -213,6 +214,7 @@ impl Drop for CachedDatasetReaderImpl {
 /// The inner reader is wrapped in `Mutex<Option<…>>` following the arro3
 /// pattern: it can be consumed once (by `__arrow_c_stream__`) and is marked
 /// closed afterwards.
+#[gen_stub_pyclass]
 #[pyclass(module = "batchcorder", name = "CachedDatasetReader", frozen)]
 pub struct PyCachedDatasetReader(Mutex<Option<CachedDatasetReaderImpl>>);
 
@@ -242,11 +244,13 @@ impl PyCachedDatasetReader {
     }
 }
 
+#[gen_stub_pymethods]
 #[pymethods]
 impl PyCachedDatasetReader {
     /// Export this reader as an Arrow C Stream PyCapsule.
     ///
     /// Consumes the reader; subsequent calls will return an error.
+    #[gen_stub(skip)]
     #[pyo3(signature = (requested_schema = None))]
     fn __arrow_c_stream__<'py>(
         &self,
@@ -261,6 +265,7 @@ impl PyCachedDatasetReader {
     }
 
     /// Export the schema as an Arrow C Schema PyCapsule.
+    #[gen_stub(skip)]
     fn __arrow_c_schema__<'py>(&self, py: Python<'py>) -> PyArrowResult<Bound<'py, PyCapsule>> {
         let inner = self.0.lock().unwrap();
         let reader = inner
@@ -270,6 +275,7 @@ impl PyCachedDatasetReader {
     }
 
     /// The Arrow schema of this reader.
+    #[gen_stub(skip)]
     #[getter]
     fn schema(&self) -> PyResult<Arro3Schema> {
         let inner = self.0.lock().unwrap();
@@ -289,6 +295,7 @@ impl PyCachedDatasetReader {
         slf
     }
 
+    #[gen_stub(skip)]
     fn __next__(&self) -> PyArrowResult<Option<Arro3RecordBatch>> {
         let mut guard = self.0.lock().unwrap();
         let impl_ = match guard.as_mut() {
@@ -337,6 +344,7 @@ impl PyCachedDatasetReader {
 /// r1 = ds.reader()
 /// r2 = ds.reader()
 /// ```
+#[gen_stub_pyclass]
 #[pyclass(module = "batchcorder", name = "CachedDataset", frozen)]
 pub struct PyCachedDataset {
     /// Arrow schema stored outside the cache for O(1) access.
@@ -347,6 +355,7 @@ pub struct PyCachedDataset {
     runtime: Arc<Runtime>,
 }
 
+#[gen_stub_pymethods]
 #[pymethods]
 impl PyCachedDataset {
     /// Create a new `CachedDataset`.
@@ -361,6 +370,7 @@ impl PyCachedDataset {
     ///
     /// Foyer opens (or creates) the disk cache under `disk_path` during
     /// construction.  The call blocks until the cache is ready.
+    #[gen_stub(skip)]
     #[new]
     #[pyo3(signature = (reader, memory_capacity, disk_path, disk_capacity))]
     pub fn new(
@@ -413,6 +423,7 @@ impl PyCachedDataset {
     }
 
     /// Return the Arrow schema of this dataset.
+    #[gen_stub(skip)]
     #[getter]
     pub fn schema(&self) -> PyResult<Arro3Schema> {
         Ok(PySchema::new(self.schema.clone()).into())
@@ -459,6 +470,7 @@ impl PyCachedDataset {
     /// Creates a fresh reader starting at batch 0 and exports it as a single-
     /// use Arrow C Stream.  This allows the dataset to be consumed directly by
     /// PyArrow, DataFusion, DuckDB, and any other Arrow-compatible library.
+    #[gen_stub(skip)]
     #[pyo3(signature = (requested_schema = None))]
     pub fn __arrow_c_stream__<'py>(
         &self,
@@ -476,6 +488,7 @@ impl PyCachedDataset {
     }
 
     /// Export the schema as an Arrow C Schema PyCapsule.
+    #[gen_stub(skip)]
     pub fn __arrow_c_schema__<'py>(&self, py: Python<'py>) -> PyArrowResult<Bound<'py, PyCapsule>> {
         to_schema_pycapsule(py, self.schema.as_ref())
     }
