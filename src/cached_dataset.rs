@@ -205,15 +205,19 @@ impl Drop for CachedDatasetReaderImpl {
 
 // ── PyCachedDatasetReader ────────────────────────────────────────────────────
 
-/// A single-use reader handle for a [`PyCachedDataset`].
+/// A single-use iterator handle for a :class:`CachedDataset`.
 ///
-/// Maintains an independent read position.  Multiple readers backed by the
-/// same dataset share the underlying cache; the upstream is ingested lazily as
-/// needed.
+/// Maintains an independent read position.  Multiple handles backed by the
+/// same dataset share the underlying cache; the upstream source is ingested
+/// lazily as needed.
 ///
-/// The inner reader is wrapped in `Mutex<Option<…>>` following the arro3
-/// pattern: it can be consumed once (by `__arrow_c_stream__`) and is marked
-/// closed afterwards.
+/// Once consumed via ``__arrow_c_stream__`` or by exhausting iteration the
+/// reader is marked closed and raises an error on further use.
+///
+/// Notes
+/// -----
+/// Obtain a handle from :meth:`CachedDataset.reader` rather than constructing
+/// one directly.
 #[gen_stub_pyclass]
 #[pyclass(module = "batchcorder", name = "CachedDatasetReader", frozen)]
 pub struct PyCachedDatasetReader(Mutex<Option<CachedDatasetReaderImpl>>);
@@ -249,7 +253,17 @@ impl PyCachedDatasetReader {
 impl PyCachedDatasetReader {
     /// Export this reader as an Arrow C Stream PyCapsule.
     ///
-    /// Consumes the reader; subsequent calls will return an error.
+    /// Consumes the reader; subsequent calls raise an error.
+    ///
+    /// Parameters
+    /// ----------
+    /// requested_schema : object, optional
+    ///     Schema capsule to cast the stream to, or ``None``.
+    ///
+    /// Raises
+    /// ------
+    /// IOError
+    ///     If the reader has already been consumed.
     #[gen_stub(skip)]
     #[pyo3(signature = (requested_schema = None))]
     fn __arrow_c_stream__<'py>(
@@ -265,6 +279,11 @@ impl PyCachedDatasetReader {
     }
 
     /// Export the schema as an Arrow C Schema PyCapsule.
+    ///
+    /// Raises
+    /// ------
+    /// IOError
+    ///     If the reader has already been consumed.
     #[gen_stub(skip)]
     fn __arrow_c_schema__<'py>(&self, py: Python<'py>) -> PyArrowResult<Bound<'py, PyCapsule>> {
         let inner = self.0.lock().unwrap();
@@ -274,7 +293,16 @@ impl PyCachedDatasetReader {
         to_schema_pycapsule(py, reader.schema.as_ref())
     }
 
-    /// The Arrow schema of this reader.
+    /// Arrow schema of batches produced by this reader.
+    ///
+    /// Returns
+    /// -------
+    /// arro3.core.Schema
+    ///
+    /// Raises
+    /// ------
+    /// IOError
+    ///     If the reader has already been consumed.
     #[gen_stub(skip)]
     #[getter]
     fn schema(&self) -> PyResult<Arro3Schema> {
@@ -285,7 +313,11 @@ impl PyCachedDatasetReader {
         Ok(PySchema::new(reader.schema.clone()).into())
     }
 
-    /// `True` if the underlying stream has been consumed.
+    /// ``True`` if this reader has been consumed.
+    ///
+    /// Returns
+    /// -------
+    /// bool
     #[getter]
     fn closed(&self) -> bool {
         self.0.lock().unwrap().is_none()
@@ -318,32 +350,42 @@ impl PyCachedDatasetReader {
 
 /// A hybrid memory+disk cached Arrow dataset.
 ///
-/// Wraps an upstream Arrow stream source (any Python object implementing
-/// `__arrow_c_stream__`) and stores each `RecordBatch` in a Foyer hybrid
-/// cache keyed by a monotonic `u64` batch index.  Batches are ingested
-/// lazily: the upstream is only read when a reader requests a batch that has
-/// not been ingested yet.
+/// Wraps any Arrow stream source and caches each ``RecordBatch`` in a Foyer
+/// hybrid cache keyed by a monotonic batch index.  Multiple independent
+/// :class:`CachedDatasetReader` handles can replay the full stream from any
+/// position; the upstream source is ingested lazily on demand.
 ///
-/// Multiple independent [`PyCachedDatasetReader`] handles can be obtained via
-/// [`PyCachedDataset::reader`], each starting at a configurable position.
+/// Parameters
+/// ----------
+/// reader : object
+///     Any object implementing ``__arrow_c_stream__`` (e.g.
+///     :class:`pyarrow.Table`, :class:`pyarrow.RecordBatchReader`,
+///     :class:`arro3.core.RecordBatchReader`).
+/// memory_capacity : int
+///     In-memory cache tier size in bytes.
+/// disk_path : str
+///     Directory for the on-disk cache tier.  Created on first use.
+/// disk_capacity : int
+///     On-disk cache tier size in bytes.
 ///
-/// # Python interface
+/// Notes
+/// -----
+/// Foyer may evict cache entries under memory/disk pressure.  If a batch is
+/// evicted before a reader reaches it the reader raises an error.  Size both
+/// tiers so they can hold all live reader positions simultaneously.
 ///
-/// ```python
-/// import pyarrow as pa
-/// from multirecord import CachedDataset
-///
-/// table = pa.table({"x": [1, 2, 3]})
-/// ds = CachedDataset(table, memory_capacity=64*1024*1024,
-///                   disk_path="/tmp/cache", disk_capacity=512*1024*1024)
-///
-/// # Use directly as an Arrow stream:
-/// result = pa.RecordBatchReader.from_stream(ds).read_all()
-///
-/// # Or get independent replay handles:
-/// r1 = ds.reader()
-/// r2 = ds.reader()
-/// ```
+/// Examples
+/// --------
+/// >>> import tempfile
+/// >>> import pyarrow as pa
+/// >>> from batchcorder import CachedDataset
+/// >>> table = pa.table({"id": [1, 2, 3], "val": [0.5, 1.0, 1.5]})
+/// >>> tmp = tempfile.mkdtemp()
+/// >>> ds = CachedDataset(table, memory_capacity=16 << 20, disk_path=tmp, disk_capacity=64 << 20)
+/// >>> pa.RecordBatchReader.from_stream(ds).read_all().equals(table)
+/// True
+/// >>> ds.upstream_exhausted
+/// True
 #[gen_stub_pyclass]
 #[pyclass(module = "batchcorder", name = "CachedDataset", frozen)]
 pub struct PyCachedDataset {
@@ -358,18 +400,21 @@ pub struct PyCachedDataset {
 #[gen_stub_pymethods]
 #[pymethods]
 impl PyCachedDataset {
-    /// Create a new `CachedDataset`.
+    /// Create a new :class:`CachedDataset`.
     ///
-    /// # Arguments
-    ///
-    /// * `reader` – any Python object implementing `__arrow_c_stream__`
-    ///   (e.g. a PyArrow table/reader, an arro3 RecordBatchReader, etc.)
-    /// * `memory_capacity` – in-memory cache tier size in bytes
-    /// * `disk_path` – directory in which Foyer stores the disk cache files
-    /// * `disk_capacity` – disk cache tier size in bytes
-    ///
-    /// Foyer opens (or creates) the disk cache under `disk_path` during
+    /// Foyer opens (or creates) the disk cache under ``disk_path`` during
     /// construction.  The call blocks until the cache is ready.
+    ///
+    /// Parameters
+    /// ----------
+    /// reader : object
+    ///     Any object implementing ``__arrow_c_stream__``.
+    /// memory_capacity : int
+    ///     In-memory cache tier size in bytes.
+    /// disk_path : str
+    ///     Directory for the on-disk cache tier.
+    /// disk_capacity : int
+    ///     On-disk cache tier size in bytes.
     #[gen_stub(skip)]
     #[new]
     #[pyo3(signature = (reader, memory_capacity, disk_path, disk_capacity))]
@@ -422,20 +467,41 @@ impl PyCachedDataset {
         })
     }
 
-    /// Return the Arrow schema of this dataset.
+    /// Arrow schema of this dataset.
+    ///
+    /// Returns
+    /// -------
+    /// arro3.core.Schema
     #[gen_stub(skip)]
     #[getter]
     pub fn schema(&self) -> PyResult<Arro3Schema> {
         Ok(PySchema::new(self.schema.clone()).into())
     }
 
-    /// Create a new [`PyCachedDatasetReader`] handle.
+    /// Return a new :class:`CachedDatasetReader` handle.
     ///
-    /// # Arguments
+    /// Parameters
+    /// ----------
+    /// from_start : bool, optional
+    ///     If ``True`` (default), the reader starts at batch 0 and replays the
+    ///     full stream.  If ``False``, it starts at the current ingestion
+    ///     frontier and yields only batches ingested after this call.
     ///
-    /// * `from_start` – if `True` (default), the reader starts at batch index
-    ///   0 and replays the full stream.  If `False`, the reader starts at the
-    ///   current ingestion frontier (the number of batches ingested so far).
+    /// Returns
+    /// -------
+    /// CachedDatasetReader
+    ///
+    /// Examples
+    /// --------
+    /// >>> import tempfile, pyarrow as pa
+    /// >>> from batchcorder import CachedDataset
+    /// >>> table = pa.table({"x": [1, 2, 3]})
+    /// >>> tmp = tempfile.mkdtemp()
+    /// >>> ds = CachedDataset(table, 16 << 20, tmp, 64 << 20)
+    /// >>> r1 = ds.reader()
+    /// >>> r2 = ds.reader()
+    /// >>> r1.closed, r2.closed
+    /// (False, False)
     #[pyo3(signature = (from_start = true))]
     pub fn reader(&self, from_start: bool) -> PyResult<PyCachedDatasetReader> {
         let mut inner = self
@@ -458,18 +524,28 @@ impl PyCachedDataset {
         }))
     }
 
-    /// Iterate over this dataset's batches from the start.
+    /// Iterate over all batches from the start.
     ///
-    /// Creates a fresh reader at batch 0 and returns it as the iterator.
+    /// Creates a fresh :class:`CachedDatasetReader` starting at batch 0 and
+    /// returns it as the iterator.
+    ///
+    /// Returns
+    /// -------
+    /// CachedDatasetReader
     pub fn __iter__(&self) -> PyResult<PyCachedDatasetReader> {
         self.reader(true)
     }
 
     /// Export this dataset as an Arrow C Stream PyCapsule.
     ///
-    /// Creates a fresh reader starting at batch 0 and exports it as a single-
-    /// use Arrow C Stream.  This allows the dataset to be consumed directly by
-    /// PyArrow, DataFusion, DuckDB, and any other Arrow-compatible library.
+    /// Creates a fresh reader starting at batch 0.  Allows the dataset to be
+    /// consumed directly by PyArrow, DuckDB, DataFusion, and any other
+    /// Arrow-compatible library.
+    ///
+    /// Parameters
+    /// ----------
+    /// requested_schema : object, optional
+    ///     Schema capsule to cast the stream to, or ``None``.
     #[gen_stub(skip)]
     #[pyo3(signature = (requested_schema = None))]
     pub fn __arrow_c_stream__<'py>(
@@ -488,15 +564,38 @@ impl PyCachedDataset {
     }
 
     /// Export the schema as an Arrow C Schema PyCapsule.
+    ///
+    /// Returns
+    /// -------
+    /// object
+    ///     Arrow C Schema capsule.
     #[gen_stub(skip)]
     pub fn __arrow_c_schema__<'py>(&self, py: Python<'py>) -> PyArrowResult<Bound<'py, PyCapsule>> {
         to_schema_pycapsule(py, self.schema.as_ref())
     }
 
-    /// Eagerly ingest all remaining batches from the upstream reader into the cache.
+    /// Eagerly ingest all batches from the upstream source into the cache.
     ///
-    /// After this call, `upstream_exhausted` is `true` and the upstream object
-    /// is released.  Subsequent readers will be served entirely from the cache.
+    /// After this call ``upstream_exhausted`` is ``True`` and the upstream
+    /// reference is released.  Subsequent reads are served entirely from cache.
+    /// Calling this method more than once is safe and idempotent.
+    ///
+    /// Returns
+    /// -------
+    /// int
+    ///     Total number of batches ingested (including any ingested previously).
+    ///
+    /// Examples
+    /// --------
+    /// >>> import tempfile, pyarrow as pa
+    /// >>> from batchcorder import CachedDataset
+    /// >>> table = pa.table({"x": [1, 2, 3]})
+    /// >>> tmp = tempfile.mkdtemp()
+    /// >>> ds = CachedDataset(table, 16 << 20, tmp, 64 << 20)
+    /// >>> ds.ingest_all()
+    /// 1
+    /// >>> ds.upstream_exhausted
+    /// True
     pub fn ingest_all(&self) -> PyResult<u64> {
         let mut inner = self
             .inner
@@ -510,13 +609,23 @@ impl PyCachedDataset {
         Ok(inner.ingested_count)
     }
 
-    /// Number of batches ingested from the upstream so far.
+    /// Number of batches pulled from the upstream source so far.
+    ///
+    /// Increments lazily as readers consume batches.
+    ///
+    /// Returns
+    /// -------
+    /// int
     #[getter]
     pub fn ingested_count(&self) -> PyResult<u64> {
         Ok(self.inner.lock().unwrap().ingested_count)
     }
 
-    /// `True` if the upstream reader has been fully consumed.
+    /// ``True`` once the upstream source has been fully consumed.
+    ///
+    /// Returns
+    /// -------
+    /// bool
     #[getter]
     pub fn upstream_exhausted(&self) -> PyResult<bool> {
         Ok(self.inner.lock().unwrap().upstream_exhausted)
