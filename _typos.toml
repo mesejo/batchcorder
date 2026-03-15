@@ -1,0 +1,5 @@
+[default]
+# arro3 is a real library name (https://github.com/kylebarron/arro3), not a
+# typo of "arrow3". The regex suppresses any identifier that starts with the
+# arro3 prefix (e.g. arro3, Arro3, Arro3RecordBatch, Arro3Schema).
+extend-ignore-identifiers-re = ["[Aa]rro3\\w*"]

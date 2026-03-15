@@ -1,0 +1,10 @@
+# mypy.stubtest allowlist for batchcorder
+#
+# Run `python -m mypy.stubtest batchcorder` without this file to rediscover
+# entries to add when the Rust implementation changes.
+
+# The compiled extension is installed as batchcorder.batchcorder (the internal
+# .so submodule). It has no dedicated stub because batchcorder/__init__.pyi
+# re-exports everything at the top-level package — the internal module is an
+# implementation detail.
+batchcorder.batchcorder
