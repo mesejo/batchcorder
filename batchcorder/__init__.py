@@ -1,7 +1,12 @@
 from importlib.metadata import version
 
-from ._batchcorder import *  # noqa: F401, F403
-from ._batchcorder import __all__  # noqa: F401
+from ._batchcorder import CachedDataset, CachedDatasetReader
+
+
+__all__ = [
+    "CachedDataset",
+    "CachedDatasetReader",
+]
 
 
 __version__ = version("batchcorder")

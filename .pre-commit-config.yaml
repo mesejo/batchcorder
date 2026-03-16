@@ -35,10 +35,10 @@ repos:
           - tomli
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.9.10
+    rev: v0.14.10
     hooks:
-      - id: ruff
-        args: ["--fix"]
+      - id: ruff-check
+        args: ["--output-format=full", "--fix"]
       - id: ruff-format
 
   - repo: https://github.com/rhysd/actionlint
@@ -101,7 +101,7 @@ repos:
       - id: mypy-stubtest
         name: mypy stubtest
         description: Validate batchcorder.pyi matches the compiled extension at runtime.
-        entry: .venv/bin/python -m mypy.stubtest batchcorder --allowlist .mypy-stubtest-allowlist
+        entry: .venv/bin/python -m mypy.stubtest batchcorder
         language: system
         pass_filenames: false
         types_or: [python, pyi]

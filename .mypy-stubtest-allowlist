@@ -1,7 +1,0 @@
-# mypy.stubtest allowlist for batchcorder
-#
-# Run `python -m mypy.stubtest batchcorder` without this file to rediscover
-# entries to add when the Rust implementation changes.
-#
-# batchcorder._batchcorder is a private submodule (underscore prefix) so
-# stubtest skips it automatically — no allowlist entry needed.
