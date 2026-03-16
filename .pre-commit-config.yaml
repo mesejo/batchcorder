@@ -3,7 +3,7 @@ default_language_version:
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v5.0.0
+    rev: v6.0.0
     hooks:
       - id: check-merge-conflict
       - id: trailing-whitespace
@@ -19,7 +19,7 @@ repos:
       - id: validate-pyproject
 
   # typos: fast, code-aware typo checker (understands identifiers/tokens)
-  - repo: https://github.com/crate-ci/typos
+  - repo: https://github.com/adhtruong/mirrors-typos
     rev: v1.44.0
     hooks:
       - id: typos
@@ -27,7 +27,7 @@ repos:
 
   # codespell: natural-language spell checker for comments and docs
   - repo: https://github.com/codespell-project/codespell
-    rev: v2.4.1
+    rev: v2.4.2
     hooks:
       - id: codespell
         args: [--toml, "pyproject.toml"]
@@ -35,21 +35,26 @@ repos:
           - tomli
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.14.10
+    rev: v0.15.6
     hooks:
       - id: ruff-check
         args: ["--output-format=full", "--fix"]
       - id: ruff-format
 
   - repo: https://github.com/rhysd/actionlint
-    rev: v1.7.6
+    rev: v1.7.11
     hooks:
       - id: actionlint
 
   - repo: https://github.com/astral-sh/uv-pre-commit
-    rev: 0.10.7
+    rev: 0.10.10
     hooks:
       - id: uv-lock
+
+  - repo: https://github.com/ComPWA/taplo-pre-commit
+    rev: v0.9.3
+    hooks:
+      - id: taplo-format
 
   - repo: local
     hooks:

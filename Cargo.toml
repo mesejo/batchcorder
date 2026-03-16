@@ -14,10 +14,11 @@ path = "src/bin/stub_gen.rs"
 [dependencies]
 # Python bindings
 pyo3 = { version = "0.28", features = [
-    "macros",
-    "extension-module",
-    "abi3",
-    "abi3-py311",] }
+  "macros",
+  "extension-module",
+  "abi3",
+  "abi3-py311",
+] }
 pyo3-arrow = "0.17"
 pyo3-stub-gen = { version = "0.19", default-features = false }
 
