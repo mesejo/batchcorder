@@ -95,6 +95,28 @@ fn without_gil<T, F: FnOnce() -> T>(_py: Python<'_>, f: F) -> T {
     f()
 }
 
+/// Acquire the GIL, run `f`, then release it back to its previous state.
+///
+/// This is the inverse of [`without_gil`]: safe to call from any thread,
+/// including C extension threads that have no Python thread state yet.
+/// Uses `PyGILState_Ensure`/`PyGILState_Release` (stable C API, abi3-safe)
+/// which handle the "already held" case correctly via a saved state cookie.
+fn with_gil_acquired<T, F: FnOnce() -> T>(f: F) -> T {
+    #[cfg(not(Py_GIL_DISABLED))]
+    {
+        struct ReleaseGuard(pyo3::ffi::PyGILState_STATE);
+        impl Drop for ReleaseGuard {
+            fn drop(&mut self) {
+                unsafe { pyo3::ffi::PyGILState_Release(self.0) };
+            }
+        }
+        let _guard = ReleaseGuard(unsafe { pyo3::ffi::PyGILState_Ensure() });
+        f()
+    }
+    #[cfg(Py_GIL_DISABLED)]
+    f()
+}
+
 // ── shared ingestion state ───────────────────────────────────────────────────
 
 /// Mutable state shared between a [`PyCachedDataset`] and all of its readers.
@@ -127,7 +149,13 @@ impl DatasetInner {
             if self.upstream_exhausted {
                 return Ok(false);
             }
-            let batch = match self.upstream.as_mut().and_then(|u| u.next()) {
+            // The upstream is backed by a Python C stream whose get_next function
+            // requires the GIL.  Acquire it here so this call is safe from any
+            // thread context — including DuckDB scanner threads that have no
+            // Python thread state (the Arrow C stream get_next path bypasses
+            // #[pymethods] and our without_gil wrapper entirely).
+            let next_result = with_gil_acquired(|| self.upstream.as_mut().and_then(|u| u.next()));
+            let batch = match next_result {
                 None => {
                     self.upstream_exhausted = true;
                     return Ok(false);
@@ -539,25 +567,26 @@ impl PyCachedDataset {
     /// >>> r1.closed, r2.closed
     /// (False, False)
     #[pyo3(signature = (from_start = true))]
-    pub fn reader(&self, from_start: bool) -> PyResult<PyCachedDatasetReader> {
-        let mut inner = self
-            .inner
-            .lock()
-            .map_err(|e| PyIOError::new_err(format!("Mutex poisoned: {e}")))?;
-
-        let consumer_id = inner.next_consumer_id;
-        inner.next_consumer_id += 1;
-
-        let start_index = if from_start { 0 } else { inner.ingested_count };
-        inner.consumer_positions.insert(consumer_id, start_index);
-
-        Ok(PyCachedDatasetReader::new(CachedDatasetReaderImpl {
-            schema: self.schema.clone(),
-            inner: self.inner.clone(),
-            current_index: start_index,
-            consumer_id,
-            runtime: self.runtime.clone(),
-        }))
+    pub fn reader(&self, py: Python<'_>, from_start: bool) -> PyResult<PyCachedDatasetReader> {
+        // Release the GIL before locking `inner` to prevent ABBA deadlock:
+        // scanner threads can hold `inner.lock()` while waiting to acquire the
+        // GIL (via `with_gil_acquired` in `ingest_up_to`), so we must never
+        // hold the GIL while waiting for `inner.lock()`.
+        without_gil(py, || {
+            let mut inner = self.inner.lock().map_err(|e| e.to_string())?;
+            let consumer_id = inner.next_consumer_id;
+            inner.next_consumer_id += 1;
+            let start_index = if from_start { 0 } else { inner.ingested_count };
+            inner.consumer_positions.insert(consumer_id, start_index);
+            Ok::<_, String>(PyCachedDatasetReader::new(CachedDatasetReaderImpl {
+                schema: self.schema.clone(),
+                inner: self.inner.clone(),
+                current_index: start_index,
+                consumer_id,
+                runtime: self.runtime.clone(),
+            }))
+        })
+        .map_err(PyIOError::new_err)
     }
 
     /// Iterate over all batches from the start.
@@ -568,8 +597,8 @@ impl PyCachedDataset {
     /// Returns
     /// -------
     /// CachedDatasetReader
-    pub fn __iter__(&self) -> PyResult<PyCachedDatasetReader> {
-        self.reader(true)
+    pub fn __iter__(&self, py: Python<'_>) -> PyResult<PyCachedDatasetReader> {
+        self.reader(py, true)
     }
 
     /// Export this dataset as an Arrow C Stream PyCapsule.
@@ -589,7 +618,7 @@ impl PyCachedDataset {
         py: Python<'py>,
         requested_schema: Option<Bound<'py, PyCapsule>>,
     ) -> PyArrowResult<Bound<'py, PyCapsule>> {
-        let reader = self.reader(true).map_err(PyArrowError::PyErr)?;
+        let reader = self.reader(py, true).map_err(PyArrowError::PyErr)?;
         let impl_ = reader
             .0
             .lock()
@@ -633,15 +662,15 @@ impl PyCachedDataset {
     /// >>> ds.upstream_exhausted
     /// True
     pub fn ingest_all(&self, py: Python<'_>) -> PyResult<u64> {
-        let mut inner = self
-            .inner
-            .lock()
-            .map_err(|e| PyIOError::new_err(format!("Mutex poisoned: {e}")))?;
-        // Release the GIL while ingesting so DuckDB scanner threads are not
-        // blocked.  The upstream Python reader re-acquires it via with_gil.
-        without_gil(py, || inner.ingest_up_to(&self.runtime, u64::MAX))
-            .map_err(|e| PyIOError::new_err(e.to_string()))?;
-        Ok(inner.ingested_count)
+        // Release the GIL before locking `inner` (same ordering rule as `reader`).
+        without_gil(py, || {
+            let mut inner = self.inner.lock().map_err(|e| e.to_string())?;
+            inner
+                .ingest_up_to(&self.runtime, u64::MAX)
+                .map_err(|e| e.to_string())?;
+            Ok::<_, String>(inner.ingested_count)
+        })
+        .map_err(PyIOError::new_err)
     }
 
     /// Number of batches pulled from the upstream source so far.
@@ -652,8 +681,10 @@ impl PyCachedDataset {
     /// -------
     /// int
     #[getter]
-    pub fn ingested_count(&self) -> PyResult<u64> {
-        Ok(self.inner.lock().unwrap().ingested_count)
+    pub fn ingested_count(&self, py: Python<'_>) -> PyResult<u64> {
+        Ok(without_gil(py, || {
+            self.inner.lock().unwrap().ingested_count
+        }))
     }
 
     /// ``True`` once the upstream source has been fully consumed.
@@ -662,7 +693,9 @@ impl PyCachedDataset {
     /// -------
     /// bool
     #[getter]
-    pub fn upstream_exhausted(&self) -> PyResult<bool> {
-        Ok(self.inner.lock().unwrap().upstream_exhausted)
+    pub fn upstream_exhausted(&self, py: Python<'_>) -> PyResult<bool> {
+        Ok(without_gil(py, || {
+            self.inner.lock().unwrap().upstream_exhausted
+        }))
     }
 }
