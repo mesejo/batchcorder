@@ -1,0 +1,78 @@
+name: ci-lint
+
+on:
+  push:
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+      - "*.md"
+      - ".envrc"
+    branches:
+      - main
+    tags:
+      - '*'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    # sccache-action sets RUSTC_WRAPPER=sccache; all cargo sub-processes
+    # (maturin develop, cargo clippy, cargo doc in pre-commit) pick it up.
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
+      UV_NO_SYNC: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      # Nightly is required by the `cargo +nightly fmt` pre-commit hook.
+      - name: Install Rust nightly
+        run: rustup toolchain install nightly --profile minimal --no-self-update
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            ./target/
+          key: cargo-lint-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock') }}
+          restore-keys: cargo-lint-
+
+      - name: Install Python dependencies
+        run: uv sync --locked --group dev
+
+      # The pyright, griffe, and mypy-stubtest pre-commit hooks import the
+      # compiled extension at runtime, so we must build it first.
+      - name: Build extension
+        uses: PyO3/maturin-action@v1
+        with:
+          command: develop
+          args: --uv
+          manylinux: 'off'
+
+      - name: Cache pre-commit environments
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ hashFiles('.pre-commit-config.yaml') }}
+          restore-keys: pre-commit-
+
+      - name: Run pre-commit
+        run: uv run pre-commit run --all-files

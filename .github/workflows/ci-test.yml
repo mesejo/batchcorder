@@ -1,0 +1,74 @@
+name: ci-test
+
+on:
+  push:
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+      - "*.md"
+      - ".envrc"
+    branches:
+      - main
+    tags:
+      - '*'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    env:
+      UV_NO_SYNC: "1"
+    strategy:
+      matrix:
+        # requires-python = ">=3.11"; test the floor and the latest stable.
+        python-version: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Update Rust stable
+        run: rustup update stable
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            ./target/
+          # abi3-py311 produces a single binary regardless of Python version,
+          # so the cache key does not include python-version.
+          key: cargo-test-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock') }}
+          restore-keys: cargo-test-
+
+      # --no-install-project: maturin develop handles the batchcorder install.
+      - name: Install Python dependencies
+        run: uv sync --locked --group dev --no-install-project
+
+      - name: Build extension
+        uses: PyO3/maturin-action@v1
+        with:
+          command: develop
+          args: --release --strip --uv
+          sccache: 'true'
+          manylinux: 'off'
+
+      - name: Run tests
+        run: uv run pytest --import-mode=importlib --cov --cov-report=xml
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5.4.0
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
