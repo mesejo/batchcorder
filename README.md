@@ -19,10 +19,10 @@ maintaining their own position in the batch sequence.
 
 ```mermaid
 flowchart LR
-    U["upstream source\n(read once)"] --> D["CachedDataset\n[mem + disk cache]"]
-    D --> R0["CachedDatasetReader 0\n(from batch 0)"]
-    D --> R1["CachedDatasetReader 1\n(from batch 0)"]
-    D --> R2["CachedDatasetReader 2\n(from batch 3)"]
+    U["upstream source<br/>(read once)"] --> D["CachedDataset<br/>[mem + disk cache]"]
+    D --> R0["CachedDatasetReader 0<br/>(from batch 0)"]
+    D --> R1["CachedDatasetReader 1<br/>(from batch 0)"]
+    D --> R2["CachedDatasetReader 2<br/>(from batch 3)"]
 ```
 
 ## Installation
