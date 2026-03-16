@@ -124,7 +124,7 @@ def test_self_join(tmp_path):
         ORDER BY e.name
     """).fetchall()
 
-    assert bare_rows == []
+    assert not bare_rows
 
 
 def test_limit_does_not_exhaust_upstream(tmp_path):
@@ -163,29 +163,6 @@ def test_limit_does_not_exhaust_upstream(tmp_path):
     (bare_total,) = bare_row
     assert bare_total < LARGE_TOTAL_ROWS
 
-
-# ── ASOF JOIN ─────────────────────────────────────────────────────────────────
-#
-# Translated from xorq (an ibis-based dataframe library backed by DuckDB).
-# xorq implements tolerance as a three-step plan:
-#   1. ASOF LEFT JOIN  — find the closest preceding event per site
-#   2. Filter          — keep only rows within the tolerance window
-#   3. Left-join back  — re-attach unmatched sensor rows (as NULLs)
-#
-# Step 3 requires a second scan of the sensors table.  A single-use Arrow
-# stream is exhausted after step 1, so step 3 sees nothing and the result is
-# empty — the same single-use problem as the self-join test above.
-# CachedDataset replays from the cache and gives the correct answer.
-#
-# Data layout (microseconds = 6th datetime arg):
-#
-# Sensor                              Closest prior event at same site
-# ──────────────────────────────────  ─────────────────────────────────────────
-# a  0.3  2024-11-16 12:00:15.500  → cloud coverage  at .400   diff  100 ms ✓
-# b  0.4  2024-11-16 12:00:15.700  → (no prior event at site b)             ✗
-# a  0.5  2024-11-17 18:12:14.950  → cloud coverage  prev day  diff >> 1 s  ✗
-# b  0.6  2024-11-17 18:12:15.120  → rain start      at .100   diff   20 ms ✓
-# a  0.7  2024-11-18 18:12:15.100  → rain stop        at .100   diff    0 ms ✓
 
 _SENSOR_SCHEMA = pa.schema(
     [

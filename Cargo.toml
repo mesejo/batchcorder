@@ -13,7 +13,11 @@ path = "src/bin/stub_gen.rs"
 
 [dependencies]
 # Python bindings
-pyo3 = { version = "0.28", features = ["macros"] }
+pyo3 = { version = "0.28", features = [
+    "macros",
+    "extension-module",
+    "abi3",
+    "abi3-py311",] }
 pyo3-arrow = "0.17"
 pyo3-stub-gen = { version = "0.19", default-features = false }
 
@@ -27,3 +31,7 @@ foyer = { version = "0.22", features = ["serde"] }
 
 # Async runtime required by foyer's async API
 tokio = { version = "1", features = ["rt-multi-thread", "io-util", "time"] }
+
+[lints.rust]
+# Py_GIL_DISABLED is a cfg set by pyo3's build script to indicate free-threaded Python.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(Py_GIL_DISABLED)'] }

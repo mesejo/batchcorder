@@ -67,6 +67,34 @@ fn deserialize_batch(bytes: &[u8]) -> Result<RecordBatch, ArrowError> {
         .ok_or_else(|| other_arrow_err("Empty IPC stream in cache entry"))?
 }
 
+// ── GIL management ───────────────────────────────────────────────────────────
+
+/// Release the GIL, run `f`, then re-acquire it.
+///
+/// `pyo3::Python::allow_threads` is not available under `abi3` targets because
+/// pyo3 cannot guarantee the GIL exists at compile time when targeting
+/// Python 3.13+, which supports a no-GIL build.  This helper calls
+/// `PyEval_SaveThread` / `PyEval_RestoreThread` directly; both are part of
+/// the stable C API (`Py_LIMITED_API`) and work correctly under abi3.
+///
+/// The calling code must already hold the GIL (ensured by the `Python<'_>`
+/// token).  Any Python calls made inside `f` must re-acquire the GIL via
+/// `Python::with_gil` — `pyo3_arrow`'s upstream reader wrapper does this
+/// automatically.
+fn without_gil<T, F: FnOnce() -> T>(_py: Python<'_>, f: F) -> T {
+    struct RestoreGuard(*mut pyo3::ffi::PyThreadState);
+    impl Drop for RestoreGuard {
+        fn drop(&mut self) {
+            unsafe { pyo3::ffi::PyEval_RestoreThread(self.0) };
+        }
+    }
+    // On free-threaded Python (Py_GIL_DISABLED) there is no GIL to release.
+    // On free-threaded Python (Py_GIL_DISABLED) there is no GIL to release.
+    #[cfg(not(Py_GIL_DISABLED))]
+    let _guard = RestoreGuard(unsafe { pyo3::ffi::PyEval_SaveThread() });
+    f()
+}
+
 // ── shared ingestion state ───────────────────────────────────────────────────
 
 /// Mutable state shared between a [`PyCachedDataset`] and all of its readers.
@@ -328,7 +356,7 @@ impl PyCachedDatasetReader {
     }
 
     #[gen_stub(skip)]
-    fn __next__(&self) -> PyArrowResult<Option<Arro3RecordBatch>> {
+    fn __next__(&self, py: Python<'_>) -> PyArrowResult<Option<Arro3RecordBatch>> {
         let mut guard = self.0.lock().unwrap();
         let impl_ = match guard.as_mut() {
             None => {
@@ -338,7 +366,11 @@ impl PyCachedDatasetReader {
             }
             Some(r) => r,
         };
-        match impl_.next() {
+        // Release the GIL while doing Rust I/O so other Python threads (e.g.
+        // DuckDB scanner threads) are not blocked.  The upstream Python reader
+        // re-acquires the GIL internally via Python::with_gil when it needs it.
+        let result = without_gil(py, || impl_.next());
+        match result {
             None => Ok(None),
             Some(Err(e)) => Err(PyArrowError::ArrowError(e)),
             Some(Ok(batch)) => Ok(Some(Arro3RecordBatch::from(batch))),
@@ -419,6 +451,7 @@ impl PyCachedDataset {
     #[new]
     #[pyo3(signature = (reader, memory_capacity, disk_path, disk_capacity))]
     pub fn new(
+        py: Python<'_>,
         reader: PyRecordBatchReader,
         memory_capacity: usize,
         disk_path: String,
@@ -437,8 +470,10 @@ impl PyCachedDataset {
 
         let disk_cap_usize = usize::try_from(disk_capacity).unwrap_or(usize::MAX);
 
-        let cache: HybridCache<u64, Vec<u8>> = rt
-            .block_on(async {
+        // Release the GIL while building the cache: Foyer opens disk files
+        // and initialises its async engine, which is pure Rust I/O.
+        let cache: HybridCache<u64, Vec<u8>> = without_gil(py, || {
+            rt.block_on(async {
                 let device = FsDeviceBuilder::new(std::path::Path::new(&disk_path))
                     .with_capacity(disk_cap_usize)
                     .build()?;
@@ -449,7 +484,8 @@ impl PyCachedDataset {
                     .build()
                     .await
             })
-            .map_err(|e| PyIOError::new_err(format!("Failed to build Foyer hybrid cache: {e}")))?;
+        })
+        .map_err(|e| PyIOError::new_err(format!("Failed to build Foyer hybrid cache: {e}")))?;
 
         let inner = DatasetInner {
             cache: Arc::new(cache),
@@ -596,15 +632,14 @@ impl PyCachedDataset {
     /// 1
     /// >>> ds.upstream_exhausted
     /// True
-    pub fn ingest_all(&self) -> PyResult<u64> {
+    pub fn ingest_all(&self, py: Python<'_>) -> PyResult<u64> {
         let mut inner = self
             .inner
             .lock()
             .map_err(|e| PyIOError::new_err(format!("Mutex poisoned: {e}")))?;
-        // Drive ingestion to a very high index; ingest_up_to stops naturally
-        // when the upstream is exhausted.
-        let _ = inner
-            .ingest_up_to(&self.runtime, u64::MAX)
+        // Release the GIL while ingesting so DuckDB scanner threads are not
+        // blocked.  The upstream Python reader re-acquires it via with_gil.
+        without_gil(py, || inner.ingest_up_to(&self.runtime, u64::MAX))
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
         Ok(inner.ingested_count)
     }
