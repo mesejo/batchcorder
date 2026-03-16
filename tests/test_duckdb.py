@@ -228,22 +228,6 @@ _EVENT_BATCHES = [
     ),
 ]
 
-_ASOF_EXPECTED = [
-    ("a", 0.3, "cloud coverage"),
-    ("b", 0.4, None),
-    ("a", 0.5, "cloud coverage"),
-    ("b", 0.6, "rain start"),
-    ("a", 0.7, "rain stop"),
-]
-
-_ASOF_TOLERANCE_EXPECTED = [
-    ("a", 0.3, "cloud coverage"),  # 100 ms ≤ 1 s
-    ("b", 0.4, None),  # no prior event
-    ("a", 0.5, None),  # diff >> 1 s → NULLed by tolerance
-    ("b", 0.6, "rain start"),  # 20 ms ≤ 1 s
-    ("a", 0.7, "rain stop"),  # 0 ms ≤ 1 s
-]
-
 _ASOF_SQL = """
     SELECT s.site, s.humidity, e.event_type
     FROM sensors s
@@ -268,6 +252,16 @@ _ASOF_TOLERANCE_SQL = """
 """
 
 
+def _reference_result(sql: str) -> list:
+    """Run *sql* against full in-memory PyArrow tables to get the ground-truth result."""
+    sensors_table = pa.Table.from_batches(_SENSOR_BATCHES)
+    events_table = pa.Table.from_batches(_EVENT_BATCHES)
+    con = duckdb.connect()
+    con.register("sensors", sensors_table)
+    con.register("events", events_table)
+    return con.execute(sql).fetchall()
+
+
 def _make_asof_con(sensors_source, events_source) -> duckdb.DuckDBPyConnection:
     con = duckdb.connect()
     con.register("sensors", sensors_source)
@@ -276,9 +270,6 @@ def _make_asof_con(sensors_source, events_source) -> duckdb.DuckDBPyConnection:
 
 
 def test_asof_join_without_tolerance(tmp_path):
-    """CachedDataset: ASOF JOIN returns all 5 sensor rows, unmatched site gets NULL.
-    Bare reader: also works here — each table is only scanned once.
-    """
     sensors_ds = CachedDataset(
         pa.RecordBatchReader.from_batches(_SENSOR_SCHEMA, iter(_SENSOR_BATCHES)),
         memory_capacity=16 * 1024 * 1024,
@@ -291,8 +282,9 @@ def test_asof_join_without_tolerance(tmp_path):
         disk_path=str(tmp_path / "events"),
         disk_capacity=64 * 1024 * 1024,
     )
+    expected = _reference_result(_ASOF_SQL)
     rows = _make_asof_con(sensors_ds, events_ds).execute(_ASOF_SQL).fetchall()
-    assert rows == _ASOF_EXPECTED
+    assert rows == expected
 
     # Bare readers also work: a simple ASOF JOIN scans each table exactly once.
     bare_sensors = pa.RecordBatchReader.from_batches(
@@ -300,18 +292,10 @@ def test_asof_join_without_tolerance(tmp_path):
     )
     bare_events = pa.RecordBatchReader.from_batches(_EVENT_SCHEMA, iter(_EVENT_BATCHES))
     bare_rows = _make_asof_con(bare_sensors, bare_events).execute(_ASOF_SQL).fetchall()
-    assert bare_rows == _ASOF_EXPECTED
+    assert bare_rows == expected
 
 
 def test_asof_join_with_tolerance(tmp_path):
-    """CachedDataset: tolerance join returns all 5 rows with out-of-window matches NULLed.
-    Bare reader: empty result because the left-join-back rescans the exhausted stream.
-
-    The SQL mirrors xorq's three-step tolerance plan: ASOF JOIN → filter →
-    left-join back to sensors.  The left-join-back is the second scan that
-    kills a single-use reader.
-    """
-    # ── CachedDataset ────────────────────────────────────────────────────────
     sensors_ds = CachedDataset(
         pa.RecordBatchReader.from_batches(_SENSOR_SCHEMA, iter(_SENSOR_BATCHES)),
         memory_capacity=16 * 1024 * 1024,
@@ -324,10 +308,10 @@ def test_asof_join_with_tolerance(tmp_path):
         disk_path=str(tmp_path / "events"),
         disk_capacity=64 * 1024 * 1024,
     )
+    expected = _reference_result(_ASOF_TOLERANCE_SQL)
     rows = _make_asof_con(sensors_ds, events_ds).execute(_ASOF_TOLERANCE_SQL).fetchall()
-    assert rows == _ASOF_TOLERANCE_EXPECTED
+    assert rows == expected
 
-    # ── Bare readers ─────────────────────────────────────────────────────────
     bare_sensors = pa.RecordBatchReader.from_batches(
         _SENSOR_SCHEMA, iter(_SENSOR_BATCHES)
     )
@@ -340,5 +324,5 @@ def test_asof_join_with_tolerance(tmp_path):
     # The stream is partially or fully drained by one branch of the query before
     # the other branch runs.  The exact row count depends on DuckDB's scheduler,
     # but in all cases the result is wrong: no events are matched.
-    assert bare_rows != _ASOF_TOLERANCE_EXPECTED
+    assert bare_rows != expected
     assert all(row[2] is None for row in bare_rows)

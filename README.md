@@ -17,11 +17,12 @@ repeatedly without re-reading from disk or the network each time.
 Multiple independent readers can then replay the stream concurrently, each
 maintaining their own position in the batch sequence.
 
-```
-upstream source ──► CachedDataset ──► CachedDatasetReader 0 (from batch 0)
-   (read once)           │          ──► CachedDatasetReader 1 (from batch 0)
-                         │          ──► CachedDatasetReader 2 (from batch 3)
-                    [mem + disk]
+```mermaid
+flowchart LR
+    U["upstream source\n(read once)"] --> D["CachedDataset\n[mem + disk cache]"]
+    D --> R0["CachedDatasetReader 0\n(from batch 0)"]
+    D --> R1["CachedDatasetReader 1\n(from batch 0)"]
+    D --> R2["CachedDatasetReader 2\n(from batch 3)"]
 ```
 
 ## Installation
