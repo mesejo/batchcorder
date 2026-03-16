@@ -65,7 +65,21 @@ class CachedDataset:
     @property
     def schema(self) -> arro3.core.Schema:
         r"""
-        The Arrow schema of this dataset.
+        Arrow schema of this dataset.
+
+        Returns
+        -------
+        arro3.core.Schema
+
+        Examples
+        --------
+        >>> import tempfile, pyarrow as pa
+        >>> from batchcorder import CachedDataset
+        >>> table = pa.table({"id": [1, 2], "val": [0.5, 1.0]})
+        >>> tmp = tempfile.mkdtemp()
+        >>> ds = CachedDataset(table, 16 << 20, tmp, 64 << 20)
+        >>> [f.name for f in ds.schema]
+        ['id', 'val']
         """
     @property
     def ingested_count(self) -> builtins.int:
@@ -77,6 +91,20 @@ class CachedDataset:
         Returns
         -------
         int
+
+        Examples
+        --------
+        >>> import tempfile, pyarrow as pa
+        >>> from batchcorder import CachedDataset
+        >>> table = pa.table({"x": [1, 2, 3]})
+        >>> tmp = tempfile.mkdtemp()
+        >>> ds = CachedDataset(table, 16 << 20, tmp, 64 << 20)
+        >>> ds.ingested_count
+        0
+        >>> ds.ingest_all()
+        1
+        >>> ds.ingested_count
+        1
         """
     @property
     def upstream_exhausted(self) -> builtins.bool:
@@ -86,6 +114,20 @@ class CachedDataset:
         Returns
         -------
         bool
+
+        Examples
+        --------
+        >>> import tempfile, pyarrow as pa
+        >>> from batchcorder import CachedDataset
+        >>> table = pa.table({"x": [1, 2, 3]})
+        >>> tmp = tempfile.mkdtemp()
+        >>> ds = CachedDataset(table, 16 << 20, tmp, 64 << 20)
+        >>> ds.upstream_exhausted
+        False
+        >>> ds.ingest_all()
+        1
+        >>> ds.upstream_exhausted
+        True
         """
     def reader(self, from_start: builtins.bool = ...) -> CachedDatasetReader:
         r"""
@@ -125,6 +167,31 @@ class CachedDataset:
         -------
         CachedDatasetReader
         """
+    def __arrow_c_stream__(self, requested_schema: typing.Any = None) -> typing.Any:
+        r"""
+        An implementation of the [Arrow PyCapsule Interface](https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html).
+        This dunder method should not be called directly, but enables zero-copy data
+        transfer to other Python libraries that understand Arrow memory.
+
+        Creates a fresh reader starting at batch 0.  Allows the dataset to be
+        consumed directly by PyArrow, DuckDB, DataFusion, and any other
+        Arrow-compatible library.
+
+        Parameters
+        ----------
+        requested_schema : object, optional
+            Schema capsule to cast the stream to, or ``None``.
+        """
+    def __arrow_c_schema__(self) -> typing.Any:
+        r"""
+        An implementation of the [Arrow PyCapsule Interface](https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html).
+        This dunder method should not be called directly, but enables zero-copy data
+        transfer to other Python libraries that understand Arrow memory.
+
+        This allows Arrow consumers to inspect the data type of this
+        :class:`CachedDataset`.  Then the consumer can ask the producer (in
+        ``__arrow_c_stream__``) to cast the exported data to a supported data type.
+        """
     def ingest_all(self) -> builtins.int:
         r"""
         Eagerly ingest all batches from the upstream source into the cache.
@@ -150,8 +217,6 @@ class CachedDataset:
         >>> ds.upstream_exhausted
         True
         """
-    def __arrow_c_stream__(self, requested_schema: typing.Any = None) -> typing.Any: ...
-    def __arrow_c_schema__(self) -> typing.Any: ...
 
 @typing.final
 class CachedDatasetReader:
@@ -171,7 +236,19 @@ class CachedDatasetReader:
     one directly.
     """
     @property
-    def schema(self) -> arro3.core.Schema: ...
+    def schema(self) -> arro3.core.Schema:
+        r"""
+        Arrow schema of batches produced by this reader.
+
+        Returns
+        -------
+        arro3.core.Schema
+
+        Raises
+        ------
+        IOError
+            If the reader has already been consumed.
+        """
     @property
     def closed(self) -> builtins.bool:
         r"""
@@ -181,7 +258,38 @@ class CachedDatasetReader:
         -------
         bool
         """
+    def __arrow_c_stream__(self, requested_schema: typing.Any = None) -> typing.Any:
+        r"""
+        An implementation of the [Arrow PyCapsule Interface](https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html).
+        This dunder method should not be called directly, but enables zero-copy data
+        transfer to other Python libraries that understand Arrow memory.
+
+        Consumes the reader; subsequent calls raise an error.
+
+        Parameters
+        ----------
+        requested_schema : object, optional
+            Schema capsule to cast the stream to, or ``None``.
+
+        Raises
+        ------
+        IOError
+            If the reader has already been consumed.
+        """
+    def __arrow_c_schema__(self) -> typing.Any:
+        r"""
+        An implementation of the [Arrow PyCapsule Interface](https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html).
+        This dunder method should not be called directly, but enables zero-copy data
+        transfer to other Python libraries that understand Arrow memory.
+
+        This allows Arrow consumers to inspect the data type of this
+        :class:`CachedDatasetReader`.  Then the consumer can ask the producer (in
+        ``__arrow_c_stream__``) to cast the exported data to a supported data type.
+
+        Raises
+        ------
+        IOError
+            If the reader has already been consumed.
+        """
     def __iter__(self) -> CachedDatasetReader: ...
     def __next__(self) -> arro3.core.RecordBatch: ...
-    def __arrow_c_stream__(self, requested_schema: typing.Any = None) -> typing.Any: ...
-    def __arrow_c_schema__(self) -> typing.Any: ...

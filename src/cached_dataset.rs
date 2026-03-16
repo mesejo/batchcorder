@@ -307,7 +307,9 @@ impl PyCachedDatasetReader {
 #[gen_stub_pymethods]
 #[pymethods]
 impl PyCachedDatasetReader {
-    /// Export this reader as an Arrow C Stream PyCapsule.
+    /// An implementation of the [Arrow PyCapsule Interface](https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html).
+    /// This dunder method should not be called directly, but enables zero-copy data
+    /// transfer to other Python libraries that understand Arrow memory.
     ///
     /// Consumes the reader; subsequent calls raise an error.
     ///
@@ -320,11 +322,13 @@ impl PyCachedDatasetReader {
     /// ------
     /// IOError
     ///     If the reader has already been consumed.
-    #[gen_stub(skip)]
+
     #[pyo3(signature = (requested_schema = None))]
+    #[gen_stub(override_return_type(type_repr = "typing.Any", imports = ("typing",)))]
     fn __arrow_c_stream__<'py>(
         &self,
         py: Python<'py>,
+        #[gen_stub(override_type(type_repr = "typing.Any", imports = ("typing",)))]
         requested_schema: Option<Bound<'py, PyCapsule>>,
     ) -> PyArrowResult<Bound<'py, PyCapsule>> {
         let reader =
@@ -334,13 +338,19 @@ impl PyCachedDatasetReader {
         Self::to_stream_pycapsule(py, reader, requested_schema)
     }
 
-    /// Export the schema as an Arrow C Schema PyCapsule.
+    /// An implementation of the [Arrow PyCapsule Interface](https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html).
+    /// This dunder method should not be called directly, but enables zero-copy data
+    /// transfer to other Python libraries that understand Arrow memory.
+    ///
+    /// This allows Arrow consumers to inspect the data type of this
+    /// :class:`CachedDatasetReader`.  Then the consumer can ask the producer (in
+    /// ``__arrow_c_stream__``) to cast the exported data to a supported data type.
     ///
     /// Raises
     /// ------
     /// IOError
     ///     If the reader has already been consumed.
-    #[gen_stub(skip)]
+    #[gen_stub(override_return_type(type_repr = "typing.Any", imports = ("typing",)))]
     fn __arrow_c_schema__<'py>(&self, py: Python<'py>) -> PyArrowResult<Bound<'py, PyCapsule>> {
         let inner = self.0.lock().unwrap();
         let reader = inner
@@ -359,7 +369,7 @@ impl PyCachedDatasetReader {
     /// ------
     /// IOError
     ///     If the reader has already been consumed.
-    #[gen_stub(skip)]
+    #[gen_stub(override_return_type(type_repr = "arro3.core.Schema", imports = ("arro3.core",)))]
     #[getter]
     fn schema(&self) -> PyResult<Arro3Schema> {
         let inner = self.0.lock().unwrap();
@@ -383,7 +393,7 @@ impl PyCachedDatasetReader {
         slf
     }
 
-    #[gen_stub(skip)]
+    #[gen_stub(override_return_type(type_repr = "arro3.core.RecordBatch", imports = ("arro3.core",)))]
     fn __next__(&self, py: Python<'_>) -> PyArrowResult<Option<Arro3RecordBatch>> {
         let mut guard = self.0.lock().unwrap();
         let impl_ = match guard.as_mut() {
@@ -405,8 +415,6 @@ impl PyCachedDatasetReader {
         }
     }
 }
-
-// ── PyCachedDataset ──────────────────────────────────────────────────────────
 
 /// A hybrid memory+disk cached Arrow dataset.
 ///
@@ -536,7 +544,17 @@ impl PyCachedDataset {
     /// Returns
     /// -------
     /// arro3.core.Schema
-    #[gen_stub(skip)]
+    ///
+    /// Examples
+    /// --------
+    /// >>> import tempfile, pyarrow as pa
+    /// >>> from batchcorder import CachedDataset
+    /// >>> table = pa.table({"id": [1, 2], "val": [0.5, 1.0]})
+    /// >>> tmp = tempfile.mkdtemp()
+    /// >>> ds = CachedDataset(table, 16 << 20, tmp, 64 << 20)
+    /// >>> [f.name for f in ds.schema]
+    /// ['id', 'val']
+    #[gen_stub(override_return_type(type_repr = "arro3.core.Schema", imports = ("arro3.core",)))]
     #[getter]
     pub fn schema(&self) -> PyResult<Arro3Schema> {
         Ok(PySchema::new(self.schema.clone()).into())
@@ -601,7 +619,9 @@ impl PyCachedDataset {
         self.reader(py, true)
     }
 
-    /// Export this dataset as an Arrow C Stream PyCapsule.
+    /// An implementation of the [Arrow PyCapsule Interface](https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html).
+    /// This dunder method should not be called directly, but enables zero-copy data
+    /// transfer to other Python libraries that understand Arrow memory.
     ///
     /// Creates a fresh reader starting at batch 0.  Allows the dataset to be
     /// consumed directly by PyArrow, DuckDB, DataFusion, and any other
@@ -611,11 +631,12 @@ impl PyCachedDataset {
     /// ----------
     /// requested_schema : object, optional
     ///     Schema capsule to cast the stream to, or ``None``.
-    #[gen_stub(skip)]
     #[pyo3(signature = (requested_schema = None))]
+    #[gen_stub(override_return_type(type_repr = "typing.Any", imports = ("typing",)))]
     pub fn __arrow_c_stream__<'py>(
         &self,
         py: Python<'py>,
+        #[gen_stub(override_type(type_repr = "typing.Any", imports = ("typing",)))]
         requested_schema: Option<Bound<'py, PyCapsule>>,
     ) -> PyArrowResult<Bound<'py, PyCapsule>> {
         let reader = self.reader(py, true).map_err(PyArrowError::PyErr)?;
@@ -628,13 +649,14 @@ impl PyCachedDataset {
         PyCachedDatasetReader::to_stream_pycapsule(py, impl_, requested_schema)
     }
 
-    /// Export the schema as an Arrow C Schema PyCapsule.
+    /// An implementation of the [Arrow PyCapsule Interface](https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html).
+    /// This dunder method should not be called directly, but enables zero-copy data
+    /// transfer to other Python libraries that understand Arrow memory.
     ///
-    /// Returns
-    /// -------
-    /// object
-    ///     Arrow C Schema capsule.
-    #[gen_stub(skip)]
+    /// This allows Arrow consumers to inspect the data type of this
+    /// :class:`CachedDataset`.  Then the consumer can ask the producer (in
+    /// ``__arrow_c_stream__``) to cast the exported data to a supported data type.
+    #[gen_stub(override_return_type(type_repr = "typing.Any", imports = ("typing",)))]
     pub fn __arrow_c_schema__<'py>(&self, py: Python<'py>) -> PyArrowResult<Bound<'py, PyCapsule>> {
         to_schema_pycapsule(py, self.schema.as_ref())
     }
@@ -680,6 +702,20 @@ impl PyCachedDataset {
     /// Returns
     /// -------
     /// int
+    ///
+    /// Examples
+    /// --------
+    /// >>> import tempfile, pyarrow as pa
+    /// >>> from batchcorder import CachedDataset
+    /// >>> table = pa.table({"x": [1, 2, 3]})
+    /// >>> tmp = tempfile.mkdtemp()
+    /// >>> ds = CachedDataset(table, 16 << 20, tmp, 64 << 20)
+    /// >>> ds.ingested_count
+    /// 0
+    /// >>> ds.ingest_all()
+    /// 1
+    /// >>> ds.ingested_count
+    /// 1
     #[getter]
     pub fn ingested_count(&self, py: Python<'_>) -> PyResult<u64> {
         Ok(without_gil(py, || {
@@ -692,6 +728,20 @@ impl PyCachedDataset {
     /// Returns
     /// -------
     /// bool
+    ///
+    /// Examples
+    /// --------
+    /// >>> import tempfile, pyarrow as pa
+    /// >>> from batchcorder import CachedDataset
+    /// >>> table = pa.table({"x": [1, 2, 3]})
+    /// >>> tmp = tempfile.mkdtemp()
+    /// >>> ds = CachedDataset(table, 16 << 20, tmp, 64 << 20)
+    /// >>> ds.upstream_exhausted
+    /// False
+    /// >>> ds.ingest_all()
+    /// 1
+    /// >>> ds.upstream_exhausted
+    /// True
     #[getter]
     pub fn upstream_exhausted(&self, py: Python<'_>) -> PyResult<bool> {
         Ok(without_gil(py, || {
