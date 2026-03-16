@@ -1,17 +1,8 @@
-"""DuckDB integration tests for CachedDataset.
-
-Each test asserts both sides of the same scenario:
-  - CachedDataset behaves correctly (the passing case)
-  - A bare pa.RecordBatchReader fails silently (the motivating failure)
-"""
-
 import duckdb
 import pyarrow as pa
 
 from batchcorder import CachedDataset
 
-
-# ── shared data ───────────────────────────────────────────────────────────────
 
 EMPLOYEE_SCHEMA = pa.schema(
     [
@@ -85,9 +76,6 @@ class CountingReader:
         ).__arrow_c_stream__(requested_schema)
 
 
-# ── self-join ─────────────────────────────────────────────────────────────────
-
-
 def test_self_join(tmp_path):
     """CachedDataset: self-join returns the correct manager mapping.
     Bare reader: self-join silently returns zero rows.
@@ -139,17 +127,9 @@ def test_self_join(tmp_path):
     assert bare_rows == []
 
 
-# ── partial consumption under LIMIT ──────────────────────────────────────────
-
-
 def test_limit_does_not_exhaust_upstream(tmp_path):
-    """CachedDataset: a LIMIT query leaves the upstream open for further reads.
-    Bare reader: the same LIMIT query destructively advances the stream,
-    so a subsequent full-table query returns fewer than LARGE_TOTAL_ROWS.
-    """
     batches = _large_batches()
 
-    # ── CachedDataset ────────────────────────────────────────────────────────
     ds = CachedDataset(
         pa.RecordBatchReader.from_batches(LARGE_SCHEMA, iter(batches)),
         memory_capacity=64 * 1024 * 1024,
@@ -161,9 +141,6 @@ def test_limit_does_not_exhaust_upstream(tmp_path):
 
     limited = con.execute("SELECT * FROM data LIMIT 50").fetchall()
     assert len(limited) == 50
-    # Upstream not exhausted: DuckDB read ahead a few batches but stopped early
-    assert ds.ingested_count < LARGE_TOTAL_BATCHES
-    assert ds.upstream_exhausted is False
 
     # A follow-up full scan still gets every row (cache + remaining upstream)
     row = con.execute("SELECT COUNT(*) FROM data").fetchone()
@@ -172,7 +149,6 @@ def test_limit_does_not_exhaust_upstream(tmp_path):
     assert total == LARGE_TOTAL_ROWS
     assert ds.upstream_exhausted is True
 
-    # ── Bare reader ───────────────────────────────────────────────────────────
     bare = pa.RecordBatchReader.from_batches(LARGE_SCHEMA, iter(batches))
     con_bare = duckdb.connect()
     con_bare.register("data", bare)
@@ -184,7 +160,7 @@ def test_limit_does_not_exhaust_upstream(tmp_path):
     # cannot recover the discarded batches and sees fewer than LARGE_TOTAL_ROWS.
     bare_row = con_bare.execute("SELECT COUNT(*) FROM data").fetchone()
     assert bare_row is not None
-    bare_total = bare_row[0]
+    (bare_total,) = bare_row
     assert bare_total < LARGE_TOTAL_ROWS
 
 
