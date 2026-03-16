@@ -283,6 +283,94 @@ def test_ingest_all_idempotent(tmp_path):
     assert ds.ingest_all() == ds.ingest_all() == 4
 
 
+def test_disk_spill_and_pyarrow_ipc_roundtrip(tmp_path):
+    # Each batch: 100 rows × 1 KiB binary payload ≈ 100 KiB serialized.
+    # Memory tier is only 32 KiB — smaller than a single batch — so every
+    # batch inserted into the cache must be evicted to the disk tier.
+    n_batches = 5
+    rows_per_batch = 100
+    table = pa.table(
+        {
+            "id": list(range(n_batches * rows_per_batch)),
+            "payload": pa.array(
+                [b"x" * 1024] * (n_batches * rows_per_batch), type=pa.large_binary()
+            ),
+        }
+    )
+
+    ds = CachedDataset(
+        table.to_reader(max_chunksize=rows_per_batch),
+        memory_capacity=32 * 1024,  # 32 KiB — forces spill
+        disk_path=str(tmp_path),
+        disk_capacity=64 * 1024 * 1024,  # 64 MiB
+    )
+
+    # Ingest all batches so the disk tier is populated.
+    assert ds.ingest_all() == n_batches
+    assert ds.upstream_exhausted
+
+    # Foyer creates its block device files during cache construction and
+    # populates them as batches are evicted from the memory tier.
+    disk_files = [p for p in tmp_path.rglob("*") if p.is_file()]
+    assert len(disk_files) > 0, "Expected Foyer to write cache files to disk"
+
+    # Read back the full dataset via PyArrow's Arrow IPC stream interface.
+    # __arrow_c_stream__ exposes the data as an Arrow IPC-backed C stream,
+    # which pa.RecordBatchReader.from_stream() deserializes transparently.
+    result = pa.RecordBatchReader.from_stream(ds).read_all()
+    assert result.equals(table)
+
+
+def test_disk_spill_ipc_file_write_and_read(tmp_path):
+    # Same spill setup: 32 KiB memory tier, ~100 KiB per batch.
+    n_batches = 5
+    rows_per_batch = 100
+    table = pa.table(
+        {
+            "id": list(range(n_batches * rows_per_batch)),
+            "payload": pa.array(
+                [b"x" * 1024] * (n_batches * rows_per_batch), type=pa.large_binary()
+            ),
+        }
+    )
+
+    # Separate subdirectory so the Foyer device files and the IPC output
+    # file live in different places, keeping the disk-file assertion clean.
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    ipc_path = tmp_path / "out.arrow"
+
+    ds = CachedDataset(
+        table.to_reader(max_chunksize=rows_per_batch),
+        memory_capacity=32 * 1024,  # 32 KiB — forces spill to disk
+        disk_path=str(cache_dir),
+        disk_capacity=64 * 1024 * 1024,
+    )
+    ds.ingest_all()
+
+    # Verify Foyer wrote its block device files under cache_dir.
+    cache_files = [p for p in cache_dir.rglob("*") if p.is_file()]
+    assert len(cache_files) > 0, "Expected Foyer to write cache files to disk"
+
+    # Stream the data out of the cache (reading from the disk tier) and write
+    # it to a standard Arrow IPC *file* (random-access format).
+    reader = pa.RecordBatchReader.from_stream(ds)
+    with (
+        pa.OSFile(str(ipc_path), "wb") as sink,
+        pa.ipc.new_file(sink, reader.schema) as writer,
+    ):
+        for batch in reader:
+            writer.write_batch(batch)
+
+    assert ipc_path.exists(), "IPC file was not created"
+
+    # Read back using a memory map (zero-copy) and verify round-trip integrity.
+    # pa.memory_map + pa.ipc.open_file is the random-access, allocation-free path.
+    with pa.memory_map(str(ipc_path), "rb") as source:
+        loaded = pa.ipc.open_file(source).read_all()
+        assert loaded.equals(table)
+
+
 def test_concurrent_readers(tmp_path):
     table = _make_table(n_batches=8, rows_per_batch=5)
     ds = _dataset(tmp_path, table, batch_size=5)

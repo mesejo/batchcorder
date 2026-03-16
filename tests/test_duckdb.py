@@ -326,3 +326,227 @@ def test_asof_join_with_tolerance(tmp_path):
     # but in all cases the result is wrong: no events are matched.
     assert bare_rows != expected
     assert all(row[2] is None for row in bare_rows)
+
+
+# ── disk-spill fixtures ───────────────────────────────────────────────────────
+
+# Padded sensor/event batches for ASOF-join spill tests.
+# Each row carries a 50 KiB binary pad so every batch exceeds the 32 KiB
+# memory tier and is evicted to disk before DuckDB reads it.  The ASOF SQL
+# only selects site/humidity/event_type, so the pad column has no effect on
+# the query result and _reference_result() can be reused for ground truth.
+_PADDED_SENSOR_SCHEMA = pa.schema(
+    [
+        ("site", pa.string()),
+        ("humidity", pa.float64()),
+        ("event_time", pa.timestamp("us")),
+        ("pad", pa.large_binary()),
+    ]
+)
+_PADDED_SENSOR_BATCHES = [
+    pa.record_batch(
+        {
+            "site": batch["site"],
+            "humidity": batch["humidity"],
+            "event_time": batch["event_time"],
+            "pad": [b"x" * 1024 * 50] * batch.num_rows,
+        },
+        schema=_PADDED_SENSOR_SCHEMA,
+    )
+    for batch in _SENSOR_BATCHES
+]
+
+_PADDED_EVENT_SCHEMA = pa.schema(
+    [
+        ("site", pa.string()),
+        ("event_type", pa.string()),
+        ("event_time", pa.timestamp("us")),
+        ("pad", pa.large_binary()),
+    ]
+)
+_PADDED_EVENT_BATCHES = [
+    pa.record_batch(
+        {
+            "site": batch["site"],
+            "event_type": batch["event_type"],
+            "event_time": batch["event_time"],
+            "pad": [b"x" * 1024 * 50] * batch.num_rows,
+        },
+        schema=_PADDED_EVENT_SCHEMA,
+    )
+    for batch in _EVENT_BATCHES
+]
+
+# Each batch below carries a 1 KiB binary pad per row so the serialized IPC
+# blob is well above the 32 KiB memory tier, guaranteeing that Foyer evicts
+# every entry to the disk tier before a reader fetches it.
+_SPILL_MEMORY = 32 * 1024  # 32 KiB memory tier
+
+_PADDED_EMPLOYEE_SCHEMA = pa.schema(
+    [
+        ("id", pa.int64()),
+        ("name", pa.string()),
+        ("manager_id", pa.int64()),
+        ("pad", pa.large_binary()),
+    ]
+)
+
+_PADDED_EMPLOYEE_BATCHES = [
+    pa.record_batch(
+        {
+            "id": batch["id"],
+            "name": batch["name"],
+            "manager_id": batch["manager_id"],
+            # 50 KiB per row × 3 rows ≈ 150 KiB per batch — far above 32 KiB
+            "pad": [b"x" * 1024 * 50] * batch.num_rows,
+        },
+        schema=_PADDED_EMPLOYEE_SCHEMA,
+    )
+    for batch in EMPLOYEE_BATCHES
+]
+
+_SPILL_AGG_SCHEMA = pa.schema(
+    [("id", pa.int64()), ("value", pa.float64()), ("pad", pa.large_binary())]
+)
+_SPILL_AGG_BATCHES = 10
+_SPILL_AGG_ROWS = 100
+
+
+def _spill_agg_batches() -> list[pa.RecordBatch]:
+    """10 batches of 100 rows with a 1 KiB pad (≈ 100 KiB each serialized)."""
+    return [
+        pa.record_batch(
+            {
+                "id": list(range(i * _SPILL_AGG_ROWS, (i + 1) * _SPILL_AGG_ROWS)),
+                "value": [
+                    float(j)
+                    for j in range(i * _SPILL_AGG_ROWS, (i + 1) * _SPILL_AGG_ROWS)
+                ],
+                "pad": [b"x" * 1024] * _SPILL_AGG_ROWS,
+            },
+            schema=_SPILL_AGG_SCHEMA,
+        )
+        for i in range(_SPILL_AGG_BATCHES)
+    ]
+
+
+def _spill_agg_reference(sql: str) -> list:
+    """Run *sql* against the full in-memory aggregation table for ground truth."""
+    table = pa.Table.from_batches(_spill_agg_batches())
+    con = duckdb.connect()
+    con.register("data", table)
+    return con.execute(sql).fetchall()
+
+
+# ── disk-spill tests ──────────────────────────────────────────────────────────
+
+
+def test_self_join_with_disk_spill(tmp_path):
+    """Self-join returns the correct result when every cache entry is on disk.
+
+    DuckDB scans the table twice (once per join side).  CachedDataset replays
+    the stream from the disk tier on the second scan; a bare reader cannot.
+    """
+    source = CountingReader(_PADDED_EMPLOYEE_BATCHES, _PADDED_EMPLOYEE_SCHEMA)
+    ds = CachedDataset(
+        source,
+        memory_capacity=_SPILL_MEMORY,
+        disk_path=str(tmp_path),
+        disk_capacity=64 * 1024 * 1024,
+    )
+
+    con = duckdb.connect()
+    con.register("employees", ds)
+
+    rows = con.execute("""
+        SELECT e.name AS employee, m.name AS manager
+        FROM employees e
+        JOIN employees m ON e.manager_id = m.id
+        ORDER BY e.name
+    """).fetchall()
+
+    assert rows == [
+        ("Bob", "Alice"),
+        ("Carol", "Alice"),
+        ("Dave", "Bob"),
+        ("Eve", "Bob"),
+        ("Frank", "Carol"),
+    ]
+    # Upstream was ingested exactly once regardless of how many scans DuckDB ran.
+    assert source.batches_read == len(_PADDED_EMPLOYEE_BATCHES)
+    assert ds.upstream_exhausted is True
+
+    # Confirm the cache actually spilled to disk.
+    disk_files = [p for p in tmp_path.rglob("*") if p.is_file()]
+    assert len(disk_files) > 0, "Expected Foyer to spill cache entries to disk"
+
+
+def test_aggregation_with_disk_spill(tmp_path):
+    """COUNT/SUM/AVG/MIN/MAX on a large dataset that fully spills to the disk tier."""
+    batches = _spill_agg_batches()
+    ds = CachedDataset(
+        pa.RecordBatchReader.from_batches(_SPILL_AGG_SCHEMA, iter(batches)),
+        memory_capacity=_SPILL_MEMORY,
+        disk_path=str(tmp_path),
+        disk_capacity=256 * 1024 * 1024,
+    )
+
+    con = duckdb.connect()
+    con.register("data", ds)
+
+    for sql in [
+        "SELECT COUNT(*) FROM data",
+        "SELECT SUM(id) FROM data",
+        "SELECT AVG(value) FROM data",
+        "SELECT MIN(id), MAX(id) FROM data",
+    ]:
+        assert con.execute(sql).fetchall() == _spill_agg_reference(sql), sql
+
+    assert ds.upstream_exhausted is True
+
+    disk_files = [p for p in tmp_path.rglob("*") if p.is_file()]
+    assert len(disk_files) > 0, "Expected Foyer to spill cache entries to disk"
+
+
+def test_asof_join_with_tolerance_and_disk_spill(tmp_path):
+    """ASOF join with 1-second tolerance returns the correct result when both
+    datasets are fully spilled to the disk tier.
+
+    DuckDB scans sensors twice (once for the ASOF subquery, once for the outer
+    LEFT JOIN).  CachedDataset replays both tables from disk on each rescan;
+    a bare reader would drain on the first pass and produce wrong results, as
+    verified by test_asof_join_with_tolerance.
+    """
+    sensors_ds = CachedDataset(
+        pa.RecordBatchReader.from_batches(
+            _PADDED_SENSOR_SCHEMA, iter(_PADDED_SENSOR_BATCHES)
+        ),
+        memory_capacity=_SPILL_MEMORY,
+        disk_path=str(tmp_path / "sensors"),
+        disk_capacity=64 * 1024 * 1024,
+    )
+    events_ds = CachedDataset(
+        pa.RecordBatchReader.from_batches(
+            _PADDED_EVENT_SCHEMA, iter(_PADDED_EVENT_BATCHES)
+        ),
+        memory_capacity=_SPILL_MEMORY,
+        disk_path=str(tmp_path / "events"),
+        disk_capacity=64 * 1024 * 1024,
+    )
+
+    rows = _make_asof_con(sensors_ds, events_ds).execute(_ASOF_TOLERANCE_SQL).fetchall()
+
+    # Ground truth from the un-padded in-memory tables — result columns are
+    # identical because _ASOF_TOLERANCE_SQL never references the pad column.
+    assert rows == _reference_result(_ASOF_TOLERANCE_SQL)
+
+    assert sensors_ds.upstream_exhausted is True
+    assert events_ds.upstream_exhausted is True
+
+    # Both cache directories must contain Foyer block device files.
+    for label, path in [
+        ("sensors", tmp_path / "sensors"),
+        ("events", tmp_path / "events"),
+    ]:
+        disk_files = [p for p in path.rglob("*") if p.is_file()]
+        assert len(disk_files) > 0, f"Expected Foyer to spill {label} cache to disk"
