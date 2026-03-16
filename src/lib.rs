@@ -3,13 +3,13 @@ use pyo3_stub_gen::define_stub_info_gatherer;
 
 mod cached_dataset;
 
-/// Register the `batchcorder` Python extension module.
+/// Register the `batchcorder._batchcorder` Python extension module.
 ///
 /// Exposes:
 /// * [`cached_dataset::PyCachedDataset`] — hybrid-cached Arrow dataset
 /// * [`cached_dataset::PyCachedDatasetReader`] — independent reader handle
 #[pymodule]
-fn batchcorder(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _batchcorder(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<cached_dataset::PyCachedDataset>()?;
     m.add_class::<cached_dataset::PyCachedDatasetReader>()?;
     Ok(())

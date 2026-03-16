@@ -6,6 +6,8 @@ import typing
 
 import arro3.core
 
+__version__: str
+
 __all__ = [
     "CachedDataset",
     "CachedDatasetReader",
