@@ -39,7 +39,7 @@ jobs:
 
       # Nightly is required by the `cargo +nightly fmt` pre-commit hook.
       - name: Install Rust nightly
-        run: rustup toolchain install nightly --profile minimal --no-self-update
+        run: rustup toolchain install nightly --profile minimal --component rustfmt --no-self-update
 
       - name: Set up sccache
         uses: mozilla-actions/sccache-action@v0.0.9
