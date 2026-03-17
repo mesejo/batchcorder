@@ -468,21 +468,6 @@ pub struct PyCachedDataset {
 #[gen_stub_pymethods]
 #[pymethods]
 impl PyCachedDataset {
-    /// Create a new :class:`CachedDataset`.
-    ///
-    /// Foyer opens (or creates) the disk cache under ``disk_path`` during
-    /// construction.  The call blocks until the cache is ready.
-    ///
-    /// Parameters
-    /// ----------
-    /// reader : object
-    ///     Any object implementing ``__arrow_c_stream__``.
-    /// memory_capacity : int
-    ///     In-memory cache tier size in bytes.
-    /// disk_path : str
-    ///     Directory for the on-disk cache tier.
-    /// disk_capacity : int
-    ///     On-disk cache tier size in bytes.
     #[new]
     #[pyo3(signature = (reader, memory_capacity, disk_path, disk_capacity))]
     pub fn new(
