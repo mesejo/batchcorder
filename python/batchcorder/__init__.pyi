@@ -6,8 +6,6 @@ import typing
 
 import arro3.core
 
-__version__: str
-
 __all__ = [
     "CachedDataset",
     "CachedDatasetReader",
@@ -55,13 +53,6 @@ class CachedDataset:
     >>> ds.upstream_exhausted
     True
     """
-    def __new__(
-        cls,
-        reader: typing.Any,
-        memory_capacity: builtins.int,
-        disk_path: builtins.str,
-        disk_capacity: builtins.int,
-    ) -> CachedDataset: ...
     @property
     def schema(self) -> arro3.core.Schema:
         r"""
@@ -128,6 +119,30 @@ class CachedDataset:
         1
         >>> ds.upstream_exhausted
         True
+        """
+    def __new__(
+        cls,
+        reader: typing.Any,
+        memory_capacity: builtins.int,
+        disk_path: builtins.str,
+        disk_capacity: builtins.int,
+    ) -> CachedDataset:
+        r"""
+        Create a new :class:`CachedDataset`.
+
+        Foyer opens (or creates) the disk cache under ``disk_path`` during
+        construction.  The call blocks until the cache is ready.
+
+        Parameters
+        ----------
+        reader : object
+            Any object implementing ``__arrow_c_stream__``.
+        memory_capacity : int
+            In-memory cache tier size in bytes.
+        disk_path : str
+            Directory for the on-disk cache tier.
+        disk_capacity : int
+            On-disk cache tier size in bytes.
         """
     def reader(self, from_start: builtins.bool = ...) -> CachedDatasetReader:
         r"""

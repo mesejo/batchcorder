@@ -9,4 +9,4 @@ __all__ = [
 ]
 
 
-__version__ = version("batchcorder")
+__version__: str = version("batchcorder")

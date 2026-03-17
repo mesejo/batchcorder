@@ -389,7 +389,7 @@ impl PyCachedDatasetReader {
         self.0.lock().unwrap().is_none()
     }
 
-    fn __iter__(slf: Py<Self>) -> Py<Self> {
+    fn __iter__<'py>(slf: PyRef<'py, Self>) -> PyRef<'py, Self> {
         slf
     }
 
@@ -483,11 +483,11 @@ impl PyCachedDataset {
     ///     Directory for the on-disk cache tier.
     /// disk_capacity : int
     ///     On-disk cache tier size in bytes.
-    #[gen_stub(skip)]
     #[new]
     #[pyo3(signature = (reader, memory_capacity, disk_path, disk_capacity))]
     pub fn new(
         py: Python<'_>,
+        #[gen_stub(override_type(type_repr = "typing.Any", imports = ("typing",)))]
         reader: PyRecordBatchReader,
         memory_capacity: usize,
         disk_path: String,
