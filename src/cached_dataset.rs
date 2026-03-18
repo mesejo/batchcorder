@@ -261,7 +261,7 @@ impl Drop for CachedDatasetReaderImpl {
 
 // ── PyCachedDatasetReader ────────────────────────────────────────────────────
 
-/// A single-use iterator handle for a :class:`CachedDataset`.
+/// A single-use iterator handle for a [CachedDataset][batchcorder.CachedDataset].
 ///
 /// Maintains an independent read position.  Multiple handles backed by the
 /// same dataset share the underlying cache; the upstream source is ingested
@@ -272,7 +272,7 @@ impl Drop for CachedDatasetReaderImpl {
 ///
 /// Notes
 /// -----
-/// Obtain a handle from :meth:`CachedDataset.reader` rather than constructing
+/// Obtain a handle from [CachedDataset.reader][batchcorder.CachedDataset.reader] rather than constructing
 /// one directly.
 #[gen_stub_pyclass]
 #[pyclass(module = "batchcorder", name = "CachedDatasetReader", frozen)]
@@ -343,7 +343,7 @@ impl PyCachedDatasetReader {
     /// transfer to other Python libraries that understand Arrow memory.
     ///
     /// This allows Arrow consumers to inspect the data type of this
-    /// :class:`CachedDatasetReader`.  Then the consumer can ask the producer (in
+    /// [CachedDatasetReader][batchcorder.CachedDatasetReader].  Then the consumer can ask the producer (in
     /// ``__arrow_c_stream__``) to cast the exported data to a supported data type.
     ///
     /// Raises
@@ -420,15 +420,15 @@ impl PyCachedDatasetReader {
 ///
 /// Wraps any Arrow stream source and caches each ``RecordBatch`` in a Foyer
 /// hybrid cache keyed by a monotonic batch index.  Multiple independent
-/// :class:`CachedDatasetReader` handles can replay the full stream from any
+/// [CachedDatasetReader][batchcorder.CachedDatasetReader] handles can replay the full stream from any
 /// position; the upstream source is ingested lazily on demand.
 ///
 /// Parameters
 /// ----------
 /// reader : object
 ///     Any object implementing ``__arrow_c_stream__`` (e.g.
-///     :class:`pyarrow.Table`, :class:`pyarrow.RecordBatchReader`,
-///     :class:`arro3.core.RecordBatchReader`).
+///     pyarrow.Table, pyarrow.RecordBatchReader,
+///     arro3.core.RecordBatchReader).
 /// memory_capacity : int
 ///     In-memory cache tier size in bytes.
 /// disk_path : str
@@ -492,7 +492,7 @@ impl PyCachedDataset {
         let disk_cap_usize = usize::try_from(disk_capacity).unwrap_or(usize::MAX);
 
         // Release the GIL while building the cache: Foyer opens disk files
-        // and initialises its async engine, which is pure Rust I/O.
+        // and initializes its async engine, which is pure Rust I/O.
         let cache: HybridCache<u64, Vec<u8>> = without_gil(py, || {
             rt.block_on(async {
                 let device = FsDeviceBuilder::new(std::path::Path::new(&disk_path))
@@ -545,7 +545,7 @@ impl PyCachedDataset {
         Ok(PySchema::new(self.schema.clone()).into())
     }
 
-    /// Return a new :class:`CachedDatasetReader` handle.
+    /// Return a new [CachedDatasetReader][batchcorder.CachedDatasetReader] handle.
     ///
     /// Parameters
     /// ----------
@@ -594,7 +594,7 @@ impl PyCachedDataset {
 
     /// Iterate over all batches from the start.
     ///
-    /// Creates a fresh :class:`CachedDatasetReader` starting at batch 0 and
+    /// Creates a fresh [CachedDatasetReader][batchcorder.CachedDatasetReader] starting at batch 0 and
     /// returns it as the iterator.
     ///
     /// Returns
@@ -639,7 +639,7 @@ impl PyCachedDataset {
     /// transfer to other Python libraries that understand Arrow memory.
     ///
     /// This allows Arrow consumers to inspect the data type of this
-    /// :class:`CachedDataset`.  Then the consumer can ask the producer (in
+    /// [CachedDataset][batchcorder.CachedDataset].  Then the consumer can ask the producer (in
     /// ``__arrow_c_stream__``) to cast the exported data to a supported data type.
     #[gen_stub(override_return_type(type_repr = "typing.Any", imports = ("typing",)))]
     pub fn __arrow_c_schema__<'py>(&self, py: Python<'py>) -> PyArrowResult<Bound<'py, PyCapsule>> {

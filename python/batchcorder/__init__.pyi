@@ -18,15 +18,15 @@ class CachedDataset:
 
     Wraps any Arrow stream source and caches each ``RecordBatch`` in a Foyer
     hybrid cache keyed by a monotonic batch index.  Multiple independent
-    :class:`CachedDatasetReader` handles can replay the full stream from any
+    [CachedDatasetReader][batchcorder.CachedDatasetReader] handles can replay the full stream from any
     position; the upstream source is ingested lazily on demand.
 
     Parameters
     ----------
     reader : object
         Any object implementing ``__arrow_c_stream__`` (e.g.
-        :class:`pyarrow.Table`, :class:`pyarrow.RecordBatchReader`,
-        :class:`arro3.core.RecordBatchReader`).
+        pyarrow.Table, pyarrow.RecordBatchReader,
+        arro3.core.RecordBatchReader).
     memory_capacity : int
         In-memory cache tier size in bytes.
     disk_path : str
@@ -129,7 +129,7 @@ class CachedDataset:
     ) -> CachedDataset: ...
     def reader(self, from_start: builtins.bool = ...) -> CachedDatasetReader:
         r"""
-        Return a new :class:`CachedDatasetReader` handle.
+        Return a new [CachedDatasetReader][batchcorder.CachedDatasetReader] handle.
 
         Parameters
         ----------
@@ -158,7 +158,7 @@ class CachedDataset:
         r"""
         Iterate over all batches from the start.
 
-        Creates a fresh :class:`CachedDatasetReader` starting at batch 0 and
+        Creates a fresh [CachedDatasetReader][batchcorder.CachedDatasetReader] starting at batch 0 and
         returns it as the iterator.
 
         Returns
@@ -187,7 +187,7 @@ class CachedDataset:
         transfer to other Python libraries that understand Arrow memory.
 
         This allows Arrow consumers to inspect the data type of this
-        :class:`CachedDataset`.  Then the consumer can ask the producer (in
+        [CachedDataset][batchcorder.CachedDataset].  Then the consumer can ask the producer (in
         ``__arrow_c_stream__``) to cast the exported data to a supported data type.
         """
     def ingest_all(self) -> builtins.int:
@@ -219,7 +219,7 @@ class CachedDataset:
 @typing.final
 class CachedDatasetReader:
     r"""
-    A single-use iterator handle for a :class:`CachedDataset`.
+    A single-use iterator handle for a [CachedDataset][batchcorder.CachedDataset].
 
     Maintains an independent read position.  Multiple handles backed by the
     same dataset share the underlying cache; the upstream source is ingested
@@ -230,7 +230,7 @@ class CachedDatasetReader:
 
     Notes
     -----
-    Obtain a handle from :meth:`CachedDataset.reader` rather than constructing
+    Obtain a handle from [CachedDataset.reader][batchcorder.CachedDataset.reader] rather than constructing
     one directly.
     """
     @property
@@ -281,7 +281,7 @@ class CachedDatasetReader:
         transfer to other Python libraries that understand Arrow memory.
 
         This allows Arrow consumers to inspect the data type of this
-        :class:`CachedDatasetReader`.  Then the consumer can ask the producer (in
+        [CachedDatasetReader][batchcorder.CachedDatasetReader].  Then the consumer can ask the producer (in
         ``__arrow_c_stream__``) to cast the exported data to a supported data type.
 
         Raises

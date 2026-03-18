@@ -11,6 +11,7 @@ classifiers = [
   "Programming Language :: Python :: Implementation :: PyPy",
 ]
 dynamic = ["version"]
+dependencies = ["ipython>=9.10.0"]
 
 [tool.maturin]
 python-source = "python"
@@ -18,6 +19,7 @@ features = ["pyo3/extension-module"]
 module-name = "batchcorder._batchcorder"
 
 [dependency-groups]
+docs = ["mkdocs-material>=9", "mkdocstrings[python]>=0.29"]
 dev = [
   "pyarrow>=14",
   "arro3-core>=0.4",
@@ -39,7 +41,7 @@ extend-select = [
   "ICN",     # import conventions
   "B",       # flake8-bugbear: mutable default args, exception chaining, etc.
   "C4",      # flake8-comprehensions: unnecessary list/dict/set comprehensions
-  "FURB",    # refurb: modernise Python code
+  "FURB",    # refurb: modernize Python code
   "PLC0415", # import-outside-toplevel: imports must be at module level
   "SIM",
 ]

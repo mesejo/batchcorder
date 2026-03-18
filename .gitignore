@@ -76,3 +76,5 @@ docs/_build/
 .envrc
 
 !src/bin
+
+site/
