@@ -1,0 +1,65 @@
+---
+title: "API overview"
+---
+
+batchcorder exposes two public classes. Both implement the
+[Arrow PyCapsule Interface](https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html)
+(`__arrow_c_stream__` and `__arrow_c_schema__`), so they are interoperable
+with PyArrow, DuckDB, Polars, DataFusion, and any other Arrow-compatible
+library without explicit conversion.
+
+## `CachedDataset`
+
+The primary entry point. Wraps an Arrow stream source and manages the
+hybrid memory + disk cache.
+
+| Method / property        | Description |
+|--------------------------|-------------|
+| `__init__(...)`          | Create a dataset from any `__arrow_c_stream__` source. |
+| `reader(from_start=True)`| Return a new independent reader handle. |
+| `ingest_all()`           | Eagerly consume the upstream source into the cache. |
+| `schema`                 | Arrow schema of the stream. |
+| `ingested_count`         | Number of batches pulled from upstream so far. |
+| `upstream_exhausted`     | `True` once the upstream source is fully consumed. |
+| `__iter__()`             | Create a reader starting at batch 0 and return it. |
+| `__arrow_c_stream__()`   | Create a reader starting at batch 0 (for PyCapsule consumers). |
+| `__arrow_c_schema__()`   | Expose the schema for PyCapsule consumers. |
+
+Full API documentation: [batchcorder.CachedDataset](../autoapi/batchcorder/index.rst).
+
+## `CachedDatasetReader`
+
+A single-use iterator handle. Maintains its own position in the batch
+sequence. Obtain one via `CachedDataset.reader()` — do not construct directly.
+
+| Method / property        | Description |
+|--------------------------|-------------|
+| `__iter__()`             | Return `self` (readers are their own iterators). |
+| `__next__()`             | Return the next `arro3.core.RecordBatch`. |
+| `schema`                 | Arrow schema of batches produced by this reader. |
+| `closed`                 | `True` if the reader has been consumed. |
+| `__arrow_c_stream__()`   | Consume the reader (for PyCapsule consumers). |
+| `__arrow_c_schema__()`   | Expose the schema for PyCapsule consumers. |
+
+Full API documentation: [batchcorder.CachedDatasetReader](../autoapi/batchcorder/index.rst).
+
+## Compatibility
+
+Both classes accept and produce data through the Arrow PyCapsule Interface,
+making them compatible with:
+
+```python
+import pyarrow as pa
+import duckdb
+
+ds = ...   # a CachedDataset
+
+# PyArrow
+table = pa.table(ds)
+reader = pa.RecordBatchReader.from_stream(ds)
+
+# DuckDB (register as a named relation)
+duckdb.table("ds")
+
+# Any library that supports __arrow_c_stream__
+```

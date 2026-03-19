@@ -1,0 +1,111 @@
+---
+title: "Size the cache correctly"
+---
+
+Foyer evicts cache entries under memory or disk pressure. If a batch is evicted
+before a reader reaches it, the reader raises an `IOError`. This guide explains
+how to choose `memory_capacity` and `disk_capacity` to prevent that.
+
+## The rule
+
+The cache must be large enough to hold all batches that any live reader
+might still need to read. In other words:
+
+> **minimum cache size = (max_batch_bytes) × (max_reader_lag_in_batches)**
+
+Where *reader lag* is the difference in batch index between the most advanced
+reader and the slowest reader.
+
+## Estimate batch size
+
+Use PyArrow to measure the serialised size of a representative batch:
+
+```python
+import pyarrow as pa
+import pyarrow.ipc as ipc
+import io
+
+def serialised_bytes(batch: pa.RecordBatch) -> int:
+    """Return the IPC-serialised size of a single RecordBatch in bytes."""
+    sink = pa.BufferOutputStream()
+    with ipc.new_stream(sink, batch.schema) as writer:
+        writer.write_batch(batch)
+    return sink.getvalue().size
+
+# Sample from your actual data source:
+sample_batch = ...   # first batch from your reader
+print(serialised_bytes(sample_batch), "bytes per batch")
+```
+
+Foyer stores data in its own serialised format, but IPC size is a reasonable
+upper-bound estimate.
+
+## Single-pass workloads (all readers finish before the next starts)
+
+If all readers are created and fully consumed before new ones are created, only
+one reader is live at any time. The minimum cache size is just one batch:
+
+```python
+ds = CachedDataset(source, memory_capacity=batch_bytes * 2, ...)
+```
+
+In practice, add a safety margin of ×2–×4.
+
+## Concurrent readers with variable speed
+
+If readers run concurrently (e.g. in different threads or async tasks) and
+advance at different rates, the cache must cover the full range from the
+slowest to the fastest reader:
+
+```python
+# Suppose batches are ~1 MB each and you have 3 concurrent readers
+# that can diverge by up to 50 batches.
+batch_bytes  = 1 << 20          # 1 MB
+max_lag      = 50               # batches
+safety       = 2
+
+memory_capacity = batch_bytes * max_lag * safety   # 100 MB
+disk_capacity   = memory_capacity * 4              # 400 MB  (disk is cheaper)
+```
+
+Allocate more disk than memory: Foyer spills from memory to disk
+automatically, so a generous disk tier prevents eviction even when the memory
+tier fills.
+
+## Training-loop workloads
+
+For ML training loops where you replay the full dataset each epoch:
+
+1. Call `ingest_all()` once before training starts.
+2. Size the cache to hold the **entire dataset**, not just the active window.
+
+```python
+import os, tempfile
+import pyarrow.parquet as pq
+from batchcorder import CachedDataset
+
+dataset_bytes = sum(
+    os.path.getsize(f) for f in ["shard_0.parquet", "shard_1.parquet"]
+)
+
+tmp = tempfile.mkdtemp()
+ds = CachedDataset(
+    pq.read_table("shard_0.parquet"),   # or a concatenated reader
+    memory_capacity = min(dataset_bytes, 512 << 20),   # cap at 512 MB RAM
+    disk_path       = tmp,
+    disk_capacity   = dataset_bytes * 2,               # full dataset + headroom
+)
+ds.ingest_all()
+```
+
+## Detecting eviction errors
+
+If the cache is too small you will see:
+
+```
+IOError: Cache entry for batch N has been evicted.
+```
+
+When this happens, either increase the cache sizes or reduce reader concurrency
+so the lag between readers shrinks.
+See [Handle eviction errors](eviction.md) for recovery strategies.

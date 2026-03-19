@@ -168,7 +168,7 @@ class CachedDataset:
         """
     def __arrow_c_stream__(self, requested_schema: typing.Any = None) -> typing.Any:
         r"""
-        An implementation of the [Arrow PyCapsule Interface](https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html).
+        An implementation of the `Arrow PyCapsule Interface <https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html>`_.
         This dunder method should not be called directly, but enables zero-copy data
         transfer to other Python libraries that understand Arrow memory.
 
@@ -183,7 +183,7 @@ class CachedDataset:
         """
     def __arrow_c_schema__(self) -> typing.Any:
         r"""
-        An implementation of the [Arrow PyCapsule Interface](https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html).
+        An implementation of the `Arrow PyCapsule Interface <https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html>`_.
         This dunder method should not be called directly, but enables zero-copy data
         transfer to other Python libraries that understand Arrow memory.
 
@@ -298,7 +298,7 @@ class CachedDatasetReader:
         """
     def __arrow_c_stream__(self, requested_schema: typing.Any = None) -> typing.Any:
         r"""
-        An implementation of the [Arrow PyCapsule Interface](https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html).
+        An implementation of the `Arrow PyCapsule Interface <https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html>`_.
         This dunder method should not be called directly, but enables zero-copy data
         transfer to other Python libraries that understand Arrow memory.
 
@@ -316,7 +316,7 @@ class CachedDatasetReader:
         """
     def __arrow_c_schema__(self) -> typing.Any:
         r"""
-        An implementation of the [Arrow PyCapsule Interface](https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html).
+        An implementation of the `Arrow PyCapsule Interface <https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html>`_.
         This dunder method should not be called directly, but enables zero-copy data
         transfer to other Python libraries that understand Arrow memory.
 
