@@ -21,11 +21,15 @@
 
 use std::collections::HashMap;
 use std::io::Cursor;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use arrow_array::{ArrayRef, RecordBatch, StructArray};
 use arrow_schema::{ArrowError, Field, SchemaRef};
-use foyer::{BlockEngineConfig, DeviceBuilder, FsDeviceBuilder, HybridCache, HybridCacheBuilder};
+use foyer::{
+    BlockEngineConfig, DeviceBuilder, FsDeviceBuilder, HybridCache, HybridCacheBuilder,
+    HybridCachePolicy,
+};
 use pyo3::exceptions::PyIOError;
 use pyo3::prelude::*;
 use pyo3::types::PyCapsule;
@@ -136,6 +140,8 @@ struct DatasetInner {
     consumer_positions: HashMap<u64, u64>,
     /// Monotonically increasing counter used to assign unique consumer IDs.
     next_consumer_id: u64,
+    /// Disk path for the cache storage.
+    disk_path: PathBuf,
 }
 
 impl DatasetInner {
@@ -393,6 +399,49 @@ impl PyCachedDatasetReader {
         slf
     }
 
+    /// Cast the reader to produce batches with the given schema.
+    ///
+    /// Mirrors :meth:`pyarrow.RecordBatchReader.cast`.  Returns a
+    /// :class:`pyarrow.RecordBatchReader` that applies the cast as batches are
+    /// read.  Consumes this reader.
+    ///
+    /// Parameters
+    /// ----------
+    /// target_schema : object
+    ///     Any Arrow schema-compatible object (e.g. :class:`pyarrow.Schema`,
+    ///     :class:`arro3.core.Schema`).
+    ///
+    /// Returns
+    /// -------
+    /// pyarrow.RecordBatchReader
+    ///
+    /// Raises
+    /// ------
+    /// IOError
+    ///     If the reader has already been consumed.
+    #[gen_stub(override_return_type(type_repr = "typing.Any", imports = ("typing",)))]
+    fn cast<'py>(
+        &self,
+        py: Python<'py>,
+        #[gen_stub(override_type(type_repr = "typing.Any", imports = ("typing",)))]
+        target_schema: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let impl_ = self
+            .0
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or_else(|| PyIOError::new_err("Reader already consumed"))?;
+        let new_reader = PyCachedDatasetReader::new(impl_);
+        let kwargs = pyo3::types::PyDict::new(py);
+        kwargs.set_item("schema", target_schema)?;
+        let py_reader = Bound::new(py, new_reader)?;
+        py.import("pyarrow")?
+            .getattr("RecordBatchReader")?
+            .getattr("from_stream")?
+            .call((py_reader,), Some(&kwargs))
+    }
+
     #[gen_stub(override_return_type(type_repr = "arro3.core.RecordBatch", imports = ("arro3.core",)))]
     fn __next__(&self, py: Python<'_>) -> PyArrowResult<Option<Arro3RecordBatch>> {
         let mut guard = self.0.lock().unwrap();
@@ -413,6 +462,120 @@ impl PyCachedDatasetReader {
             Some(Err(e)) => Err(PyArrowError::ArrowError(e)),
             Some(Ok(batch)) => Ok(Some(Arro3RecordBatch::from(batch))),
         }
+    }
+}
+
+// ── PyCastingDataset ──────────────────────────────────────────────────────────
+
+/// A replayable cast view of a :class:`CachedDataset`.
+///
+/// Created by :meth:`CachedDataset.cast`.  Each call to ``__arrow_c_stream__``
+/// produces a fresh reader from the underlying cache with each batch cast to
+/// :attr:`schema`, so this object is **replayable** — DuckDB self-joins, ASOF
+/// joins, and other multi-scan consumers work correctly on it.
+///
+/// Notes
+/// -----
+/// Obtain via :meth:`CachedDataset.cast` rather than constructing directly.
+#[gen_stub_pyclass]
+#[pyclass(module = "batchcorder", name = "CastingDataset", frozen)]
+pub struct PyCastingDataset {
+    inner: Arc<Mutex<DatasetInner>>,
+    runtime: Arc<Runtime>,
+    source_schema: SchemaRef,
+    target_schema: SchemaRef,
+}
+
+impl PyCastingDataset {
+    fn make_reader_impl(&self, py: Python<'_>) -> PyResult<CachedDatasetReaderImpl> {
+        without_gil(py, || {
+            let mut inner = self.inner.lock().map_err(|e| e.to_string())?;
+            let consumer_id = inner.next_consumer_id;
+            inner.next_consumer_id += 1;
+            inner.consumer_positions.insert(consumer_id, 0);
+            Ok::<_, String>(CachedDatasetReaderImpl {
+                schema: self.source_schema.clone(),
+                inner: self.inner.clone(),
+                current_index: 0,
+                consumer_id,
+                runtime: self.runtime.clone(),
+            })
+        })
+        .map_err(PyIOError::new_err)
+    }
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl PyCastingDataset {
+    /// Arrow schema produced by this dataset after casting.
+    ///
+    /// Returns
+    /// -------
+    /// arro3.core.Schema
+    #[gen_stub(override_return_type(type_repr = "arro3.core.Schema", imports = ("arro3.core",)))]
+    #[getter]
+    pub fn schema(&self) -> PyResult<Arro3Schema> {
+        Ok(PySchema::new(self.target_schema.clone()).into())
+    }
+
+    /// An implementation of the `Arrow PyCapsule Interface <https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html>`_.
+    ///
+    /// Creates a fresh reader from the underlying cache and applies the cast.
+    /// Safe to call multiple times — each call produces an independent stream.
+    ///
+    /// Parameters
+    /// ----------
+    /// requested_schema : object, optional
+    ///     Schema capsule to further cast the stream to, or ``None`` (uses
+    ///     :attr:`schema`).
+    #[pyo3(signature = (requested_schema = None))]
+    #[gen_stub(override_return_type(type_repr = "typing.Any", imports = ("typing",)))]
+    pub fn __arrow_c_stream__<'py>(
+        &self,
+        py: Python<'py>,
+        #[gen_stub(override_type(type_repr = "typing.Any", imports = ("typing",)))]
+        requested_schema: Option<Bound<'py, PyCapsule>>,
+    ) -> PyArrowResult<Bound<'py, PyCapsule>> {
+        let impl_ = self.make_reader_impl(py).map_err(PyArrowError::PyErr)?;
+        let effective_schema = if requested_schema.is_some() {
+            requested_schema
+        } else {
+            Some(to_schema_pycapsule(py, self.target_schema.as_ref())?)
+        };
+        PyCachedDatasetReader::to_stream_pycapsule(py, impl_, effective_schema)
+    }
+
+    /// An implementation of the `Arrow PyCapsule Interface <https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html>`_.
+    ///
+    /// Returns the target schema so consumers can inspect the post-cast type.
+    #[gen_stub(override_return_type(type_repr = "typing.Any", imports = ("typing",)))]
+    pub fn __arrow_c_schema__<'py>(&self, py: Python<'py>) -> PyArrowResult<Bound<'py, PyCapsule>> {
+        to_schema_pycapsule(py, self.target_schema.as_ref())
+    }
+
+    /// Cast to a further target schema, returning a new :class:`CastingDataset`.
+    ///
+    /// Parameters
+    /// ----------
+    /// target_schema : object
+    ///     Any Arrow schema-compatible object.
+    ///
+    /// Returns
+    /// -------
+    /// CastingDataset
+    #[gen_stub(override_return_type(type_repr = "CastingDataset", imports = ()))]
+    pub fn cast(
+        &self,
+        #[gen_stub(override_type(type_repr = "typing.Any", imports = ("typing",)))]
+        target_schema: PySchema,
+    ) -> PyResult<PyCastingDataset> {
+        Ok(PyCastingDataset {
+            inner: self.inner.clone(),
+            runtime: self.runtime.clone(),
+            source_schema: self.source_schema.clone(),
+            target_schema: target_schema.into_inner(),
+        })
     }
 }
 
@@ -465,6 +628,18 @@ pub struct PyCachedDataset {
     runtime: Arc<Runtime>,
 }
 
+impl Drop for PyCachedDataset {
+    fn drop(&mut self) {
+        // When the dataset is dropped, destroy the storage to clean up unused files
+        let cache = self.inner.lock().unwrap().cache.clone();
+        let runtime = self.runtime.clone();
+        // Spawn a task to clear the cache and destroy storage
+        runtime.spawn(async move {
+            let _ = cache.clear().await;
+        });
+    }
+}
+
 #[gen_stub_pymethods]
 #[pymethods]
 impl PyCachedDataset {
@@ -499,6 +674,15 @@ impl PyCachedDataset {
                     .with_capacity(disk_cap_usize)
                     .build()?;
                 HybridCacheBuilder::new()
+                    // Only write a batch to disk when it is evicted from the
+                    // memory tier (i.e. when memory is full).  The alternative,
+                    // WriteOnInsertion, would write every batch to disk
+                    // immediately regardless of memory pressure.
+                    .with_policy(HybridCachePolicy::WriteOnEviction)
+                    // Do not flush in-memory entries to disk when the cache is
+                    // dropped.  Without this, every CachedDataset that fits
+                    // entirely in memory would still produce disk writes on drop.
+                    .with_flush_on_close(false)
                     .memory(memory_capacity)
                     .storage()
                     .with_engine_config(BlockEngineConfig::new(device))
@@ -515,6 +699,7 @@ impl PyCachedDataset {
             upstream_exhausted: false,
             consumer_positions: HashMap::new(),
             next_consumer_id: 0,
+            disk_path: PathBuf::from(&disk_path),
         };
 
         Ok(Self {
@@ -646,6 +831,35 @@ impl PyCachedDataset {
         to_schema_pycapsule(py, self.schema.as_ref())
     }
 
+    /// Cast the dataset to produce batches with the given schema.
+    ///
+    /// Returns a :class:`CastingDataset` — a **replayable** wrapper that
+    /// applies the schema cast on every read.  Unlike
+    /// :meth:`pyarrow.RecordBatchReader.cast`, the result can be consumed
+    /// multiple times, making it suitable for DuckDB self-joins and ASOF joins.
+    ///
+    /// Parameters
+    /// ----------
+    /// target_schema : object
+    ///     Any Arrow schema-compatible object (e.g. :class:`pyarrow.Schema`,
+    ///     :class:`arro3.core.Schema`).
+    ///
+    /// Returns
+    /// -------
+    /// CastingDataset
+    pub fn cast(
+        &self,
+        #[gen_stub(override_type(type_repr = "typing.Any", imports = ("typing",)))]
+        target_schema: PySchema,
+    ) -> PyResult<PyCastingDataset> {
+        Ok(PyCastingDataset {
+            inner: self.inner.clone(),
+            runtime: self.runtime.clone(),
+            source_schema: self.schema.clone(),
+            target_schema: target_schema.into_inner(),
+        })
+    }
+
     /// Eagerly ingest all batches from the upstream source into the cache.
     ///
     /// After this call ``upstream_exhausted`` is ``True`` and the upstream
@@ -732,5 +946,47 @@ impl PyCachedDataset {
         Ok(without_gil(py, || {
             self.inner.lock().unwrap().upstream_exhausted
         }))
+    }
+
+    /// Close the dataset and destroy the underlying storage.
+    ///
+    /// This method clears the hybrid cache and destroys the disk storage,
+    /// removing any unused files that were eagerly created.
+    ///
+    /// Returns
+    /// -------
+    /// None
+    ///
+    /// Examples
+    /// --------
+    /// >>> import tempfile, pyarrow as pa
+    /// >>> from batchcorder import CachedDataset
+    /// >>> table = pa.table({"x": [1, 2, 3]})
+    /// >>> tmp = tempfile.mkdtemp()
+    /// >>> ds = CachedDataset(table, 16 << 20, tmp, 64 << 20)
+    /// >>> ds.close()
+    pub fn close(&self, py: Python<'_>) -> PyResult<()> {
+        // Release the GIL before locking `inner` and destroying storage
+        without_gil(py, || {
+            let inner = self.inner.lock().map_err(|e| e.to_string())?;
+            let cache = inner.cache.clone();
+            let runtime = self.runtime.clone();
+            let disk_path = inner.disk_path.clone();
+
+            // Clear the cache and destroy storage
+            runtime
+                .block_on(async move {
+                    cache.clear().await?;
+
+                    // Manually remove the disk files if they still exist
+                    if disk_path.exists() {
+                        std::fs::remove_dir_all(&disk_path).map_err(foyer::Error::from)?;
+                    }
+                    Ok::<(), foyer::Error>(())
+                })
+                .map_err(|e| e.to_string())?;
+            Ok::<_, String>(())
+        })
+        .map_err(PyIOError::new_err)
     }
 }

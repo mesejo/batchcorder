@@ -8,10 +8,12 @@ mod cached_dataset;
 /// Exposes:
 /// * [`cached_dataset::PyCachedDataset`] — hybrid-cached Arrow dataset
 /// * [`cached_dataset::PyCachedDatasetReader`] — independent reader handle
+/// * [`cached_dataset::PyCastingDataset`] — replayable cast view of a dataset
 #[pymodule]
 fn _batchcorder(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<cached_dataset::PyCachedDataset>()?;
     m.add_class::<cached_dataset::PyCachedDatasetReader>()?;
+    m.add_class::<cached_dataset::PyCastingDataset>()?;
     Ok(())
 }
 
