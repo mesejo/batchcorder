@@ -9,6 +9,7 @@ import arro3.core
 __all__ = [
     "CachedDataset",
     "CachedDatasetReader",
+    "CastingDataset",
 ]
 
 @typing.final
@@ -190,6 +191,25 @@ class CachedDataset:
         :class:`CachedDataset`.  Then the consumer can ask the producer (in
         ``__arrow_c_stream__``) to cast the exported data to a supported data type.
         """
+    def cast(self, target_schema: typing.Any) -> CastingDataset:
+        r"""
+        Cast the dataset to produce batches with the given schema.
+
+        Returns a :class:`CastingDataset` — a **replayable** wrapper that
+        applies the schema cast on every read.  Unlike
+        :meth:`pyarrow.RecordBatchReader.cast`, the result can be consumed
+        multiple times, making it suitable for DuckDB self-joins and ASOF joins.
+
+        Parameters
+        ----------
+        target_schema : object
+            Any Arrow schema-compatible object (e.g. :class:`pyarrow.Schema`,
+            :class:`arro3.core.Schema`).
+
+        Returns
+        -------
+        CastingDataset
+        """
     def ingest_all(self) -> builtins.int:
         r"""
         Eagerly ingest all batches from the upstream source into the cache.
@@ -214,6 +234,26 @@ class CachedDataset:
         1
         >>> ds.upstream_exhausted
         True
+        """
+    def close(self) -> None:
+        r"""
+        Close the dataset and destroy the underlying storage.
+
+        This method clears the hybrid cache and destroys the disk storage,
+        removing any unused files that were eagerly created.
+
+        Returns
+        -------
+        None
+
+        Examples
+        --------
+        >>> import tempfile, pyarrow as pa
+        >>> from batchcorder import CachedDataset
+        >>> table = pa.table({"x": [1, 2, 3]})
+        >>> tmp = tempfile.mkdtemp()
+        >>> ds = CachedDataset(table, 16 << 20, tmp, 64 << 20)
+        >>> ds.close()
         """
 
 @typing.final
@@ -290,4 +330,83 @@ class CachedDatasetReader:
             If the reader has already been consumed.
         """
     def __iter__(self) -> CachedDatasetReader: ...
+    def cast(self, target_schema: typing.Any) -> typing.Any:
+        r"""
+        Cast the reader to produce batches with the given schema.
+
+        Mirrors :meth:`pyarrow.RecordBatchReader.cast`.  Returns a
+        :class:`pyarrow.RecordBatchReader` that applies the cast as batches are
+        read.  Consumes this reader.
+
+        Parameters
+        ----------
+        target_schema : object
+            Any Arrow schema-compatible object (e.g. :class:`pyarrow.Schema`,
+            :class:`arro3.core.Schema`).
+
+        Returns
+        -------
+        pyarrow.RecordBatchReader
+
+        Raises
+        ------
+        IOError
+            If the reader has already been consumed.
+        """
     def __next__(self) -> arro3.core.RecordBatch: ...
+
+@typing.final
+class CastingDataset:
+    r"""
+    A replayable cast view of a :class:`CachedDataset`.
+
+    Created by :meth:`CachedDataset.cast`.  Each call to ``__arrow_c_stream__``
+    produces a fresh reader from the underlying cache with each batch cast to
+    :attr:`schema`, so this object is **replayable** — DuckDB self-joins, ASOF
+    joins, and other multi-scan consumers work correctly on it.
+
+    Notes
+    -----
+    Obtain via :meth:`CachedDataset.cast` rather than constructing directly.
+    """
+    @property
+    def schema(self) -> arro3.core.Schema:
+        r"""
+        Arrow schema produced by this dataset after casting.
+
+        Returns
+        -------
+        arro3.core.Schema
+        """
+    def __arrow_c_stream__(self, requested_schema: typing.Any = None) -> typing.Any:
+        r"""
+        An implementation of the `Arrow PyCapsule Interface <https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html>`_.
+
+        Creates a fresh reader from the underlying cache and applies the cast.
+        Safe to call multiple times — each call produces an independent stream.
+
+        Parameters
+        ----------
+        requested_schema : object, optional
+            Schema capsule to further cast the stream to, or ``None`` (uses
+            :attr:`schema`).
+        """
+    def __arrow_c_schema__(self) -> typing.Any:
+        r"""
+        An implementation of the `Arrow PyCapsule Interface <https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html>`_.
+
+        Returns the target schema so consumers can inspect the post-cast type.
+        """
+    def cast(self, target_schema: typing.Any) -> CastingDataset:
+        r"""
+        Cast to a further target schema, returning a new :class:`CastingDataset`.
+
+        Parameters
+        ----------
+        target_schema : object
+            Any Arrow schema-compatible object.
+
+        Returns
+        -------
+        CastingDataset
+        """

@@ -1,11 +1,12 @@
 from importlib.metadata import version
 
-from ._batchcorder import CachedDataset, CachedDatasetReader
+from ._batchcorder import CachedDataset, CachedDatasetReader, CastingDataset
 
 
 __all__ = [
     "CachedDataset",
     "CachedDatasetReader",
+    "CastingDataset",
 ]
 
 
