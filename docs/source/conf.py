@@ -1,7 +1,5 @@
 """Sphinx configuration for batchcorder documentation."""
 
-import logging
-import re
 from pathlib import Path
 
 
@@ -31,12 +29,12 @@ extensions = [
 # AutoAPI — static analysis of .pyi stubs (no compiled extension needed)
 # ---------------------------------------------------------------------------
 # We target only *.pyi files so autoapi reads the generated type stubs
-# (python/batchcorder/__init__.pyi) instead of trying to import the Rust
+# (python/batchcorder/__init__.py) instead of trying to import the Rust
 # extension module (_batchcorder.abi3.so), which is unavailable on RTD.
 
 autoapi_dirs = [str(Path(__file__).parents[2] / "python")]
 autoapi_type = "python"
-autoapi_file_patterns = ["*.pyi"]
+autoapi_file_patterns = ["__init__.py", "_batchcorder.pyi"]
 autoapi_options = [
     "members",
     "undoc-members",
@@ -82,21 +80,6 @@ intersphinx_mapping = {
 # ---------------------------------------------------------------------------
 
 
-class _SuppressFilter(logging.Filter):
-    def __init__(self, pattern):
-        super().__init__()
-        self._re = re.compile(pattern)
-
-    def filter(self, record):
-        return not self._re.search(record.getMessage())
-
-
-logging.getLogger("sphinx.sphinx_immaterial.apidoc.python.parameter_objects").addFilter(
-    _SuppressFilter(
-        r"Parameter name '(reader|memory_capacity|disk_path|disk_capacity)' does not match any of the parameters"
-    )
-)
-
 html_theme = "sphinx_immaterial"
 html_title = "batchcorder"
 
@@ -137,3 +120,6 @@ html_theme_options = {
         "toc.follow",
     ],
 }
+
+# Suppress autoapi import resolution warnings for Rust extension modules
+suppress_warnings = ["autoapi.python_import_resolution"]
