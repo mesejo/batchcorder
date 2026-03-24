@@ -22,6 +22,7 @@
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arrow_array::{ArrayRef, RecordBatch, StructArray};
@@ -39,6 +40,12 @@ use pyo3_arrow::ffi::{to_schema_pycapsule, to_stream_pycapsule, ArrayIterator};
 use pyo3_arrow::{PyRecordBatchReader, PySchema};
 use pyo3_stub_gen::derive::*;
 use tokio::runtime::Runtime;
+
+// ── dataset counter ───────────────────────────────────────────────────────────
+
+/// Monotonically increasing counter used to give each [`PyCachedDataset`] a
+/// unique Foyer device subdirectory under the caller-supplied `disk_path`.
+static DATASET_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 // ── error helpers ────────────────────────────────────────────────────────────
 
@@ -93,7 +100,6 @@ fn without_gil<T, F: FnOnce() -> T>(_py: Python<'_>, f: F) -> T {
         }
     }
     // On free-threaded Python (Py_GIL_DISABLED) there is no GIL to release.
-    // On free-threaded Python (Py_GIL_DISABLED) there is no GIL to release.
     #[cfg(not(Py_GIL_DISABLED))]
     let _guard = RestoreGuard(unsafe { pyo3::ffi::PyEval_SaveThread() });
     f()
@@ -140,8 +146,14 @@ struct DatasetInner {
     consumer_positions: HashMap<u64, u64>,
     /// Monotonically increasing counter used to assign unique consumer IDs.
     next_consumer_id: u64,
-    /// Disk path for the cache storage.
-    disk_path: PathBuf,
+    /// Path of the Foyer device subdirectory (a child of the caller-supplied
+    /// `disk_path`).  Only this subdirectory is removed on close/drop; the
+    /// parent directory provided by the caller is left untouched.
+    foyer_path: PathBuf,
+    /// `true` once [`PyCachedDataset::close`] has been called or the dataset
+    /// has been dropped.  Prevents double-cleanup and signals active readers
+    /// that the dataset is no longer usable.
+    closed: bool,
 }
 
 impl DatasetInner {
@@ -151,6 +163,9 @@ impl DatasetInner {
     /// Returns `true` if `target_index` is now in the cache, or `false` if the
     /// upstream was exhausted before reaching it.
     fn ingest_up_to(&mut self, runtime: &Runtime, target_index: u64) -> Result<bool, ArrowError> {
+        if self.closed {
+            return Err(other_arrow_err("Dataset has been closed"));
+        }
         while self.ingested_count <= target_index {
             if self.upstream_exhausted {
                 return Ok(false);
@@ -214,6 +229,9 @@ impl Iterator for CachedDatasetReaderImpl {
                 Ok(g) => g,
                 Err(e) => return Some(Err(other_arrow_err(format!("Mutex poisoned: {e}")))),
             };
+            if inner.closed {
+                return Some(Err(other_arrow_err("Dataset has been closed")));
+            }
             match inner.ingest_up_to(&self.runtime, idx) {
                 Err(e) => return Some(Err(e)),
                 Ok(false) => return None, // upstream exhausted before idx
@@ -224,28 +242,36 @@ impl Iterator for CachedDatasetReaderImpl {
             inner.cache.clone()
         };
 
-        // ── Step 2: fetch IPC bytes from cache (lock released) ───────────────
-        let maybe_bytes = self.runtime.block_on(async {
+        // ── Step 2: fetch from cache and deserialize (lock released) ─────────
+        // Deserialize directly from the cache entry to avoid cloning the raw
+        // IPC bytes into a temporary buffer before deserialization.
+        let result = self.runtime.block_on(async {
             cache
                 .get(&idx)
                 .await
-                .map(|opt| opt.map(|entry| entry.value().clone()))
+                .map(|opt| opt.map(|entry| deserialize_batch(entry.value())))
         });
 
-        let bytes = match maybe_bytes {
-            Err(e) => return Some(Err(other_arrow_err(format!("Cache get failed: {e}")))),
+        match result {
+            Err(e) => Some(Err(other_arrow_err(format!("Cache get failed: {e}")))),
             Ok(None) => {
-                return Some(Err(other_arrow_err(format!(
-                    "Batch {idx} was evicted from the cache before it could be read. \
-                     Increase cache capacity so it can hold all live consumer positions."
-                ))))
+                // Distinguish a post-close access from a genuine capacity eviction.
+                let closed = self.inner.lock().map(|g| g.closed).unwrap_or(false);
+                if closed {
+                    Some(Err(other_arrow_err("Dataset has been closed")))
+                } else {
+                    Some(Err(other_arrow_err(format!(
+                        "Batch {idx} was evicted from the cache before it could be read. \
+                         Increase cache capacity so it can hold all live consumer positions."
+                    ))))
+                }
             }
-            Ok(Some(b)) => b,
-        };
-
-        // ── Step 3: deserialize and advance position ─────────────────────────
-        self.current_index += 1;
-        Some(deserialize_batch(&bytes))
+            // ── Step 3: advance position ──────────────────────────────────────
+            Ok(Some(batch_result)) => {
+                self.current_index += 1;
+                Some(batch_result)
+            }
+        }
     }
 }
 
@@ -630,13 +656,33 @@ pub struct PyCachedDataset {
 
 impl Drop for PyCachedDataset {
     fn drop(&mut self) {
-        // When the dataset is dropped, destroy the storage to clean up unused files
-        let cache = self.inner.lock().unwrap().cache.clone();
-        let runtime = self.runtime.clone();
-        // Spawn a task to clear the cache and destroy storage
-        runtime.spawn(async move {
-            let _ = cache.clear().await;
-        });
+        if let Ok(inner) = self.inner.lock() {
+            if inner.closed {
+                // close() already ran cleanup — nothing to do.
+                return;
+            }
+            // Do NOT set closed = true here.  Readers hold their own
+            // Arc<Mutex<DatasetInner>> and can outlive the dataset handle;
+            // marking closed would break them.  Readers that hit the disk
+            // tier after the files are gone will receive an "evicted" error,
+            // which is acceptable for the implicit-drop path.  Only explicit
+            // close() sets closed = true to aggressively terminate readers.
+            let foyer_path = inner.foyer_path.clone();
+            let cache = inner.cache.clone();
+            drop(inner);
+
+            // Remove only the Foyer subdirectory we created; the caller's
+            // disk_path directory is left untouched.
+            let _ = std::fs::remove_dir_all(&foyer_path);
+            // Best-effort async flush/clear.  May not complete if this is
+            // the last Arc<Runtime> reference, but the subdirectory is
+            // already gone so data integrity is not at risk.
+            // block_on guarantees the clear completes before Drop returns,
+            // unlike spawn which may not execute if the runtime is torn down.
+            self.runtime.block_on(async move {
+                let _ = cache.clear().await;
+            });
+        }
     }
 }
 
@@ -666,11 +712,20 @@ impl PyCachedDataset {
 
         let disk_cap_usize = usize::try_from(disk_capacity).unwrap_or(usize::MAX);
 
+        // Create a unique subdirectory for Foyer's device files so that only
+        // that subdirectory is deleted on close/drop, leaving the caller's
+        // `disk_path` directory intact.
+        let id = DATASET_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let foyer_path = PathBuf::from(&disk_path).join(format!("_{id}"));
+        std::fs::create_dir_all(&foyer_path).map_err(|e| {
+            PyIOError::new_err(format!("Failed to create Foyer device directory: {e}"))
+        })?;
+
         // Release the GIL while building the cache: Foyer opens disk files
         // and initialises its async engine, which is pure Rust I/O.
         let cache: HybridCache<u64, Vec<u8>> = without_gil(py, || {
             rt.block_on(async {
-                let device = FsDeviceBuilder::new(std::path::Path::new(&disk_path))
+                let device = FsDeviceBuilder::new(&foyer_path)
                     .with_capacity(disk_cap_usize)
                     .build()?;
                 HybridCacheBuilder::new()
@@ -699,7 +754,8 @@ impl PyCachedDataset {
             upstream_exhausted: false,
             consumer_positions: HashMap::new(),
             next_consumer_id: 0,
-            disk_path: PathBuf::from(&disk_path),
+            foyer_path,
+            closed: false,
         };
 
         Ok(Self {
@@ -762,6 +818,9 @@ impl PyCachedDataset {
         // hold the GIL while waiting for `inner.lock()`.
         without_gil(py, || {
             let mut inner = self.inner.lock().map_err(|e| e.to_string())?;
+            if inner.closed {
+                return Err("Dataset has been closed".to_string());
+            }
             let consumer_id = inner.next_consumer_id;
             inner.next_consumer_id += 1;
             let start_index = if from_start { 0 } else { inner.ingested_count };
@@ -886,6 +945,8 @@ impl PyCachedDataset {
         // Release the GIL before locking `inner` (same ordering rule as `reader`).
         without_gil(py, || {
             let mut inner = self.inner.lock().map_err(|e| e.to_string())?;
+            // u64::MAX as sentinel: the loop inside ingest_up_to exits via
+            // upstream_exhausted long before ingested_count could approach it.
             inner
                 .ingest_up_to(&self.runtime, u64::MAX)
                 .map_err(|e| e.to_string())?;
@@ -966,25 +1027,24 @@ impl PyCachedDataset {
     /// >>> ds = CachedDataset(table, 16 << 20, tmp, 64 << 20)
     /// >>> ds.close()
     pub fn close(&self, py: Python<'_>) -> PyResult<()> {
-        // Release the GIL before locking `inner` and destroying storage
+        // Release the GIL before locking `inner` and destroying storage.
         without_gil(py, || {
-            let inner = self.inner.lock().map_err(|e| e.to_string())?;
+            let mut inner = self.inner.lock().map_err(|e| e.to_string())?;
+            if inner.closed {
+                return Ok(()); // idempotent — safe to call more than once
+            }
+            inner.closed = true;
             let cache = inner.cache.clone();
-            let runtime = self.runtime.clone();
-            let disk_path = inner.disk_path.clone();
+            let foyer_path = inner.foyer_path.clone();
+            drop(inner); // release the lock before I/O
 
-            // Clear the cache and destroy storage
-            runtime
-                .block_on(async move {
-                    cache.clear().await?;
-
-                    // Manually remove the disk files if they still exist
-                    if disk_path.exists() {
-                        std::fs::remove_dir_all(&disk_path).map_err(foyer::Error::from)?;
-                    }
-                    Ok::<(), foyer::Error>(())
-                })
-                .map_err(|e| e.to_string())?;
+            // Flush/clear the in-memory cache tier (best-effort; errors ignored).
+            self.runtime.block_on(async move {
+                let _ = cache.clear().await;
+            });
+            // Remove only the Foyer subdirectory we created; errors are
+            // ignored because the directory may already be gone.
+            let _ = std::fs::remove_dir_all(&foyer_path);
             Ok::<_, String>(())
         })
         .map_err(PyIOError::new_err)
