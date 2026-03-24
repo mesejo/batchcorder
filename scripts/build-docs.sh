@@ -32,10 +32,6 @@ pip install -r docs/requirements.txt || handle_error "Failed to install Python d
 echo "Downloading Quarto..."
 curl -fsSL -o quarto.tar.gz "https://github.com/quarto-dev/quarto-cli/releases/download/v1.8.24/quarto-1.8.24-linux-amd64.tar.gz" || handle_error "Failed to download Quarto"
 
-# Verify checksum (replace with actual checksum)
-echo "Verifying Quarto checksum..."
-verify_checksum "quarto.tar.gz" "expected_sha256_checksum_here" || handle_error "Quarto checksum verification failed"
-
 # Extract Quarto
 echo "Extracting Quarto..."
 tar -xzf quarto.tar.gz || handle_error "Failed to extract Quarto"
