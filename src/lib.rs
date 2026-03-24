@@ -6,14 +6,14 @@ mod cached_dataset;
 /// Register the `batchcorder._batchcorder` Python extension module.
 ///
 /// Exposes:
-/// * [`cached_dataset::PyCachedDataset`] — hybrid-cached Arrow dataset
-/// * [`cached_dataset::PyCachedDatasetReader`] — independent reader handle
-/// * [`cached_dataset::PyCastingDataset`] — replayable cast view of a dataset
+/// * [`cached_dataset::PyStreamCache`] — hybrid-cached Arrow dataset
+/// * [`cached_dataset::PyStreamCacheReader`] — independent reader handle
+/// * [`cached_dataset::PyCastingStreamCache`] — replayable cast view of a dataset
 #[pymodule]
 fn _batchcorder(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_class::<cached_dataset::PyCachedDataset>()?;
-    m.add_class::<cached_dataset::PyCachedDatasetReader>()?;
-    m.add_class::<cached_dataset::PyCastingDataset>()?;
+    m.add_class::<cached_dataset::PyStreamCache>()?;
+    m.add_class::<cached_dataset::PyStreamCacheReader>()?;
+    m.add_class::<cached_dataset::PyCastingStreamCache>()?;
     Ok(())
 }
 

@@ -5,13 +5,29 @@ build-backend = "maturin"
 [project]
 name = "batchcorder"
 requires-python = ">=3.11"
+description = "A Rust-backed Python library for caching Arrow record-batch streams so they can be replayed multiple times"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "Daniel Mesejo" }]
 classifiers = [
   "Programming Language :: Rust",
   "Programming Language :: Python :: Implementation :: CPython",
   "Programming Language :: Python :: Implementation :: PyPy",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "License :: OSI Approved :: Apache Software License",
+  "Topic :: Scientific/Engineering",
+  "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dynamic = ["version"]
 dependencies = ["arro3-core>=0.4.0"]
+
+[project.urls]
+Homepage = "https://github.com/mesejo/batchcorder"
+Repository = "https://github.com/mesejo/batchcorder"
+Documentation = "https://batchcorder.readthedocs.io"
 
 [tool.maturin]
 python-source = "python"

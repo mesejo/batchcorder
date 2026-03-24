@@ -1,27 +1,27 @@
-"""Tests for CachedDataset.cast and CachedDatasetReader.cast.
+"""Tests for StreamCache.cast and StreamCacheReader.cast.
 
 Key property under test
 -----------------------
-* ``CachedDataset.cast(schema)`` returns a **replayable** ``CastingDataset``
+* ``StreamCache.cast(schema)`` returns a **replayable** ``CastingStreamCache``
   whose ``__arrow_c_stream__`` can be called multiple times.  This mirrors the
-  multi-scan behaviour of ``CachedDataset`` itself and allows DuckDB self-joins
+  multi-scan behaviour of ``StreamCache`` itself and allows DuckDB self-joins
   and ASOF joins to produce correct results — the same guarantee that
-  ``CachedDataset`` provides for uncast data.
+  ``StreamCache`` provides for uncast data.
 
-* ``CachedDatasetReader.cast(schema)`` returns a one-shot
+* ``StreamCacheReader.cast(schema)`` returns a one-shot
   ``pa.RecordBatchReader``, consistent with the one-shot semantics of
-  ``CachedDatasetReader``.
+  ``StreamCacheReader``.
 """
 
 import duckdb
 import pyarrow as pa
 import pytest
 
-from batchcorder import CachedDataset, CastingDataset
+from batchcorder import CastingStreamCache, StreamCache
 
 
 def _ds(tmp_path, table, batch_size=3):
-    return CachedDataset(
+    return StreamCache(
         table.to_reader(max_chunksize=batch_size),
         memory_capacity=16 * 1024 * 1024,
         disk_path=str(tmp_path),
@@ -47,14 +47,14 @@ TARGET_SCHEMA = pa.schema(
 
 
 def test_dataset_cast_returns_casting_dataset(tmp_path):
-    """cast() on CachedDataset returns a CastingDataset, not a RecordBatchReader."""
+    """cast() on StreamCache returns a CastingStreamCache, not a RecordBatchReader."""
     ds = _ds(tmp_path, TABLE)
     result = ds.cast(TARGET_SCHEMA)
-    assert isinstance(result, CastingDataset)
+    assert isinstance(result, CastingStreamCache)
 
 
 def test_dataset_cast_schema_property(tmp_path):
-    """CastingDataset.schema reflects the target schema."""
+    """CastingStreamCache.schema reflects the target schema."""
     ds = _ds(tmp_path, TABLE)
     casting = ds.cast(TARGET_SCHEMA)
     schema = pa.schema(casting.schema)
@@ -64,7 +64,7 @@ def test_dataset_cast_schema_property(tmp_path):
 
 
 def test_dataset_cast_applies_schema(tmp_path):
-    """CastingDataset produces batches with the target schema."""
+    """CastingStreamCache produces batches with the target schema."""
     ds = _ds(tmp_path, TABLE)
     result = pa.table(ds.cast(TARGET_SCHEMA))
     assert result.schema.field("id").type == pa.int64()
@@ -73,7 +73,7 @@ def test_dataset_cast_applies_schema(tmp_path):
 
 
 def test_dataset_cast_preserves_values(tmp_path):
-    """CastingDataset does not alter row values, only types."""
+    """CastingStreamCache does not alter row values, only types."""
     result = pa.table(_ds(tmp_path, TABLE).cast(TARGET_SCHEMA))
     assert result.column("id").to_pylist() == TABLE.column("id").to_pylist()
     assert result.column("label").to_pylist() == TABLE.column("label").to_pylist()
@@ -81,7 +81,7 @@ def test_dataset_cast_preserves_values(tmp_path):
 
 
 def test_dataset_cast_multi_batch(tmp_path):
-    """CastingDataset works correctly when the stream spans multiple batches."""
+    """CastingStreamCache works correctly when the stream spans multiple batches."""
     casting = _ds(tmp_path, TABLE, batch_size=2).cast(TARGET_SCHEMA)
     result = pa.table(casting)
     assert result.num_rows == TABLE.num_rows
@@ -89,13 +89,13 @@ def test_dataset_cast_multi_batch(tmp_path):
 
 
 def test_dataset_cast_noop_same_schema(tmp_path):
-    """CastingDataset with the identical schema returns equivalent data."""
+    """CastingStreamCache with the identical schema returns equivalent data."""
     result = pa.table(_ds(tmp_path, TABLE).cast(TABLE.schema))
     assert result.equals(TABLE)
 
 
 def test_dataset_cast_is_replayable_multiple_reads(tmp_path):
-    """CastingDataset can be read multiple times; each read returns correct data."""
+    """CastingStreamCache can be read multiple times; each read returns correct data."""
     casting = _ds(tmp_path, TABLE).cast(TARGET_SCHEMA)
     r1 = pa.RecordBatchReader.from_stream(casting).read_all()
     r2 = pa.RecordBatchReader.from_stream(casting).read_all()
@@ -105,7 +105,7 @@ def test_dataset_cast_is_replayable_multiple_reads(tmp_path):
 
 
 def test_dataset_cast_is_replayable_repeated_cast(tmp_path):
-    """cast() can be called repeatedly on the same CachedDataset."""
+    """cast() can be called repeatedly on the same StreamCache."""
     ds = _ds(tmp_path, TABLE)
     r1 = pa.table(ds.cast(TARGET_SCHEMA))
     r2 = pa.table(ds.cast(TARGET_SCHEMA))
@@ -169,7 +169,7 @@ _EXPECTED_SELF_JOIN = [
 
 
 def _make_employee_ds(tmp_path):
-    return CachedDataset(
+    return StreamCache(
         pa.RecordBatchReader.from_batches(_EMPLOYEE_SCHEMA, iter(_EMPLOYEE_BATCHES)),
         memory_capacity=16 * 1024 * 1024,
         disk_path=str(tmp_path),
@@ -178,10 +178,10 @@ def _make_employee_ds(tmp_path):
 
 
 def test_casting_dataset_self_join_matches_uncast(tmp_path):
-    """CastingDataset self-join produces the same result as an uncast self-join.
+    """CastingStreamCache self-join produces the same result as an uncast self-join.
 
     DuckDB calls ``__arrow_c_stream__`` once per side of the join.
-    ``CastingDataset`` creates a fresh reader on each call (replayable), so
+    ``CastingStreamCache`` creates a fresh reader on each call (replayable), so
     both sides see the full dataset and the join returns correct rows.
     A bare ``pa.RecordBatchReader`` would be exhausted after the first side
     and return zero rows.
@@ -195,7 +195,7 @@ def test_casting_dataset_self_join_matches_uncast(tmp_path):
 
     assert rows == _EXPECTED_SELF_JOIN
 
-    # Cross-check: uncast CachedDataset produces the same result.
+    # Cross-check: uncast StreamCache produces the same result.
     ds2 = _make_employee_ds(tmp_path / "plain")
     con2 = duckdb.connect()
     con2.register("employees", ds2)
@@ -206,7 +206,7 @@ def test_casting_dataset_self_join_matches_uncast(tmp_path):
 def test_casting_dataset_self_join_bare_reader_fails(tmp_path):
     """Control: a bare RecordBatchReader cast result fails the self-join.
 
-    ``CachedDatasetReader.cast`` returns a one-shot ``pa.RecordBatchReader``.
+    ``StreamCacheReader.cast`` returns a one-shot ``pa.RecordBatchReader``.
     DuckDB exhausts it on the first side of the join; the second side sees
     nothing, so the join returns zero rows.
     """
@@ -309,19 +309,19 @@ def _reference_result() -> list:
 
 
 def test_casting_dataset_asof_join_matches_uncast(tmp_path):
-    """CastingDataset ASOF join returns correct rows, same as uncast CachedDataset.
+    """CastingStreamCache ASOF join returns correct rows, same as uncast StreamCache.
 
     An ASOF join scans each side once, so even a one-shot reader would work.
     This test confirms that the cast does not corrupt values and that the
-    CastingDataset is a valid Arrow stream source for DuckDB.
+    CastingStreamCache is a valid Arrow stream source for DuckDB.
     """
-    sensors_ds = CachedDataset(
+    sensors_ds = StreamCache(
         pa.RecordBatchReader.from_batches(_SENSOR_SCHEMA, iter(_SENSOR_BATCHES)),
         memory_capacity=16 * 1024 * 1024,
         disk_path=str(tmp_path / "sensors"),
         disk_capacity=64 * 1024 * 1024,
     )
-    events_ds = CachedDataset(
+    events_ds = StreamCache(
         pa.RecordBatchReader.from_batches(_EVENT_SCHEMA, iter(_EVENT_BATCHES)),
         memory_capacity=16 * 1024 * 1024,
         disk_path=str(tmp_path / "events"),
@@ -341,12 +341,12 @@ def test_casting_dataset_asof_join_matches_uncast(tmp_path):
 
 
 def test_casting_dataset_asof_join_with_tolerance_replayable(tmp_path):
-    """CastingDataset is replayable under the tolerance ASOF join pattern.
+    """CastingStreamCache is replayable under the tolerance ASOF join pattern.
 
     The tolerance ASOF query re-scans the sensors table (ASOF JOIN + a second
     LEFT JOIN on the same source).  A bare reader would be exhausted on the
-    first scan and return wrong rows; a CastingDataset replays from cache and
-    returns the correct result — matching the uncast CachedDataset behaviour.
+    first scan and return wrong rows; a CastingStreamCache replays from cache and
+    returns the correct result — matching the uncast StreamCache behaviour.
     """
     _ASOF_TOLERANCE_SQL = """
         WITH matched AS (
@@ -371,13 +371,13 @@ def test_casting_dataset_asof_join_with_tolerance_replayable(tmp_path):
         con.register("events", events_table)
         return con.execute(sql).fetchall()
 
-    sensors_ds = CachedDataset(
+    sensors_ds = StreamCache(
         pa.RecordBatchReader.from_batches(_SENSOR_SCHEMA, iter(_SENSOR_BATCHES)),
         memory_capacity=16 * 1024 * 1024,
         disk_path=str(tmp_path / "sensors"),
         disk_capacity=64 * 1024 * 1024,
     )
-    events_ds = CachedDataset(
+    events_ds = StreamCache(
         pa.RecordBatchReader.from_batches(_EVENT_SCHEMA, iter(_EVENT_BATCHES)),
         memory_capacity=16 * 1024 * 1024,
         disk_path=str(tmp_path / "events"),
@@ -397,7 +397,7 @@ def test_casting_dataset_asof_join_with_tolerance_replayable(tmp_path):
 
 
 def test_reader_cast_returns_record_batch_reader(tmp_path):
-    """cast() on CachedDatasetReader returns a pa.RecordBatchReader (one-shot)."""
+    """cast() on StreamCacheReader returns a pa.RecordBatchReader (one-shot)."""
     reader = _ds(tmp_path, TABLE).reader()
     result = reader.cast(TARGET_SCHEMA)
     assert isinstance(result, pa.RecordBatchReader)

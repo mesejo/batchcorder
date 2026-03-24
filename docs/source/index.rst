@@ -31,10 +31,3 @@ so multiple independent readers can replay the stream from any position.
 
    api
    reference/api-overview
-
-.. toctree::
-   :maxdepth: 2
-   :caption: Explanation — Understanding
-
-   explanation/architecture
-   explanation/gil-deadlock

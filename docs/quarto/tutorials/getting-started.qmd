@@ -8,25 +8,20 @@ create readers, and replay batches from the cache.
 
 ## What you will build
 
-A script that wraps a PyArrow table in a `CachedDataset`, reads it twice
+A script that wraps a PyArrow table in a `StreamCache`, reads it twice
 through two independent reader handles, and confirms both produce identical
 output — without ever touching the original source a second time.
 
 ## Prerequisites
 
 - Python 3.11 or later
-- A Rust toolchain (stable; install via [rustup](https://rustup.rs/))
-- `uv` package manager
 
 ## Step 1 — Install
 
-Clone the repository and build the extension in development mode:
+Install batchcorder from PyPI:
 
 ```bash
-git clone https://github.com/yourusername/multirecord.git
-cd multirecord
-uv sync
-maturin develop --uv
+pip install batchcorder
 ```
 
 Verify the installation:
@@ -36,7 +31,7 @@ import batchcorder
 print(batchcorder.__version__)
 ```
 
-## Step 2 — Create a dataset from a PyArrow table
+## Step 2 — Wrap a PyArrow table in a StreamCache
 
 Any object that implements `__arrow_c_stream__` can be wrapped — a
 `pyarrow.Table`, a `pyarrow.RecordBatchReader`, an `arro3.core.RecordBatchReader`, etc.
@@ -44,14 +39,14 @@ Any object that implements `__arrow_c_stream__` can be wrapped — a
 ```python
 import tempfile
 import pyarrow as pa
-from batchcorder import CachedDataset
+from batchcorder import StreamCache
 
 # Source data — in practice this would be a file, network stream, etc.
 table = pa.table({"id": [1, 2, 3, 4, 5], "value": [0.1, 0.2, 0.3, 0.4, 0.5]})
 
 # Choose cache sizes appropriate for your data volume.
 tmp = tempfile.mkdtemp()
-ds = CachedDataset(
+ds = StreamCache(
     table,                        # any __arrow_c_stream__ source
     memory_capacity=16 << 20,     # 16 MB in-memory tier
     disk_path=tmp,                # directory for the on-disk tier
@@ -65,7 +60,7 @@ print(ds.upstream_exhausted)
 # False — nothing ingested yet
 ```
 
-## Step 3 — Read through the dataset
+## Step 3 — Read through the stream
 
 Iterating directly over `ds` creates a fresh reader starting at batch 0:
 
@@ -104,7 +99,7 @@ If you know you will replay the stream many times, call `ingest_all()` once at
 startup to pull everything into the cache before your main loop runs:
 
 ```python
-ds2 = CachedDataset(table, 16 << 20, tmp, 64 << 20)
+ds2 = StreamCache(table, 16 << 20, tmp, 64 << 20)
 total_batches = ds2.ingest_all()
 print(f"Ingested {total_batches} batch(es).")
 
@@ -116,11 +111,11 @@ for _ in range(10):
 
 ## What you have learned
 
-- `CachedDataset` wraps any Arrow stream and stores batches in a hybrid
+- `StreamCache` wraps any Arrow stream and stores batches in a hybrid
   memory + disk cache.
 - The upstream source is consumed **at most once**; all replays come from the
   cache.
-- `CachedDatasetReader` handles are independent — creating or exhausting one
+- `StreamCacheReader` handles are independent — creating or exhausting one
   does not affect others.
 - `ingest_all()` lets you front-load all I/O before a replay-heavy loop.
 
@@ -129,5 +124,3 @@ for _ in range(10):
 - [Use batchcorder with DuckDB](../how-to/duckdb.md) for multi-scan queries.
 - [Size the cache correctly](../how-to/cache-config.md) to avoid eviction
   errors.
-- [Understand the architecture](../explanation/architecture.md) if you want to
-  know why the design is the way it is.

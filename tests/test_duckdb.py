@@ -1,7 +1,7 @@
 import duckdb
 import pyarrow as pa
 
-from batchcorder import CachedDataset
+from batchcorder import StreamCache
 
 
 EMPLOYEE_SCHEMA = pa.schema(
@@ -77,15 +77,15 @@ class CountingReader:
 
 
 def test_self_join(tmp_path):
-    """CachedDataset: self-join returns the correct manager mapping.
+    """StreamCache: self-join returns the correct manager mapping.
     Bare reader: self-join silently returns zero rows.
 
-    DuckDB calls __arrow_c_stream__ once per side of the join.  CachedDataset
+    DuckDB calls __arrow_c_stream__ once per side of the join.  StreamCache
     replays from the cache on each call; a bare reader is exhausted after the
     first scan, so the second side sees nothing and the join produces no rows.
     """
     source = CountingReader(EMPLOYEE_BATCHES, EMPLOYEE_SCHEMA)
-    ds = CachedDataset(source, 16 * 1024 * 1024, str(tmp_path), 64 * 1024 * 1024)
+    ds = StreamCache(source, 16 * 1024 * 1024, str(tmp_path), 64 * 1024 * 1024)
 
     con = duckdb.connect()
     con.register("employees", ds)
@@ -97,7 +97,7 @@ def test_self_join(tmp_path):
         ORDER BY e.name
     """).fetchall()
 
-    # CachedDataset: correct result
+    # StreamCache: correct result
     assert rows == [
         ("Bob", "Alice"),
         ("Carol", "Alice"),
@@ -130,7 +130,7 @@ def test_self_join(tmp_path):
 def test_limit_does_not_exhaust_upstream(tmp_path):
     batches = _large_batches()
 
-    ds = CachedDataset(
+    ds = StreamCache(
         pa.RecordBatchReader.from_batches(LARGE_SCHEMA, iter(batches)),
         memory_capacity=64 * 1024 * 1024,
         disk_path=str(tmp_path),
@@ -270,13 +270,13 @@ def _make_asof_con(sensors_source, events_source) -> duckdb.DuckDBPyConnection:
 
 
 def test_asof_join_without_tolerance(tmp_path):
-    sensors_ds = CachedDataset(
+    sensors_ds = StreamCache(
         pa.RecordBatchReader.from_batches(_SENSOR_SCHEMA, iter(_SENSOR_BATCHES)),
         memory_capacity=16 * 1024 * 1024,
         disk_path=str(tmp_path / "sensors"),
         disk_capacity=64 * 1024 * 1024,
     )
-    events_ds = CachedDataset(
+    events_ds = StreamCache(
         pa.RecordBatchReader.from_batches(_EVENT_SCHEMA, iter(_EVENT_BATCHES)),
         memory_capacity=16 * 1024 * 1024,
         disk_path=str(tmp_path / "events"),
@@ -296,13 +296,13 @@ def test_asof_join_without_tolerance(tmp_path):
 
 
 def test_asof_join_with_tolerance(tmp_path):
-    sensors_ds = CachedDataset(
+    sensors_ds = StreamCache(
         pa.RecordBatchReader.from_batches(_SENSOR_SCHEMA, iter(_SENSOR_BATCHES)),
         memory_capacity=16 * 1024 * 1024,
         disk_path=str(tmp_path / "sensors"),
         disk_capacity=64 * 1024 * 1024,
     )
-    events_ds = CachedDataset(
+    events_ds = StreamCache(
         pa.RecordBatchReader.from_batches(_EVENT_SCHEMA, iter(_EVENT_BATCHES)),
         memory_capacity=16 * 1024 * 1024,
         disk_path=str(tmp_path / "events"),
@@ -444,11 +444,11 @@ def _spill_agg_reference(sql: str) -> list:
 def test_self_join_with_disk_spill(tmp_path):
     """Self-join returns the correct result when every cache entry is on disk.
 
-    DuckDB scans the table twice (once per join side).  CachedDataset replays
+    DuckDB scans the table twice (once per join side).  StreamCache replays
     the stream from the disk tier on the second scan; a bare reader cannot.
     """
     source = CountingReader(_PADDED_EMPLOYEE_BATCHES, _PADDED_EMPLOYEE_SCHEMA)
-    ds = CachedDataset(
+    ds = StreamCache(
         source,
         memory_capacity=_SPILL_MEMORY,
         disk_path=str(tmp_path),
@@ -484,7 +484,7 @@ def test_self_join_with_disk_spill(tmp_path):
 def test_aggregation_with_disk_spill(tmp_path):
     """COUNT/SUM/AVG/MIN/MAX on a large dataset that fully spills to the disk tier."""
     batches = _spill_agg_batches()
-    ds = CachedDataset(
+    ds = StreamCache(
         pa.RecordBatchReader.from_batches(_SPILL_AGG_SCHEMA, iter(batches)),
         memory_capacity=_SPILL_MEMORY,
         disk_path=str(tmp_path),
@@ -513,11 +513,11 @@ def test_asof_join_with_tolerance_and_disk_spill(tmp_path):
     datasets are fully spilled to the disk tier.
 
     DuckDB scans sensors twice (once for the ASOF subquery, once for the outer
-    LEFT JOIN).  CachedDataset replays both tables from disk on each rescan;
+    LEFT JOIN).  StreamCache replays both tables from disk on each rescan;
     a bare reader would drain on the first pass and produce wrong results, as
     verified by test_asof_join_with_tolerance.
     """
-    sensors_ds = CachedDataset(
+    sensors_ds = StreamCache(
         pa.RecordBatchReader.from_batches(
             _PADDED_SENSOR_SCHEMA, iter(_PADDED_SENSOR_BATCHES)
         ),
@@ -525,7 +525,7 @@ def test_asof_join_with_tolerance_and_disk_spill(tmp_path):
         disk_path=str(tmp_path / "sensors"),
         disk_capacity=64 * 1024 * 1024,
     )
-    events_ds = CachedDataset(
+    events_ds = StreamCache(
         pa.RecordBatchReader.from_batches(
             _PADDED_EVENT_SCHEMA, iter(_PADDED_EVENT_BATCHES)
         ),

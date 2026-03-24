@@ -1,4 +1,4 @@
-"""Tests verifying that CachedDataset and CachedDatasetReader behave as
+"""Tests verifying that StreamCache and StreamCacheReader behave as
 well-behaved Arrow stream sources — compatible with PyArrow, arro3, IPC
 serialisation, and the full Arrow PyCapsule protocol.
 
@@ -10,14 +10,14 @@ import io
 import arro3.core as ac
 import pyarrow as pa
 
-from batchcorder import CachedDataset
+from batchcorder import StreamCache
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 
 def _ds(tmp_path, table, batch_size=3):
-    return CachedDataset(
+    return StreamCache(
         table.to_reader(max_chunksize=batch_size),
         memory_capacity=16 * 1024 * 1024,
         disk_path=str(tmp_path),
@@ -50,13 +50,13 @@ def test_pa_table_from_reader(tmp_path):
 
 
 def test_pa_record_batch_reader_from_stream_dataset(tmp_path):
-    """`pa.RecordBatchReader.from_stream` accepts CachedDataset directly."""
+    """`pa.RecordBatchReader.from_stream` accepts StreamCache directly."""
     result = pa.RecordBatchReader.from_stream(_ds(tmp_path, TABLE)).read_all()
     assert result.equals(TABLE)
 
 
 def test_pa_record_batch_reader_from_stream_reader(tmp_path):
-    """`pa.RecordBatchReader.from_stream` accepts CachedDatasetReader."""
+    """`pa.RecordBatchReader.from_stream` accepts StreamCacheReader."""
     result = pa.RecordBatchReader.from_stream(_ds(tmp_path, TABLE).reader()).read_all()
     assert result.equals(TABLE)
 
@@ -84,7 +84,7 @@ def test_schema_metadata_preserved_through_cache(tmp_path):
 
 
 def test_schema_metadata_preserved_through_reader(tmp_path):
-    """Metadata is intact when consuming via a CachedDatasetReader handle."""
+    """Metadata is intact when consuming via a StreamCacheReader handle."""
     metadata = {b"hello": b"world"}
     table = TABLE.replace_schema_metadata(metadata)
 
@@ -115,7 +115,7 @@ def test_requested_schema_casts_column_type_on_dataset(tmp_path):
 
 
 def test_requested_schema_casts_column_type_on_reader(tmp_path):
-    """Same requested_schema negotiation works on a CachedDatasetReader."""
+    """Same requested_schema negotiation works on a StreamCacheReader."""
     r = _ds(tmp_path, TABLE).reader()
     requested = pa.schema(
         [
@@ -131,7 +131,7 @@ def test_requested_schema_casts_column_type_on_reader(tmp_path):
 
 
 def test_ipc_stream_round_trip_dataset(tmp_path):
-    """CachedDataset can be piped into an IPC stream writer and read back."""
+    """StreamCache can be piped into an IPC stream writer and read back."""
     pa_reader = pa.RecordBatchReader.from_stream(_ds(tmp_path, TABLE))
     buf = io.BytesIO()
     with pa.ipc.new_stream(buf, pa_reader.schema) as writer:
@@ -142,7 +142,7 @@ def test_ipc_stream_round_trip_dataset(tmp_path):
 
 
 def test_ipc_stream_round_trip_reader(tmp_path):
-    """CachedDatasetReader can be piped into an IPC stream writer and read back."""
+    """StreamCacheReader can be piped into an IPC stream writer and read back."""
     pa_reader = pa.RecordBatchReader.from_stream(_ds(tmp_path, TABLE).reader())
     buf = io.BytesIO()
     with pa.ipc.new_stream(buf, pa_reader.schema) as writer:
@@ -156,19 +156,19 @@ def test_ipc_stream_round_trip_reader(tmp_path):
 
 
 def test_arro3_from_stream_dataset(tmp_path):
-    """`arro3.core.RecordBatchReader.from_stream` accepts CachedDataset."""
+    """`arro3.core.RecordBatchReader.from_stream` accepts StreamCache."""
     arro3_reader = ac.RecordBatchReader.from_stream(_ds(tmp_path, TABLE))
     assert pa.table(arro3_reader).equals(TABLE)
 
 
 def test_arro3_from_stream_reader(tmp_path):
-    """`arro3.core.RecordBatchReader.from_stream` accepts CachedDatasetReader."""
+    """`arro3.core.RecordBatchReader.from_stream` accepts StreamCacheReader."""
     arro3_reader = ac.RecordBatchReader.from_stream(_ds(tmp_path, TABLE).reader())
     assert pa.table(arro3_reader).equals(TABLE)
 
 
 def test_arro3_schema_metadata_preserved(tmp_path):
-    """arro3 preserves schema metadata when consuming a CachedDataset."""
+    """arro3 preserves schema metadata when consuming a StreamCache."""
     metadata = {b"hello": b"world"}
     table = TABLE.replace_schema_metadata(metadata)
 

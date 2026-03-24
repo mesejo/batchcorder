@@ -3,7 +3,7 @@ import threading
 import pyarrow as pa
 import pytest
 
-from batchcorder import CachedDataset
+from batchcorder import StreamCache
 
 
 def _make_table(n_batches: int = 4, rows_per_batch: int = 3) -> pa.Table:
@@ -20,7 +20,7 @@ def _make_table(n_batches: int = 4, rows_per_batch: int = 3) -> pa.Table:
 def _dataset(tmp_path, table=None, batch_size=3, mem_mb=16, disk_mb=64):
     if table is None:
         table = _make_table()
-    return CachedDataset(
+    return StreamCache(
         table.to_reader(max_chunksize=batch_size),
         memory_capacity=mem_mb * 1024 * 1024,
         disk_path=str(tmp_path),
@@ -41,7 +41,7 @@ def test_basic_construction(tmp_path):
 
 
 def test_accepts_pyarrow_table_directly(tmp_path):
-    ds = CachedDataset(
+    ds = StreamCache(
         _make_table(),
         memory_capacity=16 * 1024 * 1024,
         disk_path=str(tmp_path),
@@ -290,7 +290,7 @@ def test_disk_spill_and_pyarrow_ipc_roundtrip(tmp_path):
         }
     )
 
-    ds = CachedDataset(
+    ds = StreamCache(
         table.to_reader(max_chunksize=rows_per_batch),
         memory_capacity=32 * 1024,  # 32 KiB — forces spill
         disk_path=str(tmp_path),
@@ -332,7 +332,7 @@ def test_disk_spill_ipc_file_write_and_read(tmp_path):
     cache_dir.mkdir()
     ipc_path = tmp_path / "out.arrow"
 
-    ds = CachedDataset(
+    ds = StreamCache(
         table.to_reader(max_chunksize=rows_per_batch),
         memory_capacity=32 * 1024,  # 32 KiB — forces spill to disk
         disk_path=str(cache_dir),
@@ -400,7 +400,7 @@ def test_close_removes_disk_files(tmp_path):
         }
     )
 
-    ds = CachedDataset(
+    ds = StreamCache(
         table.to_reader(max_chunksize=rows_per_batch),
         memory_capacity=32 * 1024,  # 32 KiB — forces spill to disk
         disk_path=str(tmp_path),
@@ -474,7 +474,7 @@ def test_upstream_error_at_construction_propagates(tmp_path):
             raise RuntimeError("upstream failure")
 
     with pytest.raises(Exception, match="upstream failure"):
-        CachedDataset(
+        StreamCache(
             _ErrorReader(),
             memory_capacity=16 * 1024 * 1024,
             disk_path=str(tmp_path),
@@ -491,7 +491,7 @@ def test_upstream_error_during_read_propagates(tmp_path):
         raise RuntimeError("upstream failure on second batch")
 
     reader = pa.RecordBatchReader.from_batches(schema, _failing())
-    ds = CachedDataset(
+    ds = StreamCache(
         reader,
         memory_capacity=16 * 1024 * 1024,
         disk_path=str(tmp_path),
@@ -514,7 +514,7 @@ def test_drop_removes_disk_files(tmp_path):
         }
     )
 
-    ds = CachedDataset(
+    ds = StreamCache(
         table.to_reader(max_chunksize=rows_per_batch),
         memory_capacity=32 * 1024,  # 32 KiB — forces spill to disk
         disk_path=str(tmp_path),

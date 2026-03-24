@@ -2,12 +2,12 @@
 //!
 //! # Overview
 //!
-//! [`PyCachedDataset`] accepts any upstream Arrow stream source (anything that
+//! [`PyStreamCache`] accepts any upstream Arrow stream source (anything that
 //! exposes `__arrow_c_stream__` in Python) and stores each `RecordBatch` in a
 //! Foyer hybrid cache keyed by a monotonic `u64` batch index.  The IPC stream
 //! format is used for on-cache serialization so the data is schema-agnostic.
 //!
-//! Multiple independent [`PyCachedDatasetReader`] handles can be obtained from
+//! Multiple independent [`PyStreamCacheReader`] handles can be obtained from
 //! a single dataset, each maintaining its own read position.  A reader that
 //! requests a batch not yet ingested will trigger lazy ingestion up to that
 //! index.
@@ -43,7 +43,7 @@ use tokio::runtime::Runtime;
 
 // ── dataset counter ───────────────────────────────────────────────────────────
 
-/// Monotonically increasing counter used to give each [`PyCachedDataset`] a
+/// Monotonically increasing counter used to give each [`PyStreamCache`] a
 /// unique Foyer device subdirectory under the caller-supplied `disk_path`.
 static DATASET_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -129,7 +129,7 @@ fn with_gil_acquired<T, F: FnOnce() -> T>(f: F) -> T {
 
 // ── shared ingestion state ───────────────────────────────────────────────────
 
-/// Mutable state shared between a [`PyCachedDataset`] and all of its readers.
+/// Mutable state shared between a [`PyStreamCache`] and all of its readers.
 ///
 /// Protected by `Arc<Mutex<DatasetInner>>` so readers and the dataset can
 /// share it across threads.
@@ -150,7 +150,7 @@ struct DatasetInner {
     /// `disk_path`).  Only this subdirectory is removed on close/drop; the
     /// parent directory provided by the caller is left untouched.
     foyer_path: PathBuf,
-    /// `true` once [`PyCachedDataset::close`] has been called or the dataset
+    /// `true` once [`PyStreamCache::close`] has been called or the dataset
     /// has been dropped.  Prevents double-cleanup and signals active readers
     /// that the dataset is no longer usable.
     closed: bool,
@@ -198,13 +198,13 @@ impl DatasetInner {
     }
 }
 
-// ── CachedDatasetReaderImpl ──────────────────────────────────────────────────
+// ── StreamCacheReaderImpl ──────────────────────────────────────────────────
 
-/// The concrete Rust iterator that backs [`PyCachedDatasetReader`].
+/// The concrete Rust iterator that backs [`PyStreamCacheReader`].
 ///
 /// Implements [`arrow_array::RecordBatchReader`] so it can be handed to any
 /// Rust API or exported via the Arrow C Stream interface.
-struct CachedDatasetReaderImpl {
+struct StreamCacheReaderImpl {
     /// Schema shared with the owning dataset (immutable, cheap to clone).
     schema: SchemaRef,
     /// Shared dataset state (ingestion, cache handle, consumer registry).
@@ -217,7 +217,7 @@ struct CachedDatasetReaderImpl {
     runtime: Arc<Runtime>,
 }
 
-impl Iterator for CachedDatasetReaderImpl {
+impl Iterator for StreamCacheReaderImpl {
     type Item = Result<RecordBatch, ArrowError>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -275,13 +275,13 @@ impl Iterator for CachedDatasetReaderImpl {
     }
 }
 
-impl arrow_array::RecordBatchReader for CachedDatasetReaderImpl {
+impl arrow_array::RecordBatchReader for StreamCacheReaderImpl {
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
 }
 
-impl Drop for CachedDatasetReaderImpl {
+impl Drop for StreamCacheReaderImpl {
     /// Deregister this reader from the consumer registry on drop so the dataset
     /// can track the true minimum read frontier across live consumers.
     fn drop(&mut self) {
@@ -291,21 +291,21 @@ impl Drop for CachedDatasetReaderImpl {
     }
 }
 
-// ── PyCachedDatasetReader ────────────────────────────────────────────────────
+// ── PyStreamCacheReader ────────────────────────────────────────────────────
 
 #[gen_stub_pyclass]
-#[pyclass(module = "batchcorder", name = "CachedDatasetReader", frozen)]
-pub struct PyCachedDatasetReader(Mutex<Option<CachedDatasetReaderImpl>>);
+#[pyclass(module = "batchcorder", name = "StreamCacheReader", frozen)]
+pub struct PyStreamCacheReader(Mutex<Option<StreamCacheReaderImpl>>);
 
-impl PyCachedDatasetReader {
-    fn new(impl_: CachedDatasetReaderImpl) -> Self {
+impl PyStreamCacheReader {
+    fn new(impl_: StreamCacheReaderImpl) -> Self {
         Self(Mutex::new(Some(impl_)))
     }
 
     /// Consume the inner reader and produce an Arrow C Stream PyCapsule.
     fn to_stream_pycapsule<'py>(
         py: Python<'py>,
-        reader: CachedDatasetReaderImpl,
+        reader: StreamCacheReaderImpl,
         requested_schema: Option<Bound<'py, PyCapsule>>,
     ) -> PyArrowResult<Bound<'py, PyCapsule>> {
         let schema = reader.schema.clone();
@@ -325,7 +325,7 @@ impl PyCachedDatasetReader {
 
 #[gen_stub_pymethods]
 #[pymethods]
-impl PyCachedDatasetReader {
+impl PyStreamCacheReader {
     #[pyo3(signature = (requested_schema = None))]
     #[gen_stub(override_return_type(type_repr = "typing.Any", imports = ("typing",)))]
     fn __arrow_c_stream__<'py>(
@@ -382,7 +382,7 @@ impl PyCachedDatasetReader {
             .unwrap()
             .take()
             .ok_or_else(|| PyIOError::new_err("Reader already consumed"))?;
-        let new_reader = PyCachedDatasetReader::new(impl_);
+        let new_reader = PyStreamCacheReader::new(impl_);
         let kwargs = pyo3::types::PyDict::new(py);
         kwargs.set_item("schema", target_schema)?;
         let py_reader = Bound::new(py, new_reader)?;
@@ -415,25 +415,25 @@ impl PyCachedDatasetReader {
     }
 }
 
-// ── PyCastingDataset ──────────────────────────────────────────────────────────
+// ── PyCastingStreamCache ──────────────────────────────────────────────────────────
 
 #[gen_stub_pyclass]
-#[pyclass(module = "batchcorder", name = "CastingDataset", frozen)]
-pub struct PyCastingDataset {
+#[pyclass(module = "batchcorder", name = "CastingStreamCache", frozen)]
+pub struct PyCastingStreamCache {
     inner: Arc<Mutex<DatasetInner>>,
     runtime: Arc<Runtime>,
     source_schema: SchemaRef,
     target_schema: SchemaRef,
 }
 
-impl PyCastingDataset {
-    fn make_reader_impl(&self, py: Python<'_>) -> PyResult<CachedDatasetReaderImpl> {
+impl PyCastingStreamCache {
+    fn make_reader_impl(&self, py: Python<'_>) -> PyResult<StreamCacheReaderImpl> {
         without_gil(py, || {
             let mut inner = self.inner.lock().map_err(|e| e.to_string())?;
             let consumer_id = inner.next_consumer_id;
             inner.next_consumer_id += 1;
             inner.consumer_positions.insert(consumer_id, 0);
-            Ok::<_, String>(CachedDatasetReaderImpl {
+            Ok::<_, String>(StreamCacheReaderImpl {
                 schema: self.source_schema.clone(),
                 inner: self.inner.clone(),
                 current_index: 0,
@@ -447,7 +447,7 @@ impl PyCastingDataset {
 
 #[gen_stub_pymethods]
 #[pymethods]
-impl PyCastingDataset {
+impl PyCastingStreamCache {
     #[gen_stub(override_return_type(type_repr = "arro3.core.Schema", imports = ("arro3.core",)))]
     #[getter]
     pub fn schema(&self) -> PyResult<Arro3Schema> {
@@ -468,7 +468,7 @@ impl PyCastingDataset {
         } else {
             Some(to_schema_pycapsule(py, self.target_schema.as_ref())?)
         };
-        PyCachedDatasetReader::to_stream_pycapsule(py, impl_, effective_schema)
+        PyStreamCacheReader::to_stream_pycapsule(py, impl_, effective_schema)
     }
 
     #[gen_stub(override_return_type(type_repr = "typing.Any", imports = ("typing",)))]
@@ -476,13 +476,13 @@ impl PyCastingDataset {
         to_schema_pycapsule(py, self.target_schema.as_ref())
     }
 
-    #[gen_stub(override_return_type(type_repr = "CastingDataset", imports = ()))]
+    #[gen_stub(override_return_type(type_repr = "CastingStreamCache", imports = ()))]
     pub fn cast(
         &self,
         #[gen_stub(override_type(type_repr = "typing.Any", imports = ("typing",)))]
         target_schema: PySchema,
-    ) -> PyResult<PyCastingDataset> {
-        Ok(PyCastingDataset {
+    ) -> PyResult<PyCastingStreamCache> {
+        Ok(PyCastingStreamCache {
             inner: self.inner.clone(),
             runtime: self.runtime.clone(),
             source_schema: self.source_schema.clone(),
@@ -492,8 +492,8 @@ impl PyCastingDataset {
 }
 
 #[gen_stub_pyclass]
-#[pyclass(module = "batchcorder", name = "CachedDataset", frozen)]
-pub struct PyCachedDataset {
+#[pyclass(module = "batchcorder", name = "StreamCache", frozen)]
+pub struct PyStreamCache {
     /// Arrow schema stored outside the cache for O(1) access.
     schema: SchemaRef,
     /// Shared ingestion/cache state accessible by all readers.
@@ -502,7 +502,7 @@ pub struct PyCachedDataset {
     runtime: Arc<Runtime>,
 }
 
-impl Drop for PyCachedDataset {
+impl Drop for PyStreamCache {
     fn drop(&mut self) {
         if let Ok(inner) = self.inner.lock() {
             if inner.closed {
@@ -536,7 +536,7 @@ impl Drop for PyCachedDataset {
 
 #[gen_stub_pymethods]
 #[pymethods]
-impl PyCachedDataset {
+impl PyStreamCache {
     #[new]
     #[pyo3(signature = (reader, memory_capacity, disk_path, disk_capacity))]
     pub fn new(
@@ -583,7 +583,7 @@ impl PyCachedDataset {
                     // immediately regardless of memory pressure.
                     .with_policy(HybridCachePolicy::WriteOnEviction)
                     // Do not flush in-memory entries to disk when the cache is
-                    // dropped.  Without this, every CachedDataset that fits
+                    // dropped.  Without this, every StreamCache that fits
                     // entirely in memory would still produce disk writes on drop.
                     .with_flush_on_close(false)
                     .memory(memory_capacity)
@@ -620,7 +620,7 @@ impl PyCachedDataset {
     }
 
     #[pyo3(signature = (from_start = true))]
-    pub fn reader(&self, py: Python<'_>, from_start: bool) -> PyResult<PyCachedDatasetReader> {
+    pub fn reader(&self, py: Python<'_>, from_start: bool) -> PyResult<PyStreamCacheReader> {
         // Release the GIL before locking `inner` to prevent ABBA deadlock:
         // scanner threads can hold `inner.lock()` while waiting to acquire the
         // GIL (via `with_gil_acquired` in `ingest_up_to`), so we must never
@@ -634,7 +634,7 @@ impl PyCachedDataset {
             inner.next_consumer_id += 1;
             let start_index = if from_start { 0 } else { inner.ingested_count };
             inner.consumer_positions.insert(consumer_id, start_index);
-            Ok::<_, String>(PyCachedDatasetReader::new(CachedDatasetReaderImpl {
+            Ok::<_, String>(PyStreamCacheReader::new(StreamCacheReaderImpl {
                 schema: self.schema.clone(),
                 inner: self.inner.clone(),
                 current_index: start_index,
@@ -645,7 +645,7 @@ impl PyCachedDataset {
         .map_err(PyIOError::new_err)
     }
 
-    pub fn __iter__(&self, py: Python<'_>) -> PyResult<PyCachedDatasetReader> {
+    pub fn __iter__(&self, py: Python<'_>) -> PyResult<PyStreamCacheReader> {
         self.reader(py, true)
     }
 
@@ -664,7 +664,7 @@ impl PyCachedDataset {
             .unwrap()
             .take()
             .expect("freshly created reader cannot be closed");
-        PyCachedDatasetReader::to_stream_pycapsule(py, impl_, requested_schema)
+        PyStreamCacheReader::to_stream_pycapsule(py, impl_, requested_schema)
     }
 
     #[gen_stub(override_return_type(type_repr = "typing.Any", imports = ("typing",)))]
@@ -676,8 +676,8 @@ impl PyCachedDataset {
         &self,
         #[gen_stub(override_type(type_repr = "typing.Any", imports = ("typing",)))]
         target_schema: PySchema,
-    ) -> PyResult<PyCastingDataset> {
-        Ok(PyCastingDataset {
+    ) -> PyResult<PyCastingStreamCache> {
+        Ok(PyCastingStreamCache {
             inner: self.inner.clone(),
             runtime: self.runtime.clone(),
             source_schema: self.schema.clone(),
