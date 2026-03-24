@@ -56,7 +56,7 @@ jobs:
           restore-keys: cargo-lint-
 
       - name: Install Python dependencies
-        run: uv sync --locked --group dev
+        run: uv sync --locked --group dev --no-install-project
 
       # The pyright, griffe, and mypy-stubtest pre-commit hooks import the
       # compiled extension at runtime, so we must build it first.
@@ -65,6 +65,7 @@ jobs:
         with:
           command: develop
           args: --uv
+          sccache: 'true'
           manylinux: 'off'
 
       - name: Cache pre-commit environments
