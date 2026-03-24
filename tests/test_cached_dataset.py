@@ -421,10 +421,34 @@ def test_close_removes_disk_files(tmp_path):
 
     ds.close()
 
+    # close() removes only the Foyer-owned subdirectory; tmp_path itself stays.
     remaining = list(tmp_path.rglob("*"))
     assert remaining == [], (
-        f"Expected disk_path to be empty after close(), found: {remaining}"
+        f"Expected Foyer subdirectory to be removed after close(), found: {remaining}"
     )
+
+
+def test_close_is_idempotent(tmp_path):
+    """Calling close() more than once must not raise."""
+    ds = _dataset(tmp_path)
+    ds.close()
+    ds.close()  # second call must be a no-op
+
+
+def test_reader_after_close_raises(tmp_path):
+    """reader() on a closed dataset must raise an error."""
+    ds = _dataset(tmp_path)
+    ds.close()
+    with pytest.raises(Exception, match="closed"):
+        ds.reader()
+
+
+def test_ingest_after_close_raises(tmp_path):
+    """ingest_all() on a closed dataset must raise an error."""
+    ds = _dataset(tmp_path)
+    ds.close()
+    with pytest.raises(Exception, match="closed"):
+        ds.ingest_all()
 
 
 def test_drop_removes_disk_files(tmp_path):
