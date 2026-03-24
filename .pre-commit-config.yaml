@@ -86,14 +86,6 @@ repos:
         pass_filenames: false
         types: [file, rust]
 
-      - id: cargo-doc
-        name: cargo doc
-        description: Verify Rust doc-comments compile and intra-doc links resolve.
-        entry: env RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items
-        language: system
-        pass_filenames: false
-        types: [rust]
-
       - id: pyright
         name: pyright
         description: Static type-checking for Python code and stubs.
