@@ -59,25 +59,22 @@ def _assert_readable_traceback(exc_info) -> str:
 
 def test_reader_c_stream_consumed_raises_ioerror(tmp_path):
     r = _consumed_reader(tmp_path)
-    with pytest.raises(OSError) as exc_info:
+    with pytest.raises(OSError, match="consumed") as exc_info:
         r.__arrow_c_stream__()
-    assert "consumed" in str(exc_info.value).lower()
     _assert_readable_traceback(exc_info)
 
 
 def test_reader_c_schema_consumed_raises_ioerror(tmp_path):
     r = _consumed_reader(tmp_path)
-    with pytest.raises(OSError) as exc_info:
+    with pytest.raises(OSError, match="consumed") as exc_info:
         r.__arrow_c_schema__()
-    assert "consumed" in str(exc_info.value).lower()
     _assert_readable_traceback(exc_info)
 
 
 def test_reader_schema_property_consumed_raises_ioerror(tmp_path):
     r = _consumed_reader(tmp_path)
-    with pytest.raises(OSError) as exc_info:
+    with pytest.raises(OSError, match="consumed") as exc_info:
         _ = r.schema
-    assert "consumed" in str(exc_info.value).lower()
     _assert_readable_traceback(exc_info)
 
 
@@ -86,7 +83,7 @@ def test_reader_next_consumed_raises_ioerror(tmp_path):
     # StopIteration.  Python's built-in next() propagates non-StopIteration
     # exceptions as-is, so the OSError surfaces directly.
     r = _consumed_reader(tmp_path)
-    with pytest.raises(OSError) as exc_info:
+    with pytest.raises(OSError, match="consumed") as exc_info:
         next(r)
     assert "consumed" in str(exc_info.value).lower()
     _assert_readable_traceback(exc_info)
@@ -120,7 +117,7 @@ def test_upstream_error_message_not_mangled(tmp_path):
         disk_path=str(tmp_path),
         disk_capacity=64 * 1024 * 1024,
     )
-    with pytest.raises(ValueError) as exc_info:
+    with pytest.raises(ValueError, match="upstream exploded") as exc_info:
         pa.RecordBatchReader.from_stream(ds).read_all()
 
     # The original message must appear somewhere in the exception chain.
@@ -142,7 +139,7 @@ def test_upstream_error_has_readable_traceback(tmp_path):
         disk_path=str(tmp_path),
         disk_capacity=64 * 1024 * 1024,
     )
-    with pytest.raises(Exception) as exc_info:
+    with pytest.raises(Exception, match="upstream exploded") as exc_info:
         pa.RecordBatchReader.from_stream(ds).read_all()
 
     text = _assert_readable_traceback(exc_info)

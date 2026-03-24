@@ -397,7 +397,7 @@ _PADDED_EMPLOYEE_BATCHES = [
             "id": batch["id"],
             "name": batch["name"],
             "manager_id": batch["manager_id"],
-            # 50 KiB per row × 3 rows ≈ 150 KiB per batch — far above 32 KiB
+            # 50 KiB per row * 3 rows ≈ 150 KiB per batch — far above 32 KiB
             "pad": [b"x" * 1024 * 50] * batch.num_rows,
         },
         schema=_PADDED_EMPLOYEE_SCHEMA,

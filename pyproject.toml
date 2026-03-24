@@ -52,8 +52,16 @@ extend-select = [
   "FURB",    # refurb: modernise Python code
   "PLC0415", # import-outside-toplevel: imports must be at module level
   "SIM",
+  "PT",
+  "D",
+  "RUF",
+  "PYI",
+  "UP",
 ]
 
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["D"]
+"*.pyi" = ["PYI021", "D205", "D401"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["batchcorder"]
