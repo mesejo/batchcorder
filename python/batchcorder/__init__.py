@@ -1,3 +1,5 @@
+"""Batchcorder: Hybrid memory+disk cached Arrow datasets."""
+
 from importlib.metadata import version
 
 from ._batchcorder import CachedDataset, CachedDatasetReader, CastingDataset

@@ -200,7 +200,7 @@ def test_reader_second_c_stream_raises(tmp_path):
     ds = _dataset(tmp_path)
     r = ds.reader()
     pa.RecordBatchReader.from_stream(r).read_all()
-    with pytest.raises(Exception, match="consumed|closed"):
+    with pytest.raises(Exception, match=r"consumed|closed"):
         r.__arrow_c_stream__()
 
 
@@ -208,7 +208,7 @@ def test_reader_c_schema_raises_after_consumed(tmp_path):
     ds = _dataset(tmp_path)
     r = ds.reader()
     pa.RecordBatchReader.from_stream(r).read_all()
-    with pytest.raises(Exception, match="consumed|closed"):
+    with pytest.raises(Exception, match=r"consumed|closed"):
         r.__arrow_c_schema__()
 
 
@@ -243,7 +243,7 @@ def test_frontier_reader_mid_stream(tmp_path):
         half.read_next_batch()
     assert ds.ingested_count == 3
     result = pa.RecordBatchReader.from_stream(ds.reader(from_start=False)).read_all()
-    assert result.num_rows == 6  # remaining 3 batches × 2 rows
+    assert result.num_rows == 6  # remaining 3 batches * 2 rows
 
 
 def test_ingest_all_returns_batch_count(tmp_path):
@@ -276,7 +276,7 @@ def test_ingest_all_idempotent(tmp_path):
 
 
 def test_disk_spill_and_pyarrow_ipc_roundtrip(tmp_path):
-    # Each batch: 100 rows × 1 KiB binary payload ≈ 100 KiB serialized.
+    # Each batch: 100 rows * 1 KiB binary payload ≈ 100 KiB serialized.
     # Memory tier is only 32 KiB — smaller than a single batch — so every
     # batch inserted into the cache must be evicted to the disk tier.
     n_batches = 5
