@@ -1,4 +1,4 @@
-"""Batchcorder: Hybrid memory+disk cached Arrow datasets."""
+"""Batchcorder: Hybrid memory+disk cached Arrow streams."""
 
 from __future__ import annotations
 
@@ -10,31 +10,31 @@ if TYPE_CHECKING:
     from typing import Any
 
 from ._batchcorder import (
-    CachedDataset as _PyCachedDataset,
+    CastingStreamCache as _PyCastingStreamCache,
 )
 from ._batchcorder import (
-    CachedDatasetReader as _PyCachedDatasetReader,
+    StreamCache as _PyStreamCache,
 )
 from ._batchcorder import (
-    CastingDataset as _PyCastingDataset,
+    StreamCacheReader as _PyStreamCacheReader,
 )
 
 
 __all__ = [
-    "CachedDataset",
-    "CachedDatasetReader",
-    "CastingDataset",
+    "CastingStreamCache",
+    "StreamCache",
+    "StreamCacheReader",
 ]
 
 __version__: str = version("batchcorder")
 
 
-class CachedDataset:
+class StreamCache:
     """A hybrid memory+disk cached Arrow dataset.
 
     Wraps any Arrow stream source and caches each ``RecordBatch`` in a Foyer
     hybrid cache keyed by a monotonic batch index.  Multiple independent
-    :class:`CachedDatasetReader` handles can replay the full stream from any
+    :class:`StreamCacheReader` handles can replay the full stream from any
     position; the upstream source is ingested lazily on demand.
 
     Parameters
@@ -60,10 +60,10 @@ class CachedDataset:
     --------
     >>> import tempfile
     >>> import pyarrow as pa
-    >>> from batchcorder import CachedDataset
+    >>> from batchcorder import StreamCache
     >>> table = pa.table({"id": [1, 2, 3], "val": [0.5, 1.0, 1.5]})
     >>> tmp = tempfile.mkdtemp()
-    >>> ds = CachedDataset(table, memory_capacity=16 << 20, disk_path=tmp, disk_capacity=64 << 20)
+    >>> ds = StreamCache(table, memory_capacity=16 << 20, disk_path=tmp, disk_capacity=64 << 20)
     >>> pa.RecordBatchReader.from_stream(ds).read_all().equals(table)
     True
     >>> ds.upstream_exhausted
@@ -75,7 +75,7 @@ class CachedDataset:
         self, reader: Any, memory_capacity: int, disk_path: str, disk_capacity: int
     ):
         """See class docstring for parameter documentation."""
-        self._impl = _PyCachedDataset(reader, memory_capacity, disk_path, disk_capacity)
+        self._impl = _PyStreamCache(reader, memory_capacity, disk_path, disk_capacity)
 
     @property
     def schema(self) -> Any:
@@ -88,10 +88,10 @@ class CachedDataset:
         Examples
         --------
         >>> import tempfile, pyarrow as pa
-        >>> from batchcorder import CachedDataset
+        >>> from batchcorder import StreamCache
         >>> table = pa.table({"id": [1, 2], "val": [0.5, 1.0]})
         >>> tmp = tempfile.mkdtemp()
-        >>> ds = CachedDataset(table, 16 << 20, tmp, 64 << 20)
+        >>> ds = StreamCache(table, 16 << 20, tmp, 64 << 20)
         >>> [f.name for f in ds.schema]
         ['id', 'val']
 
@@ -111,10 +111,10 @@ class CachedDataset:
         Examples
         --------
         >>> import tempfile, pyarrow as pa
-        >>> from batchcorder import CachedDataset
+        >>> from batchcorder import StreamCache
         >>> table = pa.table({"x": [1, 2, 3]})
         >>> tmp = tempfile.mkdtemp()
-        >>> ds = CachedDataset(table, 16 << 20, tmp, 64 << 20)
+        >>> ds = StreamCache(table, 16 << 20, tmp, 64 << 20)
         >>> ds.ingested_count
         0
         >>> ds.ingest_all()
@@ -136,10 +136,10 @@ class CachedDataset:
         Examples
         --------
         >>> import tempfile, pyarrow as pa
-        >>> from batchcorder import CachedDataset
+        >>> from batchcorder import StreamCache
         >>> table = pa.table({"x": [1, 2, 3]})
         >>> tmp = tempfile.mkdtemp()
-        >>> ds = CachedDataset(table, 16 << 20, tmp, 64 << 20)
+        >>> ds = StreamCache(table, 16 << 20, tmp, 64 << 20)
         >>> ds.upstream_exhausted
         False
         >>> ds.ingest_all()
@@ -150,8 +150,8 @@ class CachedDataset:
         """
         return self._impl.upstream_exhausted
 
-    def reader(self, from_start: bool = True) -> CachedDatasetReader:
-        """Return a new :class:`CachedDatasetReader` handle.
+    def reader(self, from_start: bool = True) -> StreamCacheReader:
+        """Return a new :class:`StreamCacheReader` handle.
 
         Parameters
         ----------
@@ -162,32 +162,32 @@ class CachedDataset:
 
         Returns
         -------
-        CachedDatasetReader
+        StreamCacheReader
 
         Examples
         --------
         >>> import tempfile, pyarrow as pa
-        >>> from batchcorder import CachedDataset
+        >>> from batchcorder import StreamCache
         >>> table = pa.table({"x": [1, 2, 3]})
         >>> tmp = tempfile.mkdtemp()
-        >>> ds = CachedDataset(table, 16 << 20, tmp, 64 << 20)
+        >>> ds = StreamCache(table, 16 << 20, tmp, 64 << 20)
         >>> r1 = ds.reader()
         >>> r2 = ds.reader()
         >>> r1.closed, r2.closed
         (False, False)
 
         """
-        return CachedDatasetReader(self._impl.reader(from_start))
+        return StreamCacheReader(self._impl.reader(from_start))
 
-    def __iter__(self) -> CachedDatasetReader:
+    def __iter__(self) -> StreamCacheReader:
         """Iterate over all batches from the start.
 
-        Creates a fresh :class:`CachedDatasetReader` starting at batch 0 and
+        Creates a fresh :class:`StreamCacheReader` starting at batch 0 and
         returns it as the iterator.
 
         Returns
         -------
-        CachedDatasetReader
+        StreamCacheReader
 
         """
         return self.reader(True)
@@ -217,16 +217,16 @@ class CachedDataset:
         transfer to other Python libraries that understand Arrow memory.
 
         This allows Arrow consumers to inspect the data type of this
-        :class:`CachedDataset`.  Then the consumer can ask the producer (in
+        :class:`StreamCache`.  Then the consumer can ask the producer (in
         ``__arrow_c_stream__``) to cast the exported data to a supported data type.
 
         """
         return self._impl.__arrow_c_schema__()
 
-    def cast(self, target_schema: Any) -> CastingDataset:
+    def cast(self, target_schema: Any) -> CastingStreamCache:
         """Cast the dataset to produce batches with the given schema.
 
-        Returns a :class:`CastingDataset` — a **replayable** wrapper that
+        Returns a :class:`CastingStreamCache` — a **replayable** wrapper that
         applies the schema cast on every read.  Unlike
         :meth:`pyarrow.RecordBatchReader.cast`, the result can be consumed
         multiple times, making it suitable for DuckDB self-joins and ASOF joins.
@@ -239,10 +239,10 @@ class CachedDataset:
 
         Returns
         -------
-        CastingDataset
+        CastingStreamCache
 
         """
-        return CastingDataset(self._impl.cast(target_schema))
+        return CastingStreamCache(self._impl.cast(target_schema))
 
     def ingest_all(self) -> int:
         """Eagerly ingest all batches from the upstream source into the cache.
@@ -259,10 +259,10 @@ class CachedDataset:
         Examples
         --------
         >>> import tempfile, pyarrow as pa
-        >>> from batchcorder import CachedDataset
+        >>> from batchcorder import StreamCache
         >>> table = pa.table({"x": [1, 2, 3]})
         >>> tmp = tempfile.mkdtemp()
-        >>> ds = CachedDataset(table, 16 << 20, tmp, 64 << 20)
+        >>> ds = StreamCache(table, 16 << 20, tmp, 64 << 20)
         >>> ds.ingest_all()
         1
         >>> ds.upstream_exhausted
@@ -284,18 +284,18 @@ class CachedDataset:
         Examples
         --------
         >>> import tempfile, pyarrow as pa
-        >>> from batchcorder import CachedDataset
+        >>> from batchcorder import StreamCache
         >>> table = pa.table({"x": [1, 2, 3]})
         >>> tmp = tempfile.mkdtemp()
-        >>> ds = CachedDataset(table, 16 << 20, tmp, 64 << 20)
+        >>> ds = StreamCache(table, 16 << 20, tmp, 64 << 20)
         >>> ds.close()
 
         """
         return self._impl.close()
 
 
-class CachedDatasetReader:
-    """A single-use iterator handle for a :class:`CachedDataset`.
+class StreamCacheReader:
+    """A single-use iterator handle for a :class:`StreamCache`.
 
     Maintains an independent read position.  Multiple handles backed by the
     same dataset share the underlying cache; the upstream source is ingested
@@ -306,13 +306,13 @@ class CachedDatasetReader:
 
     Notes
     -----
-    Obtain a handle from :meth:`CachedDataset.reader` rather than constructing
+    Obtain a handle from :meth:`StreamCache.reader` rather than constructing
     one directly.
 
     """
 
-    def __init__(self, impl: _PyCachedDatasetReader):
-        """Obtain via :meth:`CachedDataset.reader`."""
+    def __init__(self, impl: _PyStreamCacheReader):
+        """Obtain via :meth:`StreamCache.reader`."""
         self._impl = impl
 
     @property
@@ -370,7 +370,7 @@ class CachedDatasetReader:
         transfer to other Python libraries that understand Arrow memory.
 
         This allows Arrow consumers to inspect the data type of this
-        :class:`CachedDatasetReader`.  Then the consumer can ask the producer (in
+        :class:`StreamCacheReader`.  Then the consumer can ask the producer (in
         ``__arrow_c_stream__``) to cast the exported data to a supported data type.
 
         Raises
@@ -381,7 +381,7 @@ class CachedDatasetReader:
         """
         return self._impl.__arrow_c_schema__()
 
-    def __iter__(self) -> CachedDatasetReader:
+    def __iter__(self) -> StreamCacheReader:
         """Return self as the iterator."""
         return self
 
@@ -415,22 +415,22 @@ class CachedDatasetReader:
         return next(iter(self._impl))
 
 
-class CastingDataset:
-    """A replayable cast view of a :class:`CachedDataset`.
+class CastingStreamCache:
+    """A replayable cast view of a :class:`StreamCache`.
 
-    Created by :meth:`CachedDataset.cast`.  Each call to ``__arrow_c_stream__``
+    Created by :meth:`StreamCache.cast`.  Each call to ``__arrow_c_stream__``
     produces a fresh reader from the underlying cache with each batch cast to
     :attr:`schema`, so this object is **replayable** — DuckDB self-joins, ASOF
     joins, and other multi-scan consumers work correctly on it.
 
     Notes
     -----
-    Obtain via :meth:`CachedDataset.cast` rather than constructing directly.
+    Obtain via :meth:`StreamCache.cast` rather than constructing directly.
 
     """
 
-    def __init__(self, impl: _PyCastingDataset):
-        """Obtain via :meth:`CachedDataset.cast`."""
+    def __init__(self, impl: _PyCastingStreamCache):
+        """Obtain via :meth:`StreamCache.cast`."""
         self._impl = impl
 
     @property
@@ -467,8 +467,8 @@ class CastingDataset:
         """
         return self._impl.__arrow_c_schema__()
 
-    def cast(self, target_schema: Any) -> CastingDataset:
-        """Cast to a further target schema, returning a new :class:`CastingDataset`.
+    def cast(self, target_schema: Any) -> CastingStreamCache:
+        """Cast to a further target schema, returning a new :class:`CastingStreamCache`.
 
         Parameters
         ----------
@@ -477,7 +477,7 @@ class CastingDataset:
 
         Returns
         -------
-        CastingDataset
+        CastingStreamCache
 
         """
-        return CastingDataset(self._impl.cast(target_schema))
+        return CastingStreamCache(self._impl.cast(target_schema))

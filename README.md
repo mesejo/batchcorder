@@ -6,12 +6,12 @@ be replayed multiple times from a source that can only be read once.
 ## The problem
 
 Arrow `RecordBatchReader` is a single-use stream — once consumed, it is gone.
-Training loops and multi-pass data pipelines need to iterate the same dataset
+Training loops and multi-pass data pipelines need to iterate the same stream
 repeatedly without re-reading from disk or the network each time.
 
 ## What batchcorder does
 
-`CachedDataset` wraps any Arrow stream source (anything that implements
+`StreamCache` wraps any Arrow stream source (anything that implements
 `__arrow_c_stream__`) and stores each `RecordBatch` in a two-tier hybrid cache
 (memory + disk) backed by [Foyer](https://github.com/foyer-rs/foyer).
 Multiple independent readers can then replay the stream concurrently, each
@@ -19,30 +19,27 @@ maintaining their own position in the batch sequence.
 
 ```mermaid
 flowchart LR
-    U["upstream source<br/>(read once)"] --> D["CachedDataset<br/>[mem + disk cache]"]
-    D --> R0["CachedDatasetReader 0<br/>(from batch 0)"]
-    D --> R1["CachedDatasetReader 1<br/>(from batch 0)"]
-    D --> R2["CachedDatasetReader 2<br/>(from batch 3)"]
+    U["upstream source<br/>(read once)"] --> D["StreamCache<br/>[mem + disk cache]"]
+    D --> R0["StreamCacheReader 0<br/>(from batch 0)"]
+    D --> R1["StreamCacheReader 1<br/>(from batch 0)"]
+    D --> R2["StreamCacheReader 2<br/>(from batch 3)"]
 ```
 
 ## Installation
 
-Requires a Rust toolchain and [maturin](https://github.com/PyO3/maturin).
-
 ```bash
-uv sync
-maturin develop --uv
+pip install batchcorder
 ```
 
 ## Usage
 
 ```python
 import pyarrow as pa
-from batchcorder import CachedDataset
+from batchcorder import StreamCache
 
 table = pa.table({"x": [1, 2, 3], "y": [4, 5, 6]})
 
-ds = CachedDataset(
+ds = StreamCache(
     table.to_reader(max_chunksize=1),  # any __arrow_c_stream__ source
     memory_capacity=64 * 1024 * 1024,  # 64 MB
     disk_path="/tmp/batchcorder-cache",
@@ -63,7 +60,7 @@ ds.ingest_all()
 
 ### Compatibility
 
-`CachedDataset` and `CachedDatasetReader` implement both `__arrow_c_stream__`
+`StreamCache` and `StreamCacheReader` implement both `__arrow_c_stream__`
 and `__arrow_c_schema__`, so they work with any Arrow-compatible library:
 
 ```python
@@ -71,7 +68,7 @@ import pyarrow as pa
 import duckdb
 
 pa.table(ds)             # PyArrow
-pa.table(ds.reader())    # via CachedDatasetReader
+pa.table(ds.reader())    # via StreamCacheReader
 duckdb.table("ds")       # DuckDB
 ```
 
@@ -79,8 +76,8 @@ duckdb.table("ds")       # DuckDB
 
 - **Single-read source**: the upstream stream is consumed exactly once; all
   subsequent reads come from the cache.
-- **Concurrent readers**: multiple `CachedDatasetReader` instances from the
-  same dataset are fully independent and thread-safe.
+- **Concurrent readers**: multiple `StreamCacheReader` instances from the
+  same stream cache are fully independent and thread-safe.
 - **Lazy ingestion**: batches are fetched from the upstream source on demand as
   readers advance, not upfront.
 - **Replay from any position**: `ds.reader(from_start=True)` replays from

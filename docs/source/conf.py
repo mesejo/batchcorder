@@ -107,7 +107,7 @@ html_theme_options = {
         },
     ],
     "site_url": "https://batchcorder.readthedocs.io/",
-    "repo_url": "https://github.com/yourusername/multirecord",
+    "repo_url": "https://github.com/mesejo/batchcorder",
     "repo_name": "batchcorder",
     "icon": {
         "repo": "fontawesome/brands/github",

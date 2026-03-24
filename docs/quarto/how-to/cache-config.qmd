@@ -46,7 +46,7 @@ If all readers are created and fully consumed before new ones are created, only
 one reader is live at any time. The minimum cache size is just one batch:
 
 ```python
-ds = CachedDataset(source, memory_capacity=batch_bytes * 2, ...)
+ds = StreamCache(source, memory_capacity=batch_bytes * 2, ...)
 ```
 
 In practice, add a safety margin of ×2–×4.
@@ -74,26 +74,26 @@ tier fills.
 
 ## Training-loop workloads
 
-For ML training loops where you replay the full dataset each epoch:
+For ML training loops where you replay the full stream each epoch:
 
 1. Call `ingest_all()` once before training starts.
-2. Size the cache to hold the **entire dataset**, not just the active window.
+2. Size the cache to hold the **entire stream**, not just the active window.
 
 ```python
 import os, tempfile
 import pyarrow.parquet as pq
-from batchcorder import CachedDataset
+from batchcorder import StreamCache
 
 dataset_bytes = sum(
     os.path.getsize(f) for f in ["shard_0.parquet", "shard_1.parquet"]
 )
 
 tmp = tempfile.mkdtemp()
-ds = CachedDataset(
+ds = StreamCache(
     pq.read_table("shard_0.parquet"),   # or a concatenated reader
     memory_capacity = min(dataset_bytes, 512 << 20),   # cap at 512 MB RAM
     disk_path       = tmp,
-    disk_capacity   = dataset_bytes * 2,               # full dataset + headroom
+    disk_capacity   = dataset_bytes * 2,               # full stream + headroom
 )
 ds.ingest_all()
 ```

@@ -8,14 +8,14 @@ batchcorder exposes two public classes. Both implement the
 with PyArrow, DuckDB, Polars, DataFusion, and any other Arrow-compatible
 library without explicit conversion.
 
-## `CachedDataset`
+## `StreamCache`
 
 The primary entry point. Wraps an Arrow stream source and manages the
 hybrid memory + disk cache.
 
 | Method / property        | Description |
 |--------------------------|-------------|
-| `__init__(...)`          | Create a dataset from any `__arrow_c_stream__` source. |
+| `__init__(...)`          | Create a StreamCache from any `__arrow_c_stream__` source. |
 | `reader(from_start=True)`| Return a new independent reader handle. |
 | `ingest_all()`           | Eagerly consume the upstream source into the cache. |
 | `schema`                 | Arrow schema of the stream. |
@@ -25,12 +25,12 @@ hybrid memory + disk cache.
 | `__arrow_c_stream__()`   | Create a reader starting at batch 0 (for PyCapsule consumers). |
 | `__arrow_c_schema__()`   | Expose the schema for PyCapsule consumers. |
 
-Full API documentation: [batchcorder.CachedDataset](../autoapi/batchcorder/index.rst).
+Full API documentation: [batchcorder.StreamCache](../autoapi/batchcorder/index.rst).
 
-## `CachedDatasetReader`
+## `StreamCacheReader`
 
 A single-use iterator handle. Maintains its own position in the batch
-sequence. Obtain one via `CachedDataset.reader()` — do not construct directly.
+sequence. Obtain one via `StreamCache.reader()` — do not construct directly.
 
 | Method / property        | Description |
 |--------------------------|-------------|
@@ -41,7 +41,7 @@ sequence. Obtain one via `CachedDataset.reader()` — do not construct directly.
 | `__arrow_c_stream__()`   | Consume the reader (for PyCapsule consumers). |
 | `__arrow_c_schema__()`   | Expose the schema for PyCapsule consumers. |
 
-Full API documentation: [batchcorder.CachedDatasetReader](../autoapi/batchcorder/index.rst).
+Full API documentation: [batchcorder.StreamCacheReader](../autoapi/batchcorder/index.rst).
 
 ## Compatibility
 
@@ -52,7 +52,7 @@ making them compatible with:
 import pyarrow as pa
 import duckdb
 
-ds = ...   # a CachedDataset
+ds = ...   # a StreamCache
 
 # PyArrow
 table = pa.table(ds)

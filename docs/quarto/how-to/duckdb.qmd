@@ -7,7 +7,7 @@ scan. A query that scans the same source twice — a self-join, an `ASOF JOIN`,
 a CTE referenced multiple times — will produce empty results on the second
 scan because the original `RecordBatchReader` is already exhausted.
 
-Wrapping the source in a `CachedDataset` eliminates this problem: each call to
+Wrapping the source in a `StreamCache` eliminates this problem: each call to
 `__arrow_c_stream__()` creates a fresh reader starting at batch 0, so DuckDB
 sees a full stream on every scan.
 
@@ -22,7 +22,7 @@ sees a full stream on every scan.
 import tempfile
 import pyarrow as pa
 import duckdb
-from batchcorder import CachedDataset
+from batchcorder import StreamCache
 
 employees = pa.table({
     "id":         [1,    2,    3,    4   ],
@@ -31,7 +31,7 @@ employees = pa.table({
 })
 
 tmp = tempfile.mkdtemp()
-ds = CachedDataset(employees, 16 << 20, tmp, 64 << 20)
+ds = StreamCache(employees, 16 << 20, tmp, 64 << 20)
 
 # Without batchcorder, the second scan of `employees` returns zero rows.
 result = duckdb.sql("""
@@ -49,7 +49,7 @@ print(result)
 ```
 
 DuckDB calls `__arrow_c_stream__()` twice — once for each alias of `ds`.
-Because `CachedDataset` returns a fresh `CachedDatasetReader` on every call,
+Because `StreamCache` returns a fresh `StreamCacheReader` on every call,
 both scans see all four rows.
 
 ## ASOF join (time-series lookup)
@@ -61,7 +61,7 @@ the most recent reference row whose timestamp is ≤ the event timestamp.
 import tempfile
 import pyarrow as pa
 import duckdb
-from batchcorder import CachedDataset
+from batchcorder import StreamCache
 
 events = pa.table({
     "ts":    pa.array([1, 3, 5, 7], type=pa.int64()),
@@ -73,8 +73,8 @@ prices = pa.table({
 })
 
 tmp = tempfile.mkdtemp()
-events_ds = CachedDataset(events, 16 << 20, tmp, 64 << 20)
-prices_ds = CachedDataset(prices, 16 << 20, tmp, 64 << 20)
+events_ds = StreamCache(events, 16 << 20, tmp, 64 << 20)
+prices_ds = StreamCache(prices, 16 << 20, tmp, 64 << 20)
 
 result = duckdb.sql("""
     SELECT e.ts, e.value, p.price
@@ -85,10 +85,10 @@ result = duckdb.sql("""
 print(result)
 ```
 
-Each dataset participates in only one scan here, but wrapping them ensures
+Each stream participates in only one scan here, but wrapping them ensures
 future queries that reuse the same Python variable work correctly.
 
-## Repeated queries over the same dataset
+## Repeated queries over the same stream
 
 When exploring data interactively, you often run many different queries over
 the same source without wanting to re-read the file each time:
@@ -98,13 +98,13 @@ import tempfile
 import pyarrow as pa
 import pyarrow.parquet as pq
 import duckdb
-from batchcorder import CachedDataset
+from batchcorder import StreamCache
 
 # Read a large Parquet file once.
 table = pq.read_table("data/large_file.parquet")
 
 tmp = tempfile.mkdtemp()
-ds = CachedDataset(table, 256 << 20, tmp, 2 << 30)
+ds = StreamCache(table, 256 << 20, tmp, 2 << 30)
 ds.ingest_all()   # pull everything into cache upfront
 
 # Now run as many queries as you like — each call creates a fresh reader.

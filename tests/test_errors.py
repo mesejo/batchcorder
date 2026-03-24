@@ -1,4 +1,4 @@
-"""Error quality tests for CachedDataset and CachedDatasetReader.
+"""Error quality tests for StreamCache and StreamCacheReader.
 
 Each test verifies three things for a given error condition:
   1. The correct exception *type* is raised (not a generic RuntimeError or similar).
@@ -12,7 +12,7 @@ import traceback
 import pyarrow as pa
 import pytest
 
-from batchcorder import CachedDataset
+from batchcorder import StreamCache
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -20,7 +20,7 @@ from batchcorder import CachedDataset
 
 def _ds(tmp_path):
     table = pa.table({"x": [1, 2, 3]})
-    return CachedDataset(
+    return StreamCache(
         table.to_reader(max_chunksize=3),
         memory_capacity=16 * 1024 * 1024,
         disk_path=str(tmp_path),
@@ -29,7 +29,7 @@ def _ds(tmp_path):
 
 
 def _consumed_reader(tmp_path):
-    """Return a CachedDatasetReader that has been consumed via __arrow_c_stream__."""
+    """Return a StreamCacheReader that has been consumed via __arrow_c_stream__."""
     r = _ds(tmp_path).reader()
     pa.RecordBatchReader.from_stream(r).read_all()
     assert r.closed
@@ -111,7 +111,7 @@ class _ExplodingReader:
 
 def test_upstream_error_message_not_mangled(tmp_path):
     """The upstream ValueError message must survive the Rust conversion boundary."""
-    ds = CachedDataset(
+    ds = StreamCache(
         _ExplodingReader(),
         memory_capacity=16 * 1024 * 1024,
         disk_path=str(tmp_path),
@@ -133,7 +133,7 @@ def test_upstream_error_message_not_mangled(tmp_path):
 
 def test_upstream_error_has_readable_traceback(tmp_path):
     """The traceback for an upstream error must be non-empty and name the exception."""
-    ds = CachedDataset(
+    ds = StreamCache(
         _ExplodingReader(),
         memory_capacity=16 * 1024 * 1024,
         disk_path=str(tmp_path),
