@@ -1,0 +1,164 @@
+---
+title: "Architecture"
+---
+
+> *Target audience: a developer who wants to understand why batchcorder is
+> designed the way it is — the tradeoffs, the concurrency model, and why
+> specific libraries were chosen.*
+
+## The problem
+
+The Apache Arrow ecosystem models data streams as `RecordBatchReader`:
+a forward-only, single-use iterator. Once consumed, it cannot be replayed.
+This is intentional — Arrow streams can be arbitrarily large, generated from
+network sockets or lazy computations, so buffering everything in memory is not
+always feasible.
+
+The problem surfaces whenever a downstream consumer needs to scan the same
+source more than once:
+
+- **DuckDB self-joins**: DuckDB calls `__arrow_c_stream__()` once per scan of
+  a table reference. A query with two references to the same reader results in
+  an empty second scan.
+- **Multi-epoch training**: an ML training loop needs to iterate the same
+  dataset once per epoch, but the upstream source (a network file system, a
+  remote blob store) should only be read once.
+- **Multiple independent consumers**: two workers consuming the same stream at
+  different rates cannot share a raw reader.
+
+The naive fix — collect everything into a `pyarrow.Table` — defeats streaming
+for datasets that do not fit in memory.
+
+## Design goals
+
+1. **Single upstream read**: consume the source exactly once.
+2. **Concurrent independent readers**: multiple handles, fully thread-safe,
+   each with their own position.
+3. **Bounded memory footprint**: spill to disk when the in-memory budget is
+   exhausted.
+4. **Arrow-native**: implement `__arrow_c_stream__` and `__arrow_c_schema__`
+   so downstream libraries see a standard Arrow producer.
+5. **Lazy ingestion**: don't require reading the whole source upfront; readers
+   pull batches on demand.
+
+## Key dependencies
+
+### Foyer — the cache engine
+
+[Foyer](https://github.com/foyer-rs/foyer) is a Rust crate providing a
+hybrid in-memory + on-disk cache with Least-Recently-Used (LRU) eviction.
+It was chosen over alternatives because:
+
+- It handles the memory-to-disk spill automatically.
+- Cache entries are byte-level blobs — straightforward to store IPC-serialised
+  Arrow buffers.
+- It is thread-safe and async-ready, fitting the Tokio runtime used by Foyer's
+  I/O layer.
+
+### PyO3 — Rust/Python FFI
+
+[PyO3](https://pyo3.rs/) is the standard Rust crate for writing Python
+extension modules. It handles GIL management, Python reference counting, and
+the `#[pyclass]` / `#[pymethods]` macros that expose Rust structs to Python.
+
+### Tokio — async runtime
+
+Foyer's disk I/O is asynchronous. batchcorder embeds a Tokio runtime
+(`tokio::runtime::Runtime`) and uses `runtime.block_on()` to run async cache
+operations synchronously from Python's synchronous context.
+
+## Core data structures
+
+```
+CachedDataset (Python-visible)
+├── Arc<Inner>
+│   ├── Mutex<UpstreamState>
+│   │   ├── Option<ArrowArrayStreamReader>  ← upstream reader
+│   │   └── ingested_count: usize
+│   ├── HybridCache<u64, Bytes>             ← Foyer cache, keyed by batch index
+│   └── Schema                             ← Arrow schema (from upstream)
+└── ... (Python GC bookkeeping via PyO3)
+
+CachedDatasetReader (Python-visible)
+├── Arc<Inner>           ← shared reference to the same dataset
+├── next_index: u64      ← this reader's current position
+└── closed: bool
+```
+
+`Arc<Inner>` is a reference-counted pointer to the shared state. Multiple
+`CachedDatasetReader` instances and the parent `CachedDataset` all hold a
+clone of the same `Arc`, so the cache outlives any individual handle.
+
+## Ingestion lifecycle
+
+When a reader requests batch `N`:
+
+1. If batch `N` is in the Foyer cache → deserialise from bytes and return it.
+2. If not in the cache:
+   a. Lock `UpstreamState`.
+   b. While `ingested_count < N + 1`, pull the next batch from the upstream
+      reader, serialise it to IPC bytes, and insert it into the Foyer cache
+      with key `ingested_count`, then increment `ingested_count`.
+   c. Release the lock.
+   d. Fetch batch `N` from the cache (it must be there now).
+
+This design means:
+
+- The upstream reader is consumed **at most once**, in order.
+- Multiple readers requesting the same batch concurrently will have one
+  of them pull from upstream while the others wait on the lock, then all
+  find the batch in the cache.
+- The lock is only held while pulling from upstream — reading from the cache
+  is lock-free from the application's perspective.
+
+## Concurrency model and GIL safety
+
+Python's GIL is held whenever PyO3 code runs in a Python thread. batchcorder
+releases the GIL when doing I/O-bound work (Foyer disk reads/writes) by
+using `py.allow_threads(|| { ... })` around cache operations.
+
+Key invariants:
+
+- The `Mutex<UpstreamState>` is a Rust `std::sync::Mutex`, not a Python lock.
+  It is held only while pulling from upstream, not while reading from cache.
+- `Arc<Inner>` clone/drop is atomic and does not touch the GIL.
+- `CachedDatasetReader.next_index` is per-reader state accessed only from the
+  owning reader — no synchronisation needed.
+
+This means two threads can call `next()` on different readers simultaneously
+without deadlocking, even if both readers happen to need the same uncached
+batch (one will wait on the Rust mutex; the other will proceed after the
+mutex holder populates the cache).
+
+See [GIL and deadlock risks](gil-deadlock.md) for a deeper discussion.
+
+## The PyCapsule Interface
+
+`CachedDataset` and `CachedDatasetReader` implement
+`__arrow_c_stream__` and `__arrow_c_schema__`. This means any Arrow-compatible
+Python library — PyArrow, DuckDB, DataFusion, Polars — can consume them
+without any explicit conversion:
+
+```python
+import pyarrow as pa
+import duckdb
+
+pa.table(ds)          # PyArrow reads via __arrow_c_stream__
+duckdb.table("ds")    # DuckDB reads via __arrow_c_stream__
+```
+
+Each call to `__arrow_c_stream__` creates a fresh `CachedDatasetReader`
+starting at batch 0, so every consumer sees a complete stream.
+
+## Eviction and the "reader lag" invariant
+
+Foyer evicts cache entries under memory/disk pressure using LRU. The
+invariant batchcorder relies on is:
+
+> *A cache entry for batch `N` must not be evicted before the slowest live
+> reader has consumed batch `N`.*
+
+batchcorder cannot enforce this invariant automatically — it depends on the
+user sizing the cache to cover the maximum reader lag. If the invariant is
+violated, the affected reader raises an `IOError` with a clear message
+identifying the evicted batch index.

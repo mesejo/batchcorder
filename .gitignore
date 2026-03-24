@@ -61,6 +61,16 @@ coverage.xml
 
 # Sphinx documentation
 docs/_build/
+docs/build/
+
+# Quarto-generated Markdown files (build artifacts — source is in docs/quarto/)
+docs/source/**/*.md
+
+# Quarto project cache
+docs/quarto/.quarto/
+
+# sphinx-autoapi generated RST files
+docs/source/_autoapi/
 
 # PyCharm
 .idea/
@@ -76,3 +86,5 @@ docs/_build/
 .envrc
 
 !src/bin
+
+site
