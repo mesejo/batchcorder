@@ -177,23 +177,15 @@ def test_reader_iterable(tmp_path):
     assert sum(b.num_rows for b in batches) == table.num_rows
 
 
-def test_source_reader_advances_as_dataset_ingests(tmp_path):
-    # CachedDataset owns the source reader and pulls from it during ingestion.
-    # Reading via a from_stream wrapper advances the source reader position.
+def test_upstream_ingested_lazily(tmp_path):
+    # The dataset pulls from the upstream reader on demand, not all upfront.
     table = _make_table(n_batches=4, rows_per_batch=3)
-    reader = table.to_reader(max_chunksize=3)
-    ds = CachedDataset(
-        reader,
-        memory_capacity=16 * 1024 * 1024,
-        disk_path=str(tmp_path),
-        disk_capacity=64 * 1024 * 1024,
-    )
-    wrapper = pa.RecordBatchReader.from_stream(ds)
-    first = wrapper.read_next_batch()
-    assert first.equals(table.slice(0, 3).to_batches()[0])
-    # The source reader has been advanced past the batch the dataset consumed.
-    second = reader.read_next_batch()
-    assert second.equals(table.slice(3, 3).to_batches()[0])
+    ds = _dataset(tmp_path, table)
+    assert ds.ingested_count == 0
+    reader = pa.RecordBatchReader.from_stream(ds.reader())
+    reader.read_next_batch()
+    assert ds.ingested_count >= 1
+    assert not ds.upstream_exhausted
 
 
 def test_reader_closed_after_c_stream_export(tmp_path):
@@ -448,6 +440,64 @@ def test_ingest_after_close_raises(tmp_path):
     ds = _dataset(tmp_path)
     ds.close()
     with pytest.raises(Exception, match="closed"):
+        ds.ingest_all()
+
+
+def test_close_while_reader_mid_stream(tmp_path):
+    """An active reader gets a 'closed' error on the next read after close()."""
+    table = _make_table(n_batches=4, rows_per_batch=3)
+    ds = _dataset(tmp_path, table)
+    reader = pa.RecordBatchReader.from_stream(ds.reader())
+    reader.read_next_batch()  # succeeds — batch 0 is already in the memory tier
+    ds.close()
+    with pytest.raises(Exception, match="closed"):
+        reader.read_next_batch()
+
+
+def test_frontier_reader_from_start_false_at_zero(tmp_path):
+    """A from_start=False reader created before any ingestion replays the full stream."""
+    table = _make_table(n_batches=4, rows_per_batch=3)
+    ds = _dataset(tmp_path, table)
+    assert ds.ingested_count == 0
+    result = pa.RecordBatchReader.from_stream(ds.reader(from_start=False)).read_all()
+    assert result.equals(table)
+
+
+def test_upstream_error_at_construction_propagates(tmp_path):
+    """An error raised by __arrow_c_stream__ during construction is surfaced immediately."""
+
+    class _ErrorReader:
+        def __arrow_c_schema__(self):
+            return pa.schema({"x": pa.int32()}).__arrow_c_schema__()
+
+        def __arrow_c_stream__(self, requested_schema=None):
+            raise RuntimeError("upstream failure")
+
+    with pytest.raises(Exception, match="upstream failure"):
+        CachedDataset(
+            _ErrorReader(),
+            memory_capacity=16 * 1024 * 1024,
+            disk_path=str(tmp_path),
+            disk_capacity=64 * 1024 * 1024,
+        )
+
+
+def test_upstream_error_during_read_propagates(tmp_path):
+    """An error raised while iterating the upstream source propagates to the caller."""
+    schema = pa.schema({"x": pa.int32()})
+
+    def _failing():
+        yield pa.record_batch({"x": pa.array([1], type=pa.int32())})
+        raise RuntimeError("upstream failure on second batch")
+
+    reader = pa.RecordBatchReader.from_batches(schema, _failing())
+    ds = CachedDataset(
+        reader,
+        memory_capacity=16 * 1024 * 1024,
+        disk_path=str(tmp_path),
+        disk_capacity=64 * 1024 * 1024,
+    )
+    with pytest.raises(Exception, match="upstream failure"):
         ds.ingest_all()
 
 

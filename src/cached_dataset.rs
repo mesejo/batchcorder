@@ -100,7 +100,6 @@ fn without_gil<T, F: FnOnce() -> T>(_py: Python<'_>, f: F) -> T {
         }
     }
     // On free-threaded Python (Py_GIL_DISABLED) there is no GIL to release.
-    // On free-threaded Python (Py_GIL_DISABLED) there is no GIL to release.
     #[cfg(not(Py_GIL_DISABLED))]
     let _guard = RestoreGuard(unsafe { pyo3::ffi::PyEval_SaveThread() });
     f()
@@ -243,33 +242,36 @@ impl Iterator for CachedDatasetReaderImpl {
             inner.cache.clone()
         };
 
-        // ── Step 2: fetch IPC bytes from cache (lock released) ───────────────
-        let maybe_bytes = self.runtime.block_on(async {
+        // ── Step 2: fetch from cache and deserialize (lock released) ─────────
+        // Deserialize directly from the cache entry to avoid cloning the raw
+        // IPC bytes into a temporary buffer before deserialization.
+        let result = self.runtime.block_on(async {
             cache
                 .get(&idx)
                 .await
-                .map(|opt| opt.map(|entry| entry.value().clone()))
+                .map(|opt| opt.map(|entry| deserialize_batch(entry.value())))
         });
 
-        let bytes = match maybe_bytes {
-            Err(e) => return Some(Err(other_arrow_err(format!("Cache get failed: {e}")))),
+        match result {
+            Err(e) => Some(Err(other_arrow_err(format!("Cache get failed: {e}")))),
             Ok(None) => {
                 // Distinguish a post-close access from a genuine capacity eviction.
                 let closed = self.inner.lock().map(|g| g.closed).unwrap_or(false);
                 if closed {
-                    return Some(Err(other_arrow_err("Dataset has been closed")));
+                    Some(Err(other_arrow_err("Dataset has been closed")))
+                } else {
+                    Some(Err(other_arrow_err(format!(
+                        "Batch {idx} was evicted from the cache before it could be read. \
+                         Increase cache capacity so it can hold all live consumer positions."
+                    ))))
                 }
-                return Some(Err(other_arrow_err(format!(
-                    "Batch {idx} was evicted from the cache before it could be read. \
-                     Increase cache capacity so it can hold all live consumer positions."
-                ))));
             }
-            Ok(Some(b)) => b,
-        };
-
-        // ── Step 3: deserialize and advance position ─────────────────────────
-        self.current_index += 1;
-        Some(deserialize_batch(&bytes))
+            // ── Step 3: advance position ──────────────────────────────────────
+            Ok(Some(batch_result)) => {
+                self.current_index += 1;
+                Some(batch_result)
+            }
+        }
     }
 }
 
@@ -675,8 +677,9 @@ impl Drop for PyCachedDataset {
             // Best-effort async flush/clear.  May not complete if this is
             // the last Arc<Runtime> reference, but the subdirectory is
             // already gone so data integrity is not at risk.
-            #[allow(clippy::let_underscore_future)]
-            let _ = self.runtime.spawn(async move {
+            // block_on guarantees the clear completes before Drop returns,
+            // unlike spawn which may not execute if the runtime is torn down.
+            self.runtime.block_on(async move {
                 let _ = cache.clear().await;
             });
         }
@@ -942,6 +945,8 @@ impl PyCachedDataset {
         // Release the GIL before locking `inner` (same ordering rule as `reader`).
         without_gil(py, || {
             let mut inner = self.inner.lock().map_err(|e| e.to_string())?;
+            // u64::MAX as sentinel: the loop inside ingest_up_to exits via
+            // upstream_exhausted long before ingested_count could approach it.
             inner
                 .ingest_up_to(&self.runtime, u64::MAX)
                 .map_err(|e| e.to_string())?;
