@@ -425,3 +425,36 @@ def test_close_removes_disk_files(tmp_path):
     assert remaining == [], (
         f"Expected disk_path to be empty after close(), found: {remaining}"
     )
+
+
+def test_drop_removes_disk_files(tmp_path):
+    """Drop (when dataset goes out of scope) must delete the Foyer block-device files it wrote to disk."""
+    n_batches = 5
+    rows_per_batch = 100
+    table = pa.table(
+        {
+            "id": list(range(n_batches * rows_per_batch)),
+            "payload": pa.array(
+                [b"x" * 1024] * (n_batches * rows_per_batch), type=pa.large_binary()
+            ),
+        }
+    )
+
+    ds = CachedDataset(
+        table.to_reader(max_chunksize=rows_per_batch),
+        memory_capacity=32 * 1024,  # 32 KiB — forces spill to disk
+        disk_path=str(tmp_path),
+        disk_capacity=64 * 1024 * 1024,
+    )
+    ds.ingest_all()
+
+    disk_files = list(tmp_path.rglob("*"))
+    assert len(disk_files) > 0, "Expected Foyer to write cache files before drop()"
+
+    # Let ds go out of scope (drop is called automatically)
+    del ds
+
+    # Check that the directory no longer exists or is empty
+    assert not tmp_path.exists() or list(tmp_path.rglob("*")) == [], (
+        f"Expected disk_path to be removed or empty after drop(), found: {list(tmp_path.rglob('*')) if tmp_path.exists() else 'directory does not exist'}"
+    )

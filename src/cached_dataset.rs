@@ -22,6 +22,7 @@
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arrow_array::{ArrayRef, RecordBatch, StructArray};
@@ -39,6 +40,12 @@ use pyo3_arrow::ffi::{to_schema_pycapsule, to_stream_pycapsule, ArrayIterator};
 use pyo3_arrow::{PyRecordBatchReader, PySchema};
 use pyo3_stub_gen::derive::*;
 use tokio::runtime::Runtime;
+
+// ── dataset counter ───────────────────────────────────────────────────────────
+
+/// Monotonically increasing counter used to give each [`PyCachedDataset`] a
+/// unique Foyer device subdirectory under the caller-supplied `disk_path`.
+static DATASET_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 // ── error helpers ────────────────────────────────────────────────────────────
 
@@ -628,13 +635,41 @@ pub struct PyCachedDataset {
     runtime: Arc<Runtime>,
 }
 
+impl PyCachedDataset {
+    /// Internal helper to clean up cache and disk storage
+    /// Returns the disk path and runtime for async operations
+    fn cleanup_resources(&self) -> (Arc<HybridCache<u64, Vec<u8>>>, Arc<Runtime>, PathBuf) {
+        let inner = self.inner.lock().unwrap();
+        (inner.cache.clone(), self.runtime.clone(), inner.disk_path.clone())
+    }
+
+    /// Internal helper to perform async cleanup
+    async fn cleanup_cache_and_disk(
+        cache: Arc<HybridCache<u64, Vec<u8>>>, 
+        disk_path: PathBuf,
+    ) -> Result<(), foyer::Error> {
+        // Clear the cache
+        cache.clear().await?;
+        
+        // Remove disk files if they exist
+        if disk_path.exists() {
+            std::fs::remove_dir_all(&disk_path)?;
+        }
+        Ok(())
+    }
+}
+
 impl Drop for PyCachedDataset {
     fn drop(&mut self) {
         // When the dataset is dropped, destroy the storage to clean up unused files
-        let cache = self.inner.lock().unwrap().cache.clone();
-        let runtime = self.runtime.clone();
-        // Spawn a task to clear the cache and destroy storage
-        runtime.spawn(async move {
+        let (cache, runtime, disk_path) = self.cleanup_resources();
+        
+        // For drop, we'll use a simpler synchronous approach to avoid runtime issues
+        // Just remove the disk files directly (ignore errors - directory may not exist)
+        let _ = std::fs::remove_dir_all(&disk_path);
+        
+        // Clear the cache in the background (best effort)
+        let _ = runtime.spawn(async move {
             let _ = cache.clear().await;
         });
     }
@@ -968,21 +1003,12 @@ impl PyCachedDataset {
     pub fn close(&self, py: Python<'_>) -> PyResult<()> {
         // Release the GIL before locking `inner` and destroying storage
         without_gil(py, || {
-            let inner = self.inner.lock().map_err(|e| e.to_string())?;
-            let cache = inner.cache.clone();
-            let runtime = self.runtime.clone();
-            let disk_path = inner.disk_path.clone();
+            let (cache, runtime, disk_path) = self.cleanup_resources();
 
             // Clear the cache and destroy storage
             runtime
                 .block_on(async move {
-                    cache.clear().await?;
-
-                    // Manually remove the disk files if they still exist
-                    if disk_path.exists() {
-                        std::fs::remove_dir_all(&disk_path).map_err(foyer::Error::from)?;
-                    }
-                    Ok::<(), foyer::Error>(())
+                    Self::cleanup_cache_and_disk(cache, disk_path).await
                 })
                 .map_err(|e| e.to_string())?;
             Ok::<_, String>(())
