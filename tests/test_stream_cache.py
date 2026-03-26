@@ -532,3 +532,74 @@ def test_drop_removes_disk_files(tmp_path):
     assert not tmp_path.exists() or list(tmp_path.rglob("*")) == [], (
         f"Expected disk_path to be removed or empty after drop(), found: {list(tmp_path.rglob('*')) if tmp_path.exists() else 'directory does not exist'}"
     )
+
+
+# ── memory-only mode ──────────────────────────────────────────────────────────
+
+
+def _memory_only_dataset(table=None, batch_size=3, mem_mb=16):
+    if table is None:
+        table = _make_table()
+    return StreamCache(
+        table.to_reader(max_chunksize=batch_size),
+        memory_capacity=mem_mb * 1024 * 1024,
+    )
+
+
+def test_memory_only_default_capacity():
+    """Omitting memory_capacity uses total system RAM; stream is fully readable."""
+    table = _make_table(n_batches=2, rows_per_batch=3)
+    ds = StreamCache(table.to_reader(max_chunksize=3))
+    result = pa.RecordBatchReader.from_stream(ds).read_all()
+    assert result.equals(table)
+
+
+def test_memory_only_construction():
+    assert _memory_only_dataset() is not None
+
+
+def test_memory_only_returns_correct_data():
+    table = _make_table(n_batches=4, rows_per_batch=3)
+    result = pa.RecordBatchReader.from_stream(_memory_only_dataset(table)).read_all()
+    assert result.equals(table)
+
+
+def test_memory_only_replayable():
+    table = _make_table(n_batches=2, rows_per_batch=5)
+    ds = _memory_only_dataset(table)
+    for _ in range(3):
+        result = pa.RecordBatchReader.from_stream(ds).read_all()
+        assert result.equals(table)
+
+
+def test_memory_only_ingest_all():
+    table = _make_table(n_batches=3, rows_per_batch=4)
+    ds = _memory_only_dataset(table, batch_size=4)
+    count = ds.ingest_all()
+    assert count == 3
+    assert ds.upstream_exhausted
+
+
+def test_memory_only_multiple_independent_readers():
+    table = _make_table(n_batches=4, rows_per_batch=3)
+    ds = _memory_only_dataset(table)
+    r1 = ds.reader()
+    r2 = ds.reader()
+    result1 = pa.RecordBatchReader.from_stream(r1).read_all()
+    result2 = pa.RecordBatchReader.from_stream(r2).read_all()
+    assert result1.equals(table)
+    assert result2.equals(table)
+
+
+def test_memory_only_close():
+    ds = _memory_only_dataset()
+    ds.close()
+    ds.close()  # idempotent
+
+
+def test_disk_params_must_both_be_provided_or_omitted():
+    table = _make_table()
+    with pytest.raises(OSError, match="disk_path and disk_capacity"):
+        StreamCache(table, memory_capacity=16 << 20, disk_path="/tmp")
+    with pytest.raises(OSError, match="disk_path and disk_capacity"):
+        StreamCache(table, memory_capacity=16 << 20, disk_capacity=64 << 20)

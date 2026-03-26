@@ -30,12 +30,20 @@ __version__: str = version("batchcorder")
 
 
 class StreamCache:
-    """A hybrid memory+disk cached Arrow dataset.
+    """A cached Arrow dataset backed by Foyer.
 
     Wraps any Arrow stream source and caches each ``RecordBatch`` in a Foyer
-    hybrid cache keyed by a monotonic batch index.  Multiple independent
+    cache keyed by a monotonic batch index.  Multiple independent
     :class:`StreamCacheReader` handles can replay the full stream from any
     position; the upstream source is ingested lazily on demand.
+
+    Two storage modes are supported:
+
+    - **Memory-only** (omit ``disk_path`` / ``disk_capacity``): batches are
+      kept in a Foyer in-memory cache.  No files are created on disk.
+    - **Hybrid** (provide both ``disk_path`` and ``disk_capacity``): batches
+      evicted from the memory tier spill to a Foyer block-device on disk,
+      allowing the working set to exceed available RAM.
 
     Parameters
     ----------
@@ -43,25 +51,36 @@ class StreamCache:
         Any object implementing ``__arrow_c_stream__`` (e.g.
         :class:`pyarrow.Table`, :class:`pyarrow.RecordBatchReader`,
         :class:`arro3.core.RecordBatchReader`).
-    memory_capacity : int
-        In-memory cache tier size in bytes.
-    disk_path : str
+    memory_capacity : int, optional
+        In-memory cache tier size in bytes.  Defaults to total physical RAM so
+        the cache fails only when a ``tee``-style copy would also exhaust memory.
+    disk_path : str, optional
         Directory for the on-disk cache tier.  Created on first use.
-    disk_capacity : int
+        Must be provided together with ``disk_capacity``.
+    disk_capacity : int, optional
         On-disk cache tier size in bytes.
+        Must be provided together with ``disk_path``.
 
     Notes
     -----
     Foyer may evict cache entries under memory/disk pressure.  If a batch is
-    evicted before a reader reaches it the reader raises an error.  Size both
-    tiers so they can hold all live reader positions simultaneously.
+    evicted before a reader reaches it the reader raises an error.  Size the
+    cache so it can hold all live reader positions simultaneously.
 
     Examples
     --------
-    >>> import tempfile
+    Memory-only:
+
     >>> import pyarrow as pa
     >>> from batchcorder import StreamCache
     >>> table = pa.table({"id": [1, 2, 3], "val": [0.5, 1.0, 1.5]})
+    >>> ds = StreamCache(table, memory_capacity=16 << 20)
+    >>> pa.RecordBatchReader.from_stream(ds).read_all().equals(table)
+    True
+
+    Hybrid memory+disk:
+
+    >>> import tempfile
     >>> tmp = tempfile.mkdtemp()
     >>> ds = StreamCache(table, memory_capacity=16 << 20, disk_path=tmp, disk_capacity=64 << 20)
     >>> pa.RecordBatchReader.from_stream(ds).read_all().equals(table)
@@ -72,7 +91,11 @@ class StreamCache:
     """
 
     def __init__(
-        self, reader: Any, memory_capacity: int, disk_path: str, disk_capacity: int
+        self,
+        reader: Any,
+        memory_capacity: int | None = None,
+        disk_path: str | None = None,
+        disk_capacity: int | None = None,
     ):
         """See class docstring for parameter documentation."""
         self._impl = _PyStreamCache(reader, memory_capacity, disk_path, disk_capacity)
