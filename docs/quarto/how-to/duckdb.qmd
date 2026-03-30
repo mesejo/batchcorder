@@ -41,11 +41,6 @@ result = duckdb.sql("""
 """).fetchdf()
 
 print(result)
-#   employee manager
-# 0    Alice    None
-# 1      Bob   Alice
-# 2    Carol   Alice
-# 3     Dave     Bob
 ```
 
 DuckDB calls `__arrow_c_stream__()` twice — once for each alias of `ds`.
