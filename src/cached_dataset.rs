@@ -1,11 +1,20 @@
-//! Hybrid memory+disk cached Arrow dataset backed by Foyer.
+//! Cached Arrow dataset backed by Foyer.
 //!
 //! # Overview
 //!
 //! [`PyStreamCache`] accepts any upstream Arrow stream source (anything that
 //! exposes `__arrow_c_stream__` in Python) and stores each `RecordBatch` in a
-//! Foyer hybrid cache keyed by a monotonic `u64` batch index.  The IPC stream
-//! format is used for on-cache serialization so the data is schema-agnostic.
+//! Foyer cache keyed by a monotonic `u64` batch index.  The IPC stream format
+//! is used for on-cache serialization so the data is schema-agnostic.
+//!
+//! Two storage modes are supported:
+//!
+//! - **Memory-only** (`disk_path` / `disk_capacity` omitted): batches are kept
+//!   in a Foyer in-memory cache only.  No files are created on disk.
+//! - **Hybrid** (`disk_path` + `disk_capacity` both provided): batches that
+//!   are evicted from the memory tier are written to a Foyer block-device
+//!   backed by the filesystem, allowing the working set to exceed available
+//!   RAM.
 //!
 //! Multiple independent [`PyStreamCacheReader`] handles can be obtained from
 //! a single dataset, each maintaining its own read position.  A reader that
@@ -25,11 +34,25 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+// ── system memory detection ───────────────────────────────────────────────────
+
+/// Return the total physical RAM of this machine in bytes.
+///
+/// Used as the default `memory_capacity` for memory-only caches so they fail
+/// only when a `tee`-style copy would also exhaust available memory.
+fn total_system_memory() -> usize {
+    let sys = sysinfo::System::new_with_specifics(
+        sysinfo::RefreshKind::nothing()
+            .with_memory(sysinfo::MemoryRefreshKind::nothing().with_ram()),
+    );
+    sys.total_memory() as usize
+}
+
 use arrow_array::{ArrayRef, RecordBatch, StructArray};
 use arrow_schema::{ArrowError, Field, SchemaRef};
 use foyer::{
-    BlockEngineConfig, DeviceBuilder, FsDeviceBuilder, HybridCache, HybridCacheBuilder,
-    HybridCachePolicy,
+    BlockEngineConfig, Cache, CacheBuilder, DeviceBuilder, FsDeviceBuilder, HybridCache,
+    HybridCacheBuilder, HybridCachePolicy,
 };
 use pyo3::exceptions::PyIOError;
 use pyo3::prelude::*;
@@ -46,6 +69,54 @@ use tokio::runtime::Runtime;
 /// Monotonically increasing counter used to give each [`PyStreamCache`] a
 /// unique Foyer device subdirectory under the caller-supplied `disk_path`.
 static DATASET_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+// ── cache tier ───────────────────────────────────────────────────────────────
+
+/// Abstraction over memory-only and hybrid memory+disk Foyer caches.
+///
+/// Both variants expose the same insert/get/clear interface so the rest of the
+/// code does not need to branch on the storage mode.
+enum CacheTier {
+    Memory(Cache<u64, Vec<u8>>),
+    Hybrid(HybridCache<u64, Vec<u8>>),
+}
+
+impl CacheTier {
+    /// Insert a batch into the cache.  Synchronous for both variants.
+    fn insert(&self, key: u64, value: Vec<u8>) {
+        match self {
+            CacheTier::Memory(c) => {
+                c.insert(key, value);
+            }
+            CacheTier::Hybrid(c) => {
+                c.insert(key, value);
+            }
+        }
+    }
+
+    /// Fetch the raw IPC bytes for `key`, or `None` if evicted / not yet
+    /// inserted.  Returns `Err` only when the hybrid disk tier fails.
+    async fn get_bytes(&self, key: &u64) -> Result<Option<Vec<u8>>, String> {
+        match self {
+            CacheTier::Memory(c) => Ok(c.get(key).map(|e| e.value().clone())),
+            CacheTier::Hybrid(c) => c
+                .get(key)
+                .await
+                .map(|opt| opt.map(|e| e.value().clone()))
+                .map_err(|e| e.to_string()),
+        }
+    }
+
+    /// Clear all entries from the cache.
+    async fn clear(&self) {
+        match self {
+            CacheTier::Memory(c) => c.clear(),
+            CacheTier::Hybrid(c) => {
+                let _ = c.clear().await;
+            }
+        }
+    }
+}
 
 // ── error helpers ────────────────────────────────────────────────────────────
 
@@ -134,8 +205,8 @@ fn with_gil_acquired<T, F: FnOnce() -> T>(f: F) -> T {
 /// Protected by `Arc<Mutex<DatasetInner>>` so readers and the dataset can
 /// share it across threads.
 struct DatasetInner {
-    /// Foyer hybrid cache: `batch_index → IPC bytes`.
-    cache: Arc<HybridCache<u64, Vec<u8>>>,
+    /// Foyer cache: `batch_index → IPC bytes`.
+    cache: Arc<CacheTier>,
     /// Upstream source; `None` once it is fully exhausted or has never been set.
     upstream: Option<Box<dyn arrow_array::RecordBatchReader + Send>>,
     /// How many batches have been pulled from `upstream` and inserted into the cache.
@@ -147,9 +218,9 @@ struct DatasetInner {
     /// Monotonically increasing counter used to assign unique consumer IDs.
     next_consumer_id: u64,
     /// Path of the Foyer device subdirectory (a child of the caller-supplied
-    /// `disk_path`).  Only this subdirectory is removed on close/drop; the
-    /// parent directory provided by the caller is left untouched.
-    foyer_path: PathBuf,
+    /// `disk_path`).  `None` for memory-only caches.  Only this subdirectory
+    /// is removed on close/drop; the parent directory is left untouched.
+    foyer_path: Option<PathBuf>,
     /// `true` once [`PyStreamCache::close`] has been called or the dataset
     /// has been dropped.  Prevents double-cleanup and signals active readers
     /// that the dataset is no longer usable.
@@ -162,7 +233,7 @@ impl DatasetInner {
     ///
     /// Returns `true` if `target_index` is now in the cache, or `false` if the
     /// upstream was exhausted before reaching it.
-    fn ingest_up_to(&mut self, runtime: &Runtime, target_index: u64) -> Result<bool, ArrowError> {
+    fn ingest_up_to(&mut self, target_index: u64) -> Result<bool, ArrowError> {
         if self.closed {
             return Err(other_arrow_err("Dataset has been closed"));
         }
@@ -186,12 +257,10 @@ impl DatasetInner {
             };
             let idx = self.ingested_count;
             let bytes = serialize_batch(&batch)?;
-            let cache = self.cache.clone();
-            // `HybridCache::insert` is synchronous (memory tier) and schedules
-            // disk persistence in the background.
-            runtime.block_on(async move {
-                cache.insert(idx, bytes);
-            });
+            // Both cache variants insert synchronously.  For the hybrid tier
+            // this writes to memory immediately and schedules disk persistence
+            // in the background.
+            self.cache.insert(idx, bytes);
             self.ingested_count += 1;
         }
         Ok(true)
@@ -232,7 +301,7 @@ impl Iterator for StreamCacheReaderImpl {
             if inner.closed {
                 return Some(Err(other_arrow_err("Dataset has been closed")));
             }
-            match inner.ingest_up_to(&self.runtime, idx) {
+            match inner.ingest_up_to(idx) {
                 Err(e) => return Some(Err(e)),
                 Ok(false) => return None, // upstream exhausted before idx
                 Ok(true) => {}
@@ -243,16 +312,9 @@ impl Iterator for StreamCacheReaderImpl {
         };
 
         // ── Step 2: fetch from cache and deserialize (lock released) ─────────
-        // Deserialize directly from the cache entry to avoid cloning the raw
-        // IPC bytes into a temporary buffer before deserialization.
-        let result = self.runtime.block_on(async {
-            cache
-                .get(&idx)
-                .await
-                .map(|opt| opt.map(|entry| deserialize_batch(entry.value())))
-        });
+        let bytes = self.runtime.block_on(async { cache.get_bytes(&idx).await });
 
-        match result {
+        match bytes {
             Err(e) => Some(Err(other_arrow_err(format!("Cache get failed: {e}")))),
             Ok(None) => {
                 // Distinguish a post-close access from a genuine capacity eviction.
@@ -266,10 +328,10 @@ impl Iterator for StreamCacheReaderImpl {
                     ))))
                 }
             }
-            // ── Step 3: advance position ──────────────────────────────────────
-            Ok(Some(batch_result)) => {
+            // ── Step 3: deserialize and advance position ──────────────────────
+            Ok(Some(b)) => {
                 self.current_index += 1;
-                Some(batch_result)
+                Some(deserialize_batch(&b))
             }
         }
     }
@@ -520,15 +582,18 @@ impl Drop for PyStreamCache {
             drop(inner);
 
             // Remove only the Foyer subdirectory we created; the caller's
-            // disk_path directory is left untouched.
-            let _ = std::fs::remove_dir_all(&foyer_path);
+            // disk_path directory is left untouched.  Nothing to do for
+            // memory-only caches (foyer_path is None).
+            if let Some(path) = foyer_path {
+                let _ = std::fs::remove_dir_all(path);
+            }
             // Best-effort async flush/clear.  May not complete if this is
             // the last Arc<Runtime> reference, but the subdirectory is
             // already gone so data integrity is not at risk.
             // block_on guarantees the clear completes before Drop returns,
             // unlike spawn which may not execute if the runtime is torn down.
             self.runtime.block_on(async move {
-                let _ = cache.clear().await;
+                cache.clear().await;
             });
         }
     }
@@ -538,17 +603,18 @@ impl Drop for PyStreamCache {
 #[pymethods]
 impl PyStreamCache {
     #[new]
-    #[pyo3(signature = (reader, memory_capacity, disk_path, disk_capacity))]
+    #[pyo3(signature = (reader, memory_capacity = None, disk_path = None, disk_capacity = None))]
     pub fn new(
         py: Python<'_>,
         #[gen_stub(override_type(type_repr = "typing.Any", imports = ("typing",)))]
         reader: PyRecordBatchReader,
-        memory_capacity: usize,
-        disk_path: String,
-        disk_capacity: u64,
+        memory_capacity: Option<usize>,
+        disk_path: Option<String>,
+        disk_capacity: Option<u64>,
     ) -> PyResult<Self> {
         let upstream = reader.into_reader()?;
         let schema = upstream.schema();
+        let memory_capacity = memory_capacity.unwrap_or_else(total_system_memory);
 
         // Build a dedicated multi-thread Tokio runtime.  A fresh runtime is
         // used rather than `Handle::current()` so this works both inside and
@@ -558,42 +624,60 @@ impl PyStreamCache {
             .build()
             .map_err(|e| PyIOError::new_err(format!("Failed to create Tokio runtime: {e}")))?;
 
-        let disk_cap_usize = usize::try_from(disk_capacity).unwrap_or(usize::MAX);
+        let (cache, foyer_path) = match (disk_path, disk_capacity) {
+            (Some(path), Some(capacity)) => {
+                // Create a unique subdirectory for Foyer's device files so that only
+                // that subdirectory is deleted on close/drop, leaving the caller's
+                // `disk_path` directory intact.
+                let id = DATASET_COUNTER.fetch_add(1, Ordering::Relaxed);
+                let foyer_path = PathBuf::from(&path).join(format!("_{id}"));
+                std::fs::create_dir_all(&foyer_path).map_err(|e| {
+                    PyIOError::new_err(format!("Failed to create Foyer device directory: {e}"))
+                })?;
 
-        // Create a unique subdirectory for Foyer's device files so that only
-        // that subdirectory is deleted on close/drop, leaving the caller's
-        // `disk_path` directory intact.
-        let id = DATASET_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let foyer_path = PathBuf::from(&disk_path).join(format!("_{id}"));
-        std::fs::create_dir_all(&foyer_path).map_err(|e| {
-            PyIOError::new_err(format!("Failed to create Foyer device directory: {e}"))
-        })?;
+                let disk_cap_usize = usize::try_from(capacity).unwrap_or(usize::MAX);
 
-        // Release the GIL while building the cache: Foyer opens disk files
-        // and initialises its async engine, which is pure Rust I/O.
-        let cache: HybridCache<u64, Vec<u8>> = without_gil(py, || {
-            rt.block_on(async {
-                let device = FsDeviceBuilder::new(&foyer_path)
-                    .with_capacity(disk_cap_usize)
-                    .build()?;
-                HybridCacheBuilder::new()
-                    // Only write a batch to disk when it is evicted from the
-                    // memory tier (i.e. when memory is full).  The alternative,
-                    // WriteOnInsertion, would write every batch to disk
-                    // immediately regardless of memory pressure.
-                    .with_policy(HybridCachePolicy::WriteOnEviction)
-                    // Do not flush in-memory entries to disk when the cache is
-                    // dropped.  Without this, every StreamCache that fits
-                    // entirely in memory would still produce disk writes on drop.
-                    .with_flush_on_close(false)
-                    .memory(memory_capacity)
-                    .storage()
-                    .with_engine_config(BlockEngineConfig::new(device))
-                    .build()
-                    .await
-            })
-        })
-        .map_err(|e| PyIOError::new_err(format!("Failed to build Foyer hybrid cache: {e}")))?;
+                // Release the GIL while building the cache: Foyer opens disk
+                // files and initialises its async engine, which is pure Rust I/O.
+                let cache = without_gil(py, || {
+                    rt.block_on(async {
+                        let device = FsDeviceBuilder::new(&foyer_path)
+                            .with_capacity(disk_cap_usize)
+                            .build()?;
+                        HybridCacheBuilder::new()
+                            // Only write a batch to disk when it is evicted from the
+                            // memory tier (i.e. when memory is full).  The alternative,
+                            // WriteOnInsertion, would write every batch to disk
+                            // immediately regardless of memory pressure.
+                            .with_policy(HybridCachePolicy::WriteOnEviction)
+                            // Do not flush in-memory entries to disk when the cache is
+                            // dropped.  Without this, every StreamCache that fits
+                            // entirely in memory would still produce disk writes on drop.
+                            .with_flush_on_close(false)
+                            .memory(memory_capacity)
+                            .storage()
+                            .with_engine_config(BlockEngineConfig::new(device))
+                            .build()
+                            .await
+                            .map(CacheTier::Hybrid)
+                    })
+                })
+                .map_err(|e| {
+                    PyIOError::new_err(format!("Failed to build Foyer hybrid cache: {e}"))
+                })?;
+
+                (cache, Some(foyer_path))
+            }
+            (None, None) => {
+                let cache = CacheBuilder::new(memory_capacity).build();
+                (CacheTier::Memory(cache), None)
+            }
+            _ => {
+                return Err(PyIOError::new_err(
+                    "disk_path and disk_capacity must both be provided, or both omitted",
+                ))
+            }
+        };
 
         let inner = DatasetInner {
             cache: Arc::new(cache),
@@ -691,9 +775,7 @@ impl PyStreamCache {
             let mut inner = self.inner.lock().map_err(|e| e.to_string())?;
             // u64::MAX as sentinel: the loop inside ingest_up_to exits via
             // upstream_exhausted long before ingested_count could approach it.
-            inner
-                .ingest_up_to(&self.runtime, u64::MAX)
-                .map_err(|e| e.to_string())?;
+            inner.ingest_up_to(u64::MAX).map_err(|e| e.to_string())?;
             Ok::<_, String>(inner.ingested_count)
         })
         .map_err(PyIOError::new_err)
@@ -725,13 +807,16 @@ impl PyStreamCache {
             let foyer_path = inner.foyer_path.clone();
             drop(inner); // release the lock before I/O
 
-            // Flush/clear the in-memory cache tier (best-effort; errors ignored).
+            // Flush/clear the cache (best-effort; errors ignored).
             self.runtime.block_on(async move {
-                let _ = cache.clear().await;
+                cache.clear().await;
             });
             // Remove only the Foyer subdirectory we created; errors are
             // ignored because the directory may already be gone.
-            let _ = std::fs::remove_dir_all(&foyer_path);
+            // Nothing to do for memory-only caches (foyer_path is None).
+            if let Some(path) = foyer_path {
+                let _ = std::fs::remove_dir_all(path);
+            }
             Ok::<_, String>(())
         })
         .map_err(PyIOError::new_err)
