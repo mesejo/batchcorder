@@ -27,7 +27,7 @@ evicted while a reader still needs it. See
 When you cannot guarantee the cache is large enough (e.g. unbounded upstream
 sources), catch the error and decide how to proceed:
 
-```python
+```{python}
 import pyarrow as pa
 from batchcorder import StreamCache
 
@@ -50,7 +50,8 @@ def safe_read(ds: StreamCache) -> pa.Table | None:
 If the original source is still available (e.g. a file), re-create the
 `StreamCache` with a larger cache:
 
-```python
+```{python}
+#| eval: false
 import tempfile
 import pyarrow.parquet as pq
 from batchcorder import StreamCache
@@ -79,7 +80,7 @@ except IOError:
 If multiple readers are running concurrently and diverging too far, serialise
 them or add back-pressure so the slowest reader limits the fastest:
 
-```python
+```{python}
 import threading
 
 lock = threading.Lock()
@@ -98,7 +99,8 @@ readers ensures all batches are in the cache simultaneously. Eviction can only
 happen after ingestion if additional memory pressure occurs between `ingest_all()`
 and the read:
 
-```python
+```{python}
+#| eval: false
 ds = StreamCache(source, memory_capacity=full_size, ...)
 ds.ingest_all()   # all batches are in cache now
 # ... create readers and consume at any pace

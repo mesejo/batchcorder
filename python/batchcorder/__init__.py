@@ -30,7 +30,8 @@ __version__: str = version("batchcorder")
 
 
 class StreamCache:
-    """A cached Arrow dataset backed by Foyer.
+    """
+    A cached Arrow dataset backed by Foyer.
 
     Wraps any Arrow stream source and caches each ``RecordBatch`` in a Foyer
     cache keyed by a monotonic batch index.  Multiple independent
@@ -102,7 +103,8 @@ class StreamCache:
 
     @property
     def schema(self) -> Any:
-        """Arrow schema of this dataset.
+        """
+        Arrow schema of this dataset.
 
         Returns
         -------
@@ -123,7 +125,8 @@ class StreamCache:
 
     @property
     def ingested_count(self) -> int:
-        """Number of batches pulled from the upstream source so far.
+        """
+        Number of batches pulled from the upstream source so far.
 
         Increments lazily as readers consume batches.
 
@@ -150,7 +153,8 @@ class StreamCache:
 
     @property
     def upstream_exhausted(self) -> bool:
-        """``True`` once the upstream source has been fully consumed.
+        """
+        ``True`` once the upstream source has been fully consumed.
 
         Returns
         -------
@@ -174,7 +178,8 @@ class StreamCache:
         return self._impl.upstream_exhausted
 
     def reader(self, from_start: bool = True) -> StreamCacheReader:
-        """Return a new :class:`StreamCacheReader` handle.
+        """
+        Return a new :class:`StreamCacheReader` handle.
 
         Parameters
         ----------
@@ -203,7 +208,8 @@ class StreamCache:
         return StreamCacheReader(self._impl.reader(from_start))
 
     def __iter__(self) -> StreamCacheReader:
-        """Iterate over all batches from the start.
+        """
+        Iterate over all batches from the start.
 
         Creates a fresh :class:`StreamCacheReader` starting at batch 0 and
         returns it as the iterator.
@@ -216,7 +222,8 @@ class StreamCache:
         return self.reader(True)
 
     def __arrow_c_stream__(self, requested_schema: Any = None) -> Any:
-        """Enable Arrow stream export via the `PyCapsule Interface <https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html>`_.
+        """
+        Enable Arrow stream export via the `PyCapsule Interface <https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html>`_.
 
         This dunder method should not be called directly, but enables zero-copy data
         transfer to other Python libraries that understand Arrow memory.
@@ -234,7 +241,8 @@ class StreamCache:
         return self._impl.__arrow_c_stream__(requested_schema)
 
     def __arrow_c_schema__(self) -> Any:
-        """Enable Arrow schema export via the `PyCapsule Interface <https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html>`_.
+        """
+        Enable Arrow schema export via the `PyCapsule Interface <https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html>`_.
 
         This dunder method should not be called directly, but enables zero-copy data
         transfer to other Python libraries that understand Arrow memory.
@@ -247,7 +255,8 @@ class StreamCache:
         return self._impl.__arrow_c_schema__()
 
     def cast(self, target_schema: Any) -> CastingStreamCache:
-        """Cast the dataset to produce batches with the given schema.
+        """
+        Cast the dataset to produce batches with the given schema.
 
         Returns a :class:`CastingStreamCache` — a **replayable** wrapper that
         applies the schema cast on every read.  Unlike
@@ -268,7 +277,8 @@ class StreamCache:
         return CastingStreamCache(self._impl.cast(target_schema))
 
     def ingest_all(self) -> int:
-        """Eagerly ingest all batches from the upstream source into the cache.
+        """
+        Eagerly ingest all batches from the upstream source into the cache.
 
         After this call ``upstream_exhausted`` is ``True`` and the upstream
         reference is released.  Subsequent reads are served entirely from cache.
@@ -295,7 +305,8 @@ class StreamCache:
         return self._impl.ingest_all()
 
     def close(self) -> None:
-        """Close the dataset and destroy the underlying storage.
+        """
+        Close the dataset and destroy the underlying storage.
 
         This method clears the hybrid cache and destroys the disk storage,
         removing any unused files that were eagerly created.
@@ -318,7 +329,8 @@ class StreamCache:
 
 
 class StreamCacheReader:
-    """A single-use iterator handle for a :class:`StreamCache`.
+    """
+    A single-use iterator handle for a :class:`StreamCache`.
 
     Maintains an independent read position.  Multiple handles backed by the
     same dataset share the underlying cache; the upstream source is ingested
@@ -340,7 +352,8 @@ class StreamCacheReader:
 
     @property
     def schema(self) -> Any:
-        """Arrow schema of batches produced by this reader.
+        """
+        Arrow schema of batches produced by this reader.
 
         Returns
         -------
@@ -356,7 +369,8 @@ class StreamCacheReader:
 
     @property
     def closed(self) -> bool:
-        """``True`` if this reader has been consumed.
+        """
+        ``True`` if this reader has been consumed.
 
         Returns
         -------
@@ -366,7 +380,8 @@ class StreamCacheReader:
         return self._impl.closed
 
     def __arrow_c_stream__(self, requested_schema: Any = None) -> Any:
-        """Enable Arrow stream export via the `PyCapsule Interface <https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html>`_.
+        """
+        Enable Arrow stream export via the `PyCapsule Interface <https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html>`_.
 
         This dunder method should not be called directly, but enables zero-copy data
         transfer to other Python libraries that understand Arrow memory.
@@ -387,7 +402,8 @@ class StreamCacheReader:
         return self._impl.__arrow_c_stream__(requested_schema)
 
     def __arrow_c_schema__(self) -> Any:
-        """Enable Arrow schema export via the `PyCapsule Interface <https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html>`_.
+        """
+        Enable Arrow schema export via the `PyCapsule Interface <https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html>`_.
 
         This dunder method should not be called directly, but enables zero-copy data
         transfer to other Python libraries that understand Arrow memory.
@@ -409,7 +425,8 @@ class StreamCacheReader:
         return self
 
     def cast(self, target_schema: Any) -> Any:
-        """Cast the reader to produce batches with the given schema.
+        """
+        Cast the reader to produce batches with the given schema.
 
         Mirrors :meth:`pyarrow.RecordBatchReader.cast`.  Returns a
         :class:`pyarrow.RecordBatchReader` that applies the cast as batches are
@@ -439,7 +456,8 @@ class StreamCacheReader:
 
 
 class CastingStreamCache:
-    """A replayable cast view of a :class:`StreamCache`.
+    """
+    A replayable cast view of a :class:`StreamCache`.
 
     Created by :meth:`StreamCache.cast`.  Each call to ``__arrow_c_stream__``
     produces a fresh reader from the underlying cache with each batch cast to
@@ -458,7 +476,8 @@ class CastingStreamCache:
 
     @property
     def schema(self) -> Any:
-        """Arrow schema produced by this dataset after casting.
+        """
+        Arrow schema produced by this dataset after casting.
 
         Returns
         -------
@@ -468,7 +487,8 @@ class CastingStreamCache:
         return self._impl.schema
 
     def __arrow_c_stream__(self, requested_schema: Any = None) -> Any:
-        """Enable Arrow stream export via the `PyCapsule Interface <https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html>`_.
+        """
+        Enable Arrow stream export via the `PyCapsule Interface <https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html>`_.
 
         Creates a fresh reader from the underlying cache and applies the cast.
         Safe to call multiple times — each call produces an independent stream.
@@ -483,7 +503,8 @@ class CastingStreamCache:
         return self._impl.__arrow_c_stream__(requested_schema)
 
     def __arrow_c_schema__(self) -> Any:
-        """Enable Arrow schema export via the `PyCapsule Interface <https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html>`_.
+        """
+        Enable Arrow schema export via the `PyCapsule Interface <https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html>`_.
 
         Returns the target schema so consumers can inspect the post-cast type.
 
@@ -491,7 +512,8 @@ class CastingStreamCache:
         return self._impl.__arrow_c_schema__()
 
     def cast(self, target_schema: Any) -> CastingStreamCache:
-        """Cast to a further target schema, returning a new :class:`CastingStreamCache`.
+        """
+        Cast to a further target schema, returning a new :class:`CastingStreamCache`.
 
         Parameters
         ----------

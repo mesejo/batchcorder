@@ -26,7 +26,7 @@ pip install batchcorder
 
 Verify the installation:
 
-```python
+```{python}
 import batchcorder
 print(batchcorder.__version__)
 ```
@@ -36,7 +36,7 @@ print(batchcorder.__version__)
 Any object that implements `__arrow_c_stream__` can be wrapped — a
 `pyarrow.Table`, a `pyarrow.RecordBatchReader`, an `arro3.core.RecordBatchReader`, etc.
 
-```python
+```{python}
 import tempfile
 import pyarrow as pa
 from batchcorder import StreamCache
@@ -64,7 +64,7 @@ print(ds.upstream_exhausted)
 
 Iterating directly over `ds` creates a fresh reader starting at batch 0:
 
-```python
+```{python}
 for batch in ds:
     print(batch.num_rows, "rows")
 # 5 rows  (one batch for the whole table by default)
@@ -78,7 +78,7 @@ print(ds.upstream_exhausted)
 Because the data is now in the cache, you can create more readers and replay
 from the start as many times as needed:
 
-```python
+```{python}
 r1 = ds.reader()   # starts at batch 0
 r2 = ds.reader()   # independent handle, also at batch 0
 
@@ -98,7 +98,7 @@ original `table` object.
 If you know you will replay the stream many times, call `ingest_all()` once at
 startup to pull everything into the cache before your main loop runs:
 
-```python
+```{python}
 ds2 = StreamCache(table, 16 << 20, tmp, 64 << 20)
 total_batches = ds2.ingest_all()
 print(f"Ingested {total_batches} batch(es).")

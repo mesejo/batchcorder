@@ -1,11 +1,11 @@
 project:
   type: default
   output-dir: ../source
+  render:
+    - "**/*.qmd"
 
-# Disable code execution: batchcorder requires a compiled Rust extension
-# that is not available in the Quarto render environment.
 execute:
-  enabled: false
+  enabled: true
 
 format:
   md:

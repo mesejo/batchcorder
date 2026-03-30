@@ -41,7 +41,10 @@ pip install batchcorder
 ## Usage
 
 ```python
+import tempfile
+
 import pyarrow as pa
+
 from batchcorder import StreamCache
 
 table = pa.table({"x": [1, 2, 3], "y": [4, 5, 6]})
@@ -56,11 +59,12 @@ ds = StreamCache(
 )
 
 # Hybrid memory+disk
+tmp = tempfile.mkdtemp()
 ds = StreamCache(
     table.to_reader(max_chunksize=1),
-    memory_capacity=64 * 1024 * 1024,   # 64 MB in RAM
-    disk_path="/tmp/batchcorder-cache",
-    disk_capacity=512 * 1024 * 1024,    # 512 MB on disk
+    memory_capacity=64 * 1024 * 1024,  # 64 MB in RAM
+    disk_path=tmp,
+    disk_capacity=512 * 1024 * 1024,  # 512 MB on disk
 )
 
 # Replay as many times as needed
@@ -80,13 +84,14 @@ ds.ingest_all()
 `StreamCache` and `StreamCacheReader` implement both `__arrow_c_stream__`
 and `__arrow_c_schema__`, so they work with any Arrow-compatible library:
 
+<!-- skip: next -->
 ```python
 import pyarrow as pa
 import duckdb
 
-pa.table(ds)             # PyArrow
-pa.table(ds.reader())    # via StreamCacheReader
-duckdb.table("ds")       # DuckDB
+pa.table(ds)  # PyArrow
+pa.table(ds.reader())  # via StreamCacheReader
+duckdb.table("ds")  # DuckDB
 ```
 
 ## Key properties
