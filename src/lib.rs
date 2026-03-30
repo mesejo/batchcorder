@@ -6,7 +6,7 @@ mod cached_dataset;
 /// Register the `batchcorder._batchcorder` Python extension module.
 ///
 /// Exposes:
-/// * [`cached_dataset::PyStreamCache`] — hybrid-cached Arrow dataset
+/// * [`cached_dataset::PyStreamCache`] — cached Arrow dataset (memory-only or hybrid)
 /// * [`cached_dataset::PyStreamCacheReader`] — independent reader handle
 /// * [`cached_dataset::PyCastingStreamCache`] — replayable cast view of a dataset
 #[pymodule]

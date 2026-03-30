@@ -1,0 +1,3 @@
+[toolchain]
+# Edition 2024 (required for let chains) was stabilised in Rust 1.85.0.
+channel = "stable"

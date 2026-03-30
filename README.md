@@ -12,14 +12,21 @@ repeatedly without re-reading from disk or the network each time.
 ## What batchcorder does
 
 `StreamCache` wraps any Arrow stream source (anything that implements
-`__arrow_c_stream__`) and stores each `RecordBatch` in a two-tier hybrid cache
-(memory + disk) backed by [Foyer](https://github.com/foyer-rs/foyer).
-Multiple independent readers can then replay the stream concurrently, each
+`__arrow_c_stream__`) and stores each `RecordBatch` in a
+[Foyer](https://github.com/foyer-rs/foyer) cache. Two storage modes are
+supported:
+
+- **Memory-only** (default): all batches are kept in RAM; no files are created
+  on disk.
+- **Hybrid memory+disk**: batches evicted from the memory tier spill to disk,
+  allowing the working set to exceed available RAM.
+
+Multiple independent readers can replay the stream concurrently, each
 maintaining their own position in the batch sequence.
 
 ```mermaid
 flowchart LR
-    U["upstream source<br/>(read once)"] --> D["StreamCache<br/>[mem + disk cache]"]
+    U["upstream source<br/>(read once)"] --> D["StreamCache<br/>[mem cache / mem+disk cache]"]
     D --> R0["StreamCacheReader 0<br/>(from batch 0)"]
     D --> R1["StreamCacheReader 1<br/>(from batch 0)"]
     D --> R2["StreamCacheReader 2<br/>(from batch 3)"]
@@ -39,11 +46,21 @@ from batchcorder import StreamCache
 
 table = pa.table({"x": [1, 2, 3], "y": [4, 5, 6]})
 
+# Memory-only (default capacity = total physical RAM)
+ds = StreamCache(table.to_reader(max_chunksize=1))
+
+# Memory-only with explicit capacity
 ds = StreamCache(
-    table.to_reader(max_chunksize=1),  # any __arrow_c_stream__ source
+    table.to_reader(max_chunksize=1),
     memory_capacity=64 * 1024 * 1024,  # 64 MB
+)
+
+# Hybrid memory+disk
+ds = StreamCache(
+    table.to_reader(max_chunksize=1),
+    memory_capacity=64 * 1024 * 1024,   # 64 MB in RAM
     disk_path="/tmp/batchcorder-cache",
-    disk_capacity=512 * 1024 * 1024,  # 512 MB
+    disk_capacity=512 * 1024 * 1024,    # 512 MB on disk
 )
 
 # Replay as many times as needed
@@ -80,9 +97,9 @@ duckdb.table("ds")       # DuckDB
   same stream cache are fully independent and thread-safe.
 - **Lazy ingestion**: batches are fetched from the upstream source on demand as
   readers advance, not upfront.
-- **Replay from any position**: `ds.reader(from_start=True)` replays from
-  batch 0; `ds.reader(from_start=False)` (default) starts from the frontier
-  (next batch not yet ingested).
+- **Replay from any position**: `ds.reader(from_start=True)` (default) replays
+  from batch 0; `ds.reader(from_start=False)` starts from the current ingestion
+  frontier (next batch not yet ingested).
 
 ## Eviction caveat
 
@@ -95,8 +112,8 @@ concurrent reader.
 
 ```bash
 # Install dependencies and build the extension
-uv sync
-maturin develop --uv
+uv sync --no-install-project --dev
+uv run maturin develop --uv
 
 # Run tests
 uv run pytest
