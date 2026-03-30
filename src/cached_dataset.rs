@@ -59,7 +59,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyCapsule;
 use pyo3_arrow::error::{PyArrowError, PyArrowResult};
 use pyo3_arrow::export::{Arro3RecordBatch, Arro3Schema};
-use pyo3_arrow::ffi::{to_schema_pycapsule, to_stream_pycapsule, ArrayIterator};
+use pyo3_arrow::ffi::{ArrayIterator, to_schema_pycapsule, to_stream_pycapsule};
 use pyo3_arrow::{PyRecordBatchReader, PySchema};
 use pyo3_stub_gen::derive::*;
 use tokio::runtime::Runtime;
@@ -461,7 +461,7 @@ impl PyStreamCacheReader {
             None => {
                 return Err(PyArrowError::PyErr(PyIOError::new_err(
                     "Reader already consumed",
-                )))
+                )));
             }
             Some(r) => r,
         };
@@ -566,11 +566,9 @@ pub struct PyStreamCache {
 
 impl Drop for PyStreamCache {
     fn drop(&mut self) {
-        if let Ok(inner) = self.inner.lock() {
-            if inner.closed {
-                // close() already ran cleanup — nothing to do.
-                return;
-            }
+        if let Ok(inner) = self.inner.lock()
+            && !inner.closed
+        {
             // Do NOT set closed = true here.  Readers hold their own
             // Arc<Mutex<DatasetInner>> and can outlive the dataset handle;
             // marking closed would break them.  Readers that hit the disk
@@ -675,7 +673,7 @@ impl PyStreamCache {
             _ => {
                 return Err(PyIOError::new_err(
                     "disk_path and disk_capacity must both be provided, or both omitted",
-                ))
+                ));
             }
         };
 
@@ -783,16 +781,24 @@ impl PyStreamCache {
 
     #[getter]
     pub fn ingested_count(&self, py: Python<'_>) -> PyResult<u64> {
-        Ok(without_gil(py, || {
-            self.inner.lock().unwrap().ingested_count
-        }))
+        without_gil(py, || {
+            self.inner
+                .lock()
+                .map(|g| g.ingested_count)
+                .map_err(|e| e.to_string())
+        })
+        .map_err(PyIOError::new_err)
     }
 
     #[getter]
     pub fn upstream_exhausted(&self, py: Python<'_>) -> PyResult<bool> {
-        Ok(without_gil(py, || {
-            self.inner.lock().unwrap().upstream_exhausted
-        }))
+        without_gil(py, || {
+            self.inner
+                .lock()
+                .map(|g| g.upstream_exhausted)
+                .map_err(|e| e.to_string())
+        })
+        .map_err(PyIOError::new_err)
     }
 
     pub fn close(&self, py: Python<'_>) -> PyResult<()> {
