@@ -18,7 +18,7 @@ sees a full stream on every scan.
 
 ## Self-join
 
-```python
+```{python}
 import tempfile
 import pyarrow as pa
 import duckdb
@@ -57,7 +57,7 @@ both scans see all four rows.
 ASOF joins are a common pattern in event-stream analytics: for each event, find
 the most recent reference row whose timestamp is ≤ the event timestamp.
 
-```python
+```{python}
 import tempfile
 import pyarrow as pa
 import duckdb
@@ -93,7 +93,8 @@ future queries that reuse the same Python variable work correctly.
 When exploring data interactively, you often run many different queries over
 the same source without wanting to re-read the file each time:
 
-```python
+```{python}
+#| eval: false
 import tempfile
 import pyarrow as pa
 import pyarrow.parquet as pq

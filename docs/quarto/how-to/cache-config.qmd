@@ -20,7 +20,8 @@ reader and the slowest reader.
 
 Use PyArrow to measure the serialised size of a representative batch:
 
-```python
+```{python}
+#| eval: false
 import pyarrow as pa
 import pyarrow.ipc as ipc
 import io
@@ -45,7 +46,8 @@ upper-bound estimate.
 If all readers are created and fully consumed before new ones are created, only
 one reader is live at any time. The minimum cache size is just one batch:
 
-```python
+```{python}
+#| eval: false
 ds = StreamCache(source, memory_capacity=batch_bytes * 2, ...)
 ```
 
@@ -57,7 +59,7 @@ If readers run concurrently (e.g. in different threads or async tasks) and
 advance at different rates, the cache must cover the full range from the
 slowest to the fastest reader:
 
-```python
+```{python}
 # Suppose batches are ~1 MB each and you have 3 concurrent readers
 # that can diverge by up to 50 batches.
 batch_bytes  = 1 << 20          # 1 MB
@@ -79,7 +81,8 @@ For ML training loops where you replay the full stream each epoch:
 1. Call `ingest_all()` once before training starts.
 2. Size the cache to hold the **entire stream**, not just the active window.
 
-```python
+```{python}
+#| eval: false
 import os, tempfile
 import pyarrow.parquet as pq
 from batchcorder import StreamCache

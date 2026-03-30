@@ -48,7 +48,8 @@ Full API documentation: [batchcorder.StreamCacheReader](../autoapi/batchcorder/i
 Both classes accept and produce data through the Arrow PyCapsule Interface,
 making them compatible with:
 
-```python
+```{python}
+#| eval: false
 import pyarrow as pa
 import duckdb
 
