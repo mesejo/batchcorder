@@ -8,6 +8,8 @@ build:
   commands:
     # Run the build script with error handling and security checks
     - ./scripts/build-docs.sh
+  pull_requests:
+    enabled: true
 python:
   install:
     - method: pip
