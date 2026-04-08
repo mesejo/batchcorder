@@ -134,6 +134,31 @@ batchcorder/
 5. **Commit changes**: Use clear, descriptive commit messages
 6. **Push and create PR**: Get code review before merging
 
+## 🚢 Releasing
+
+### Prerequisites
+
+Install `cargo-edit` for version bumping:
+
+```bash
+cargo install cargo-edit
+```
+
+### Release Process
+
+Use the release script, passing the bump type as an argument:
+
+```bash
+bash scripts/build-release.sh <major|minor|patch>
+```
+
+This will:
+1. Switch to upstream `main` and pull the latest changes
+2. Bump the version in `Cargo.toml` using `cargo set-version --bump`
+3. Create a `release-<version>` branch
+4. Commit the version change
+5. Push the branch to upstream
+
 ## 🛑 Boundaries
 
 ### Never Touch
