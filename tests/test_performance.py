@@ -231,6 +231,72 @@ def test_disk_cache_hit_faster_than_slow_upstream(tmp_path):
     )
 
 
+# ── GIL release structural proof ─────────────────────────────────────────────
+
+
+def test_gil_released_while_readers_block_on_mutex():
+    """Readers release the Python GIL before acquiring the cache mutex.
+
+    Structural proof: two reader threads are driven into Rust via a slow
+    upstream (100 ms per batch).  __next__ calls without_gil() before locking
+    DatasetInner, so both threads release the GIL while one holds the mutex
+    doing ingestion and the other blocks waiting for it.
+
+    A third thread (the heartbeat) does pure Python work and sets an event.
+    The event must fire within 20 ms — well before the first batch can finish
+    (60 ms of ingestion remain when the heartbeat starts).  If either reader
+    held the GIL throughout its Rust call, the heartbeat could not run until
+    that reader returned to Python, which takes at least 60 ms.
+    """
+    delay_s = 0.10  # 100 ms per batch; slow enough to observe
+    n_batches = 3
+    batches = _make_batches(n_batches=n_batches)
+    ds = StreamCache(SlowReader(batches, delay=delay_s))
+
+    gil_confirmed = threading.Event()
+    errors: list[Exception] = []
+
+    def reader():
+        try:
+            pa.RecordBatchReader.from_stream(ds.reader()).read_all()
+        except Exception as e:
+            errors.append(e)
+
+    def python_heartbeat():
+        # Any Python bytecode requires the GIL.  The list comprehension below
+        # keeps the interpreter busy for a moment so the confirmation is not
+        # a scheduling artefact.
+        _ = [i * i for i in range(500)]
+        gil_confirmed.set()
+
+    t1 = threading.Thread(target=reader, name="reader-1")
+    t2 = threading.Thread(target=reader, name="reader-2")
+    t1.start()
+    t2.start()
+
+    # Wait until both readers are inside Rust and at least one is waiting on
+    # the mutex (approximately 40% into the first batch's delay window).
+    time.sleep(delay_s * 0.4)  # 40 ms in
+
+    t3 = threading.Thread(target=python_heartbeat, name="heartbeat")
+    t3.start()
+
+    # The remaining ingestion for batch 0 alone is ~60 ms.  A reader holding
+    # the GIL would block the heartbeat for at least that long.  20 ms gives
+    # a factor-of-three margin between "GIL released" (<1 ms) and "GIL held"
+    # (≥60 ms), making the test robust to scheduler jitter.
+    assert gil_confirmed.wait(timeout=0.020), (
+        "Python heartbeat did not complete within 20 ms while two reader "
+        "threads were blocked in Rust — without_gil() may not be releasing "
+        "the GIL before the cache mutex is acquired"
+    )
+
+    t1.join(timeout=delay_s * n_batches * 3)
+    t2.join(timeout=delay_s * n_batches * 3)
+    t3.join()
+    assert not errors, errors
+
+
 # ── large-scale stress ────────────────────────────────────────────────────────
 
 
