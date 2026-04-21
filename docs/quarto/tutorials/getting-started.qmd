@@ -111,8 +111,8 @@ for _ in range(10):
 
 ## What you have learned
 
-- `StreamCache` wraps any Arrow stream and stores batches in a hybrid
-  memory + disk cache.
+- `StreamCache` wraps any Arrow stream and stores batches in a memory or
+  disk cache.
 - The upstream source is consumed **at most once**; all replays come from the
   cache.
 - `StreamCacheReader` handles are independent — creating or exhausting one
@@ -122,5 +122,6 @@ for _ in range(10):
 ## Next steps
 
 - [Use batchcorder with DuckDB](../how-to/duckdb.md) for multi-scan queries.
-- [Size the cache correctly](../how-to/cache-config.md) to avoid eviction
-  errors.
+- [Configure cache storage](../how-to/cache-config.md) to choose between
+  memory and disk modes.
+- [Concurrent reads](../how-to/eviction.md) for multi-threaded patterns.

@@ -1,4 +1,4 @@
-"""Batchcorder: Hybrid memory+disk cached Arrow streams."""
+"""Batchcorder: Replayable cached Arrow record-batch streams."""
 
 from __future__ import annotations
 
@@ -31,20 +31,22 @@ __version__: str = version("batchcorder")
 
 class StreamCache:
     """
-    A cached Arrow dataset backed by Foyer.
+    A cached Arrow stream backed by an in-memory Vec or an on-disk IPC file.
 
-    Wraps any Arrow stream source and caches each ``RecordBatch`` in a Foyer
-    cache keyed by a monotonic batch index.  Multiple independent
-    :class:`StreamCacheReader` handles can replay the full stream from any
-    position; the upstream source is ingested lazily on demand.
+    Wraps any Arrow stream source and stores each ``RecordBatch`` so multiple
+    independent :class:`StreamCacheReader` handles can replay the full stream
+    from any position.  The upstream source is ingested lazily on demand and
+    consumed exactly once.
 
     Two storage modes are supported:
 
     - **Memory-only** (omit ``disk_path`` / ``disk_capacity``): batches are
-      kept in a Foyer in-memory cache.  No files are created on disk.
-    - **Hybrid** (provide both ``disk_path`` and ``disk_capacity``): batches
-      evicted from the memory tier spill to a Foyer block-device on disk,
-      allowing the working set to exceed available RAM.
+      kept as reference-counted pointers in RAM.  Reads are zero-copy; no IPC
+      serialisation happens.
+    - **Disk** (provide both ``disk_path`` and ``disk_capacity``): batches are
+      serialised to an append-only Arrow IPC file.  A configurable hot layer
+      (``memory_capacity``) keeps recently ingested batches in RAM to reduce
+      disk reads.
 
     Parameters
     ----------
@@ -53,20 +55,14 @@ class StreamCache:
         :class:`pyarrow.Table`, :class:`pyarrow.RecordBatchReader`,
         :class:`arro3.core.RecordBatchReader`).
     memory_capacity : int, optional
-        In-memory cache tier size in bytes.  Defaults to total physical RAM so
-        the cache fails only when a ``tee``-style copy would also exhaust memory.
+        Hot-layer budget in bytes for disk mode.  Defaults to total physical
+        RAM.  Ignored in memory-only mode.
     disk_path : str, optional
-        Directory for the on-disk cache tier.  Created on first use.
+        Directory for the on-disk IPC file.  Created on first use.
         Must be provided together with ``disk_capacity``.
     disk_capacity : int, optional
-        On-disk cache tier size in bytes.
+        On-disk storage budget in bytes.
         Must be provided together with ``disk_path``.
-
-    Notes
-    -----
-    Foyer may evict cache entries under memory/disk pressure.  If a batch is
-    evicted before a reader reaches it the reader raises an error.  Size the
-    cache so it can hold all live reader positions simultaneously.
 
     Examples
     --------
@@ -75,11 +71,11 @@ class StreamCache:
     >>> import pyarrow as pa
     >>> from batchcorder import StreamCache
     >>> table = pa.table({"id": [1, 2, 3], "val": [0.5, 1.0, 1.5]})
-    >>> ds = StreamCache(table, memory_capacity=16 << 20)
+    >>> ds = StreamCache(table)
     >>> pa.RecordBatchReader.from_stream(ds).read_all().equals(table)
     True
 
-    Hybrid memory+disk:
+    Disk mode:
 
     >>> import tempfile
     >>> tmp = tempfile.mkdtemp()

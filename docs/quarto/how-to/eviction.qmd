@@ -1,107 +1,84 @@
 ---
-title: "Handle eviction errors"
+title: "Concurrent reads"
 ---
 
-Foyer evicts cache entries under memory or disk pressure. When a
-`StreamCacheReader` tries to fetch a batch that has already been evicted, it
-raises an `IOError`. This guide shows how to detect, prevent, and recover from
-eviction errors.
+Multiple `StreamCacheReader` handles backed by the same `StreamCache` are
+fully independent and thread-safe.  This guide shows common patterns for
+reading a cached stream from several threads or tasks simultaneously.
 
-## What the error looks like
+## Creating independent reader handles
 
-```
-IOError: Cache entry for batch 42 has been evicted before reader reached it.
-```
-
-The number is the zero-based batch index. The reader that raised the error is
-now closed and cannot be resumed.
-
-## Prevention — size the cache correctly
-
-The most reliable fix is to make the cache large enough that no entry is ever
-evicted while a reader still needs it. See
-[Size the cache correctly](cache-config.md) for sizing guidance.
-
-## Detection — wrap reads in a try/except
-
-When you cannot guarantee the cache is large enough (e.g. unbounded upstream
-sources), catch the error and decide how to proceed:
+Each call to `StreamCache.reader()` returns a fresh handle starting at batch 0
+(or the current ingestion frontier when `from_start=False`).  Handles share the
+underlying cache but maintain separate read positions.
 
 ```{python}
+#| eval: false
 import pyarrow as pa
 from batchcorder import StreamCache
 
+ds = StreamCache(source)
 
-def safe_read(ds: StreamCache) -> pa.Table | None:
-    """Return the full table, or None if an eviction occurred."""
-    try:
-        return pa.RecordBatchReader.from_stream(ds.reader()).read_all()
-    except IOError as exc:
-        if "evicted" in str(exc):
-            print(f"Eviction detected: {exc}")
-            return None
-        raise
+r1 = ds.reader()   # starts at batch 0
+r2 = ds.reader()   # independent handle, also at batch 0
+
+# r1 and r2 can advance at completely different rates.
+result1 = pa.RecordBatchReader.from_stream(r1).read_all()
+result2 = pa.RecordBatchReader.from_stream(r2).read_all()
 ```
 
-## Recovery strategies
+## Reading from multiple threads
 
-### Re-create the stream cache from the original source
-
-If the original source is still available (e.g. a file), re-create the
-`StreamCache` with a larger cache:
+`StreamCache` and `StreamCacheReader` are thread-safe.  A common pattern is
+to hand each worker thread its own reader handle before starting the threads:
 
 ```{python}
 #| eval: false
-import tempfile
-import pyarrow.parquet as pq
+import threading
+import pyarrow as pa
 from batchcorder import StreamCache
 
+ds = StreamCache(source)
+results = [None] * 4
 
-def make_stream_cache(path: str, memory_mb: int = 256, disk_gb: int = 2) -> StreamCache:
-    tmp = tempfile.mkdtemp()
-    return StreamCache(
-        pq.read_table(path),
-        memory_capacity=memory_mb << 20,
-        disk_path=tmp,
-        disk_capacity=disk_gb << 30,
-    )
+def read(i):
+    results[i] = pa.RecordBatchReader.from_stream(ds.reader()).read_all()
 
-ds = make_stream_cache("data.parquet")
-try:
-    result = pa.RecordBatchReader.from_stream(ds.reader()).read_all()
-except IOError:
-    # Double the cache and retry once.
-    ds = make_stream_cache("data.parquet", memory_mb=512, disk_gb=4)
-    result = pa.RecordBatchReader.from_stream(ds.reader()).read_all()
+threads = [threading.Thread(target=read, args=(i,)) for i in range(4)]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
 ```
 
-### Reduce reader concurrency
+All threads share a single ingestion pass — the upstream source is read at
+most once regardless of how many readers are active.
 
-If multiple readers are running concurrently and diverging too far, serialise
-them or add back-pressure so the slowest reader limits the fastest:
+## Pre-ingesting before concurrent access
 
-```{python}
-import threading
-
-lock = threading.Lock()
-
-def consume_batch(reader, idx):
-    """Consume one batch, waiting if necessary to avoid over-running."""
-    with lock:
-        batch = next(reader)
-    return batch
-```
-
-### Use `ingest_all()` with a full-capacity cache
-
-If you know the stream size upfront, ingesting everything before creating any
-readers ensures all batches are in the cache simultaneously. Eviction can only
-happen after ingestion if additional memory pressure occurs between `ingest_all()`
-and the read:
+If you want to guarantee that all data is in the cache before any reader
+starts (useful when the upstream source may not be accessible later), call
+`ingest_all()` first:
 
 ```{python}
 #| eval: false
-ds = StreamCache(source, memory_capacity=full_size, ...)
-ds.ingest_all()   # all batches are in cache now
-# ... create readers and consume at any pace
+ds = StreamCache(source)
+ds.ingest_all()   # upstream fully consumed; cache is complete
+
+# Safe to hand out readers to any number of threads now.
+readers = [ds.reader() for _ in range(8)]
+```
+
+## Reading from `__arrow_c_stream__`
+
+`StreamCache` itself implements `__arrow_c_stream__`, which creates a fresh
+reader on every call.  This lets DuckDB, DataFusion, and other Arrow consumers
+perform multiple scans without any extra wrapping:
+
+```{python}
+#| eval: false
+import duckdb
+
+# DuckDB can scan `ds` as many times as needed.
+duckdb.table("ds").show()
 ```

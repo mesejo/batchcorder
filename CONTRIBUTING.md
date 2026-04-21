@@ -13,7 +13,7 @@ The project consists of:
 
 The Rust core implements the `StreamCache` functionality using:
 - Arrow C Stream interface for compatibility
-- Foyer for hybrid memory/disk caching
+- Arrow IPC stream format for on-disk serialisation
 - PyO3 for Python interoperability
 
 ## 🚀 Getting Started
@@ -306,7 +306,6 @@ Where:
 
 - [Arrow Documentation](https://arrow.apache.org/docs/)
 - [PyO3 Documentation](https://pyo3.rs/)
-- [Foyer Documentation](https://foyer.readthedocs.io/)
 - [Rust Documentation](https://doc.rust-lang.org/)
 - [Python Documentation](https://docs.python.org/3/)
 - [Quarto Documentation](https://quarto.org/docs/)

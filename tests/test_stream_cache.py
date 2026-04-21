@@ -277,8 +277,8 @@ def test_ingest_all_idempotent(tmp_path):
 
 def test_disk_spill_and_pyarrow_ipc_roundtrip(tmp_path):
     # Each batch: 100 rows * 1 KiB binary payload ≈ 100 KiB serialized.
-    # Memory tier is only 32 KiB — smaller than a single batch — so every
-    # batch inserted into the cache must be evicted to the disk tier.
+    # Memory tier is only 32 KiB — smaller than a single batch — so the hot
+    # layer fills immediately and every batch is read back from disk.
     n_batches = 5
     rows_per_batch = 100
     table = pa.table(
@@ -301,10 +301,8 @@ def test_disk_spill_and_pyarrow_ipc_roundtrip(tmp_path):
     assert ds.ingest_all() == n_batches
     assert ds.upstream_exhausted
 
-    # Foyer creates its block device files during cache construction and
-    # populates them as batches are evicted from the memory tier.
     disk_files = [p for p in tmp_path.rglob("*") if p.is_file()]
-    assert len(disk_files) > 0, "Expected Foyer to write cache files to disk"
+    assert len(disk_files) > 0, "Expected disk tier to write cache files"
 
     # Read back the full dataset via PyArrow's Arrow IPC stream interface.
     # __arrow_c_stream__ exposes the data as an Arrow IPC-backed C stream,
@@ -326,7 +324,7 @@ def test_disk_spill_ipc_file_write_and_read(tmp_path):
         }
     )
 
-    # Separate subdirectory so the Foyer device files and the IPC output
+    # Separate subdirectory so the cache IPC file and the IPC output
     # file live in different places, keeping the disk-file assertion clean.
     cache_dir = tmp_path / "cache"
     cache_dir.mkdir()
@@ -340,9 +338,8 @@ def test_disk_spill_ipc_file_write_and_read(tmp_path):
     )
     ds.ingest_all()
 
-    # Verify Foyer wrote its block device files under cache_dir.
     cache_files = [p for p in cache_dir.rglob("*") if p.is_file()]
-    assert len(cache_files) > 0, "Expected Foyer to write cache files to disk"
+    assert len(cache_files) > 0, "Expected disk tier to write cache files"
 
     # Stream the data out of the cache (reading from the disk tier) and write
     # it to a standard Arrow IPC *file* (random-access format).
@@ -500,7 +497,7 @@ def test_reader_batch_order_preserved_under_concurrency():
 
 
 def test_close_removes_disk_files(tmp_path):
-    """close() must delete the Foyer block-device files it wrote to disk."""
+    """close() must delete the IPC cache files written to disk."""
     n_batches = 5
     rows_per_batch = 100
     table = pa.table(
@@ -521,14 +518,14 @@ def test_close_removes_disk_files(tmp_path):
     ds.ingest_all()
 
     disk_files = list(tmp_path.rglob("*"))
-    assert len(disk_files) > 0, "Expected Foyer to write cache files before close()"
+    assert len(disk_files) > 0, "Expected disk tier to write cache files before close()"
 
     ds.close()
 
-    # close() removes only the Foyer-owned subdirectory; tmp_path itself stays.
+    # close() removes only the cache subdirectory; tmp_path itself stays.
     remaining = list(tmp_path.rglob("*"))
     assert remaining == [], (
-        f"Expected Foyer subdirectory to be removed after close(), found: {remaining}"
+        f"Expected cache subdirectory to be removed after close(), found: {remaining}"
     )
 
 
@@ -614,7 +611,7 @@ def test_upstream_error_during_read_propagates(tmp_path):
 
 
 def test_drop_removes_disk_files(tmp_path):
-    """Drop (when dataset goes out of scope) must delete the Foyer block-device files it wrote to disk."""
+    """Drop (when dataset goes out of scope) must delete the IPC cache files written to disk."""
     n_batches = 5
     rows_per_batch = 100
     table = pa.table(
@@ -635,7 +632,7 @@ def test_drop_removes_disk_files(tmp_path):
     ds.ingest_all()
 
     disk_files = list(tmp_path.rglob("*"))
-    assert len(disk_files) > 0, "Expected Foyer to write cache files before drop()"
+    assert len(disk_files) > 0, "Expected disk tier to write cache files before drop()"
 
     # Let ds go out of scope (drop is called automatically)
     del ds

@@ -1,85 +1,73 @@
 ---
-title: "Size the cache correctly"
+title: "Configure cache storage"
 ---
 
-Foyer evicts cache entries under memory or disk pressure. If a batch is evicted
-before a reader reaches it, the reader raises an `IOError`. This guide explains
-how to choose `memory_capacity` and `disk_capacity` to prevent that.
+`StreamCache` supports two storage modes.  Choose based on whether your
+dataset fits in RAM.
 
-## The rule
+## Memory-only mode (default)
 
-The cache must be large enough to hold all batches that any live reader
-might still need to read. In other words:
-
-> **minimum cache size = (max_batch_bytes) × (max_reader_lag_in_batches)**
-
-Where *reader lag* is the difference in batch index between the most advanced
-reader and the slowest reader.
-
-## Estimate batch size
-
-Use PyArrow to measure the serialised size of a representative batch:
+When `disk_path` and `disk_capacity` are omitted, every batch is stored as
+a reference-counted pointer (`Arc<RecordBatch>`) in RAM.  Reads are
+zero-copy and no serialisation happens.
 
 ```{python}
 #| eval: false
-import pyarrow as pa
-import pyarrow.ipc as ipc
-import io
+from batchcorder import StreamCache
 
-def serialised_bytes(batch: pa.RecordBatch) -> int:
-    """Return the IPC-serialised size of a single RecordBatch in bytes."""
-    sink = pa.BufferOutputStream()
-    with ipc.new_stream(sink, batch.schema) as writer:
-        writer.write_batch(batch)
-    return sink.getvalue().size
-
-# Sample from your actual data source:
-sample_batch = ...   # first batch from your reader
-print(serialised_bytes(sample_batch), "bytes per batch")
+ds = StreamCache(source)   # all batches kept in RAM
 ```
 
-Foyer stores data in its own serialised format, but IPC size is a reasonable
-upper-bound estimate.
+Batches accumulate until the stream is fully ingested.  `memory_capacity`
+has no effect in this mode — use disk mode if your dataset exceeds available
+RAM.
 
-## Single-pass workloads (all readers finish before the next starts)
+## Disk mode
 
-If all readers are created and fully consumed before new ones are created, only
-one reader is live at any time. The minimum cache size is just one batch:
+Provide both `disk_path` and `disk_capacity` to enable on-disk storage.
+Every batch is serialised to an append-only Arrow IPC file at ingestion time.
+A *hot layer* keeps recently ingested batches in RAM to avoid redundant disk
+reads.
 
 ```{python}
 #| eval: false
-ds = StreamCache(source, memory_capacity=batch_bytes * 2, ...)
+import tempfile
+from batchcorder import StreamCache
+
+tmp = tempfile.mkdtemp()
+ds = StreamCache(
+    source,
+    disk_path=tmp,
+    disk_capacity=2 << 30,   # 2 GB disk budget
+)
 ```
 
-In practice, add a safety margin of ×2–×4.
+Concurrent readers use positional I/O (`pread`-style) to read different
+offsets simultaneously without blocking each other.
 
-## Concurrent readers with variable speed
+## Tuning the hot layer
 
-If readers run concurrently (e.g. in different threads or async tasks) and
-advance at different rates, the cache must cover the full range from the
-slowest to the fastest reader:
+In disk mode, `memory_capacity` controls how many bytes of recently ingested
+batches are kept in RAM.  Defaults to total physical RAM.
 
 ```{python}
-# Suppose batches are ~1 MB each and you have 3 concurrent readers
-# that can diverge by up to 50 batches.
-batch_bytes  = 1 << 20          # 1 MB
-max_lag      = 50               # batches
-safety       = 2
-
-memory_capacity = batch_bytes * max_lag * safety   # 100 MB
-disk_capacity   = memory_capacity * 4              # 400 MB  (disk is cheaper)
+#| eval: false
+ds = StreamCache(
+    source,
+    memory_capacity=256 << 20,  # 256 MB hot layer
+    disk_path=tmp,
+    disk_capacity=2 << 30,
+)
 ```
 
-Allocate more disk than memory: Foyer spills from memory to disk
-automatically, so a generous disk tier prevents eviction even when the memory
-tier fills.
+Set `memory_capacity` to cover the data your hottest readers are actively
+consuming.  Batches that exceed the hot budget are served directly from disk
+with no in-memory copy.
 
 ## Training-loop workloads
 
-For ML training loops where you replay the full stream each epoch:
-
-1. Call `ingest_all()` once before training starts.
-2. Size the cache to hold the **entire stream**, not just the active window.
+For ML training loops where you replay the full stream each epoch, call
+`ingest_all()` once at startup:
 
 ```{python}
 #| eval: false
@@ -87,28 +75,13 @@ import os, tempfile
 import pyarrow.parquet as pq
 from batchcorder import StreamCache
 
-dataset_bytes = sum(
-    os.path.getsize(f) for f in ["shard_0.parquet", "shard_1.parquet"]
-)
-
 tmp = tempfile.mkdtemp()
 ds = StreamCache(
-    pq.read_table("shard_0.parquet"),   # or a concatenated reader
-    memory_capacity = min(dataset_bytes, 512 << 20),   # cap at 512 MB RAM
-    disk_path       = tmp,
-    disk_capacity   = dataset_bytes * 2,               # full stream + headroom
+    pq.read_table("shard_0.parquet"),
+    disk_path=tmp,
+    disk_capacity=4 << 30,  # 4 GB
 )
-ds.ingest_all()
+ds.ingest_all()   # pull everything into cache before the training loop
 ```
 
-## Detecting eviction errors
-
-If the cache is too small you will see:
-
-```
-IOError: Cache entry for batch N has been evicted.
-```
-
-When this happens, either increase the cache sizes or reduce reader concurrency
-so the lag between readers shrinks.
-See [Handle eviction errors](eviction.md) for recovery strategies.
+All subsequent reads come from cache — no upstream I/O on replay.

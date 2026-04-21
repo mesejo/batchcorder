@@ -332,7 +332,7 @@ def test_asof_join_with_tolerance(tmp_path):
 
 # Padded sensor/event batches for ASOF-join spill tests.
 # Each row carries a 50 KiB binary pad so every batch exceeds the 32 KiB
-# memory tier and is evicted to disk before DuckDB reads it.  The ASOF SQL
+# memory tier so the hot layer fills immediately and DuckDB reads from disk.  The ASOF SQL
 # only selects site/humidity/event_type, so the pad column has no effect on
 # the query result and _reference_result() can be reused for ground truth.
 _PADDED_SENSOR_SCHEMA = pa.schema(
@@ -378,8 +378,8 @@ _PADDED_EVENT_BATCHES = [
 ]
 
 # Each batch below carries a 1 KiB binary pad per row so the serialized IPC
-# blob is well above the 32 KiB memory tier, guaranteeing that Foyer evicts
-# every entry to the disk tier before a reader fetches it.
+# blob is well above the 32 KiB memory tier, guaranteeing the hot layer fills
+# immediately and every entry is read from disk.
 _SPILL_MEMORY = 32 * 1024  # 32 KiB memory tier
 
 _PADDED_EMPLOYEE_SCHEMA = pa.schema(
@@ -478,7 +478,7 @@ def test_self_join_with_disk_spill(tmp_path):
 
     # Confirm the cache actually spilled to disk.
     disk_files = [p for p in tmp_path.rglob("*") if p.is_file()]
-    assert len(disk_files) > 0, "Expected Foyer to spill cache entries to disk"
+    assert len(disk_files) > 0, "Expected disk tier to write cache files"
 
 
 def test_aggregation_with_disk_spill(tmp_path):
@@ -505,7 +505,7 @@ def test_aggregation_with_disk_spill(tmp_path):
     assert ds.upstream_exhausted is True
 
     disk_files = [p for p in tmp_path.rglob("*") if p.is_file()]
-    assert len(disk_files) > 0, "Expected Foyer to spill cache entries to disk"
+    assert len(disk_files) > 0, "Expected disk tier to write cache files"
 
 
 def test_asof_join_with_tolerance_and_disk_spill(tmp_path):
@@ -543,10 +543,9 @@ def test_asof_join_with_tolerance_and_disk_spill(tmp_path):
     assert sensors_ds.upstream_exhausted is True
     assert events_ds.upstream_exhausted is True
 
-    # Both cache directories must contain Foyer block device files.
     for label, path in [
         ("sensors", tmp_path / "sensors"),
         ("events", tmp_path / "events"),
     ]:
         disk_files = [p for p in path.rglob("*") if p.is_file()]
-        assert len(disk_files) > 0, f"Expected Foyer to spill {label} cache to disk"
+        assert len(disk_files) > 0, f"Expected disk tier to write {label} cache files"
