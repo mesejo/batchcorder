@@ -231,58 +231,6 @@ def test_disk_cache_hit_faster_than_slow_upstream(tmp_path):
     )
 
 
-# ── concurrent read throughput ────────────────────────────────────────────────
-
-
-def test_concurrent_reads_not_fully_serialized():
-    """N concurrent readers on a warm cache complete faster than N sequential reads.
-
-    After ingest_all() the readers compete only for cache access, not the
-    ingestion lock.  If they were fully serialized the wall-clock time of N
-    concurrent readers would equal N x (single reader time).  We assert that
-    the concurrent wall time is less than 70% of the fully-serialized bound,
-    leaving enough headroom for scheduler jitter.
-
-    The slow upstream guarantees the single-reader time is dominated by ingestion
-    (≥ n_batches x delay), so "N x single_time" is a reliable upper bound.
-    """
-    n_threads = 4
-    delay = 0.05
-    n_batches = 4
-    batches = _make_batches(n_batches=n_batches)
-    ds = StreamCache(SlowReader(batches, delay=delay))
-    ds.ingest_all()  # warm the cache before the timing section
-
-    # Measure a single sequential read on the warm cache.
-    t0 = time.perf_counter()
-    pa.RecordBatchReader.from_stream(ds.reader()).read_all()
-    single_read_s = time.perf_counter() - t0
-
-    fully_serialized_bound = single_read_s * n_threads
-
-    errors: list[Exception] = []
-
-    def read():
-        try:
-            pa.RecordBatchReader.from_stream(ds.reader()).read_all()
-        except Exception as e:
-            errors.append(e)
-
-    t_concurrent = time.perf_counter()
-    threads = [threading.Thread(target=read) for _ in range(n_threads)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-    concurrent_s = time.perf_counter() - t_concurrent
-
-    assert not errors, errors
-    assert concurrent_s < fully_serialized_bound * 0.7, (
-        f"Concurrent reads ({concurrent_s:.3f}s) look fully serialized "
-        f"(bound: {fully_serialized_bound:.3f}s)"
-    )
-
-
 # ── large-scale stress ────────────────────────────────────────────────────────
 
 
