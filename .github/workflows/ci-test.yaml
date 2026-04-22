@@ -72,3 +72,93 @@ jobs:
         uses: codecov/codecov-action@v5.4.0
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
+
+  windows:
+    runs-on: windows-latest
+    env:
+      UV_NO_SYNC: "1"
+    strategy:
+      matrix:
+        python-version: ["3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Update Rust stable
+        run: rustup update stable
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            ./target/
+          key: cargo-test-windows-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock') }}
+          restore-keys: cargo-test-windows-
+
+      - name: Install Python dependencies
+        run: uv sync --locked --group dev --no-install-project
+
+      - name: Build extension
+        uses: PyO3/maturin-action@v1
+        with:
+          command: develop
+          args: --release --strip --uv
+          sccache: 'true'
+
+      - name: Run tests
+        run: uv run pytest --import-mode=importlib
+
+  macos:
+    runs-on: macos-latest
+    env:
+      UV_NO_SYNC: "1"
+    strategy:
+      matrix:
+        python-version: ["3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Update Rust stable
+        run: rustup update stable
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            ./target/
+          key: cargo-test-macos-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock') }}
+          restore-keys: cargo-test-macos-
+
+      - name: Install Python dependencies
+        run: uv sync --locked --group dev --no-install-project
+
+      - name: Build extension
+        uses: PyO3/maturin-action@v1
+        with:
+          command: develop
+          args: --release --strip --uv
+          sccache: 'true'
+
+      - name: Run tests
+        run: uv run pytest --import-mode=importlib
