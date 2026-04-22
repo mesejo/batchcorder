@@ -62,14 +62,11 @@ jobs:
       - name: Install Python dependencies
         run: uv sync --locked --group dev --no-install-project
 
-      - name: Set llvm-cov environment
-        run: cargo llvm-cov show-env >> $GITHUB_ENV
-
       - name: Build and test with coverage
         env:
-          CARGO_TARGET_DIR: ${{ env.CARGO_LLVM_COV_TARGET_DIR }}
           CARGO_INCREMENTAL: "1"
         run: |
+          eval "$(cargo llvm-cov show-env --export-prefix)"
           cargo llvm-cov clean --workspace
           cargo test
           uv run maturin develop --uv
@@ -122,16 +119,12 @@ jobs:
       - name: Install Python dependencies
         run: uv sync --locked --group dev --no-install-project
 
-      - name: Set llvm-cov environment
-        shell: bash
-        run: cargo llvm-cov show-env >> $GITHUB_ENV
-
       - name: Build and test with coverage
         shell: bash
         env:
-          CARGO_TARGET_DIR: ${{ env.CARGO_LLVM_COV_TARGET_DIR }}
           CARGO_INCREMENTAL: "1"
         run: |
+          eval "$(cargo llvm-cov show-env --export-prefix)"
           cargo llvm-cov clean --workspace
           cargo test
           uv run maturin develop --uv
