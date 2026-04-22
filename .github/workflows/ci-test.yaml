@@ -90,7 +90,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Update Rust stable
-        run: rustup update stable
+        run: rustup update stable && rustup component add llvm-tools-preview
 
       - uses: actions/setup-python@v5
         with:
@@ -99,6 +99,11 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
 
       - name: Cargo cache
         uses: actions/cache@v4
@@ -114,15 +119,23 @@ jobs:
       - name: Install Python dependencies
         run: uv sync --locked --group dev --no-install-project
 
-      - name: Build extension
-        uses: PyO3/maturin-action@v1
-        with:
-          command: develop
-          args: --release --strip --uv
-          sccache: 'true'
+      - name: Build and test with coverage
+        shell: bash
+        run: |
+          source <(cargo llvm-cov show-env --export-prefix)
+          export CARGO_TARGET_DIR=$CARGO_LLVM_COV_TARGET_DIR
+          export CARGO_INCREMENTAL=1
+          cargo llvm-cov clean --workspace
+          cargo test
+          uv run maturin develop --uv
+          uv run pytest --import-mode=importlib --cov --cov-report=xml
+          cargo llvm-cov report --lcov --output-path coverage.lcov
 
-      - name: Run tests
-        run: uv run pytest --import-mode=importlib
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5.4.0
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: coverage.xml,coverage.lcov
 
   macos:
     runs-on: macos-latest
