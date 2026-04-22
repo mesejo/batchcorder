@@ -428,10 +428,10 @@ def test_reader_cast_consumes_reader(tmp_path):
 
 
 def test_reader_cast_raises_if_already_consumed(tmp_path):
-    """cast() on an already-consumed reader raises IOError."""
+    """cast() on an already-consumed reader raises ValueError."""
     reader = _ds(tmp_path, TABLE).reader()
     reader.cast(TARGET_SCHEMA).read_all()
-    with pytest.raises(OSError, match="already consumed"):
+    with pytest.raises(ValueError, match="already consumed"):
         reader.cast(TARGET_SCHEMA)
 
 

@@ -708,7 +708,7 @@ def test_memory_only_close():
 
 def test_disk_params_must_both_be_provided_or_omitted():
     table = _make_table()
-    with pytest.raises(OSError, match="disk_path and disk_capacity"):
+    with pytest.raises(ValueError, match="disk_path and disk_capacity"):
         StreamCache(table, memory_capacity=16 << 20, disk_path="/tmp")
-    with pytest.raises(OSError, match="disk_path and disk_capacity"):
+    with pytest.raises(ValueError, match="disk_path and disk_capacity"):
         StreamCache(table, memory_capacity=16 << 20, disk_capacity=64 << 20)
