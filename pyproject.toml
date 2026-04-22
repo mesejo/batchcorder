@@ -100,3 +100,9 @@ section-order = [
   "local-folder",
 ]
 lines-after-imports = 2
+
+[tool.coverage.run]
+source = ["batchcorder"]
+
+[tool.coverage.report]
+exclude_lines = ["pragma: no cover", "if TYPE_CHECKING:"]
