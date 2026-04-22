@@ -36,6 +36,7 @@ module-name = "batchcorder._batchcorder"
 
 [dependency-groups]
 dev = [
+  "maturin>=1.7,<2.0",
   "pyarrow>=14",
   "pytest>=8",
   "duckdb>=1.5",

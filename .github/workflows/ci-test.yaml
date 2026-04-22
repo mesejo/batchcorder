@@ -40,10 +40,10 @@ jobs:
         with:
           enable-cache: true
 
-      - name: Install cargo-llvm-cov and maturin
+      - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-llvm-cov,maturin
+          tool: cargo-llvm-cov
 
       - name: Cargo cache
         uses: actions/cache@v4
@@ -103,10 +103,10 @@ jobs:
         with:
           enable-cache: true
 
-      - name: Install cargo-llvm-cov and maturin
+      - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-llvm-cov,maturin
+          tool: cargo-llvm-cov
 
       - name: Cargo cache
         uses: actions/cache@v4
