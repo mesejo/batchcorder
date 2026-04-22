@@ -12,14 +12,14 @@ repeatedly without re-reading from disk or the network each time.
 ## What batchcorder does
 
 `StreamCache` wraps any Arrow stream source (anything that implements
-`__arrow_c_stream__`) and stores each `RecordBatch` in a
-[Foyer](https://github.com/foyer-rs/foyer) cache. Two storage modes are
-supported:
+`__arrow_c_stream__`) and stores each `RecordBatch` in a cache. Two storage
+modes are supported:
 
-- **Memory-only** (default): all batches are kept in RAM; no files are created
-  on disk.
-- **Hybrid memory+disk**: batches evicted from the memory tier spill to disk,
-  allowing the working set to exceed available RAM.
+- **Memory-only** (default): batches are stored as reference-counted pointers
+  in RAM; reads are zero-copy and no IPC serialisation happens.
+- **Hybrid memory+disk**: batches are serialised to an append-only IPC file on
+  disk; a configurable hot layer keeps recently ingested batches in RAM to
+  reduce disk I/O.
 
 Multiple independent readers can replay the stream concurrently, each
 maintaining their own position in the batch sequence.
@@ -105,13 +105,6 @@ duckdb.table("ds")  # DuckDB
 - **Replay from any position**: `ds.reader(from_start=True)` (default) replays
   from batch 0; `ds.reader(from_start=False)` starts from the current ingestion
   frontier (next batch not yet ingested).
-
-## Eviction caveat
-
-Foyer evicts cache entries under memory/disk pressure. If an entry is evicted
-before a reader reaches it, that reader will raise an error. Size the cache to
-hold at least as many batches as the span between the slowest and fastest
-concurrent reader.
 
 ## Development
 

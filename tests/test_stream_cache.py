@@ -277,8 +277,8 @@ def test_ingest_all_idempotent(tmp_path):
 
 def test_disk_spill_and_pyarrow_ipc_roundtrip(tmp_path):
     # Each batch: 100 rows * 1 KiB binary payload ≈ 100 KiB serialized.
-    # Memory tier is only 32 KiB — smaller than a single batch — so every
-    # batch inserted into the cache must be evicted to the disk tier.
+    # Memory tier is only 32 KiB — smaller than a single batch — so the hot
+    # layer fills immediately and every batch is read back from disk.
     n_batches = 5
     rows_per_batch = 100
     table = pa.table(
@@ -301,10 +301,8 @@ def test_disk_spill_and_pyarrow_ipc_roundtrip(tmp_path):
     assert ds.ingest_all() == n_batches
     assert ds.upstream_exhausted
 
-    # Foyer creates its block device files during cache construction and
-    # populates them as batches are evicted from the memory tier.
     disk_files = [p for p in tmp_path.rglob("*") if p.is_file()]
-    assert len(disk_files) > 0, "Expected Foyer to write cache files to disk"
+    assert len(disk_files) > 0, "Expected disk tier to write cache files"
 
     # Read back the full dataset via PyArrow's Arrow IPC stream interface.
     # __arrow_c_stream__ exposes the data as an Arrow IPC-backed C stream,
@@ -326,7 +324,7 @@ def test_disk_spill_ipc_file_write_and_read(tmp_path):
         }
     )
 
-    # Separate subdirectory so the Foyer device files and the IPC output
+    # Separate subdirectory so the cache IPC file and the IPC output
     # file live in different places, keeping the disk-file assertion clean.
     cache_dir = tmp_path / "cache"
     cache_dir.mkdir()
@@ -340,9 +338,8 @@ def test_disk_spill_ipc_file_write_and_read(tmp_path):
     )
     ds.ingest_all()
 
-    # Verify Foyer wrote its block device files under cache_dir.
     cache_files = [p for p in cache_dir.rglob("*") if p.is_file()]
-    assert len(cache_files) > 0, "Expected Foyer to write cache files to disk"
+    assert len(cache_files) > 0, "Expected disk tier to write cache files"
 
     # Stream the data out of the cache (reading from the disk tier) and write
     # it to a standard Arrow IPC *file* (random-access format).
@@ -387,8 +384,120 @@ def test_concurrent_readers(tmp_path):
         assert res.equals(table)
 
 
+def test_many_concurrent_readers_memory_only():
+    """16 threads reading from a memory-only cache all get complete, correct data."""
+    n_threads = 16
+    table = _make_table(n_batches=8, rows_per_batch=5)
+    ds = StreamCache(table.to_reader(max_chunksize=5))
+    results: list[pa.Table | None] = [None] * n_threads
+    errors: list[Exception] = []
+
+    def read(i):
+        try:
+            results[i] = pa.RecordBatchReader.from_stream(ds.reader()).read_all()
+        except Exception as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target=read, args=(i,)) for i in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, errors
+    for res in results:
+        assert res is not None
+        assert res.equals(table)
+
+
+def test_concurrent_readers_after_full_ingestion():
+    """After ingest_all(), concurrent readers contend only on cache reads — no ingestion lock."""
+    n_threads = 8
+    table = _make_table(n_batches=10, rows_per_batch=4)
+    ds = StreamCache(table.to_reader(max_chunksize=4))
+    count = ds.ingest_all()
+    assert count == 10
+
+    results: list[pa.Table | None] = [None] * n_threads
+    errors: list[Exception] = []
+
+    def read(i):
+        try:
+            results[i] = pa.RecordBatchReader.from_stream(ds.reader()).read_all()
+        except Exception as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target=read, args=(i,)) for i in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, errors
+    for res in results:
+        assert res is not None
+        assert res.equals(table)
+
+
+def test_concurrent_ingest_all_is_idempotent():
+    """Two threads calling ingest_all() concurrently produce the correct count without errors."""
+    table = _make_table(n_batches=6, rows_per_batch=3)
+    ds = StreamCache(table.to_reader(max_chunksize=3))
+    counts: list[int] = []
+    errors: list[Exception] = []
+
+    def ingest():
+        try:
+            counts.append(ds.ingest_all())
+        except Exception as e:
+            errors.append(e)
+
+    t1 = threading.Thread(target=ingest)
+    t2 = threading.Thread(target=ingest)
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+
+    assert not errors, errors
+    assert len(counts) == 2
+    assert all(c == 6 for c in counts)
+    assert ds.upstream_exhausted
+
+
+def test_reader_batch_order_preserved_under_concurrency():
+    """Each concurrent reader's batches arrive in index order even under heavy concurrency."""
+    n_threads = 8
+    n_batches = 12
+    rows_per_batch = 5
+    table = _make_table(n_batches=n_batches, rows_per_batch=rows_per_batch)
+    ds = StreamCache(table.to_reader(max_chunksize=rows_per_batch))
+    errors: list[Exception] = []
+    # Collect per-reader batch sequences to verify ordering.
+    batch_ids: list[list[int]] = [[] for _ in range(n_threads)]
+
+    def read(i):
+        try:
+            for batch in ds.reader():
+                # The first value in each batch encodes its position.
+                batch_ids[i].append(int(batch.column("id")[0].as_py()))
+        except Exception as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target=read, args=(i,)) for i in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, errors
+    expected_first_ids = [i * rows_per_batch for i in range(n_batches)]
+    for ids in batch_ids:
+        assert ids == expected_first_ids, f"batch order violated: {ids}"
+
+
 def test_close_removes_disk_files(tmp_path):
-    """close() must delete the Foyer block-device files it wrote to disk."""
+    """close() must delete the IPC cache files written to disk."""
     n_batches = 5
     rows_per_batch = 100
     table = pa.table(
@@ -409,14 +518,14 @@ def test_close_removes_disk_files(tmp_path):
     ds.ingest_all()
 
     disk_files = list(tmp_path.rglob("*"))
-    assert len(disk_files) > 0, "Expected Foyer to write cache files before close()"
+    assert len(disk_files) > 0, "Expected disk tier to write cache files before close()"
 
     ds.close()
 
-    # close() removes only the Foyer-owned subdirectory; tmp_path itself stays.
+    # close() removes only the cache subdirectory; tmp_path itself stays.
     remaining = list(tmp_path.rglob("*"))
     assert remaining == [], (
-        f"Expected Foyer subdirectory to be removed after close(), found: {remaining}"
+        f"Expected cache subdirectory to be removed after close(), found: {remaining}"
     )
 
 
@@ -502,7 +611,7 @@ def test_upstream_error_during_read_propagates(tmp_path):
 
 
 def test_drop_removes_disk_files(tmp_path):
-    """Drop (when dataset goes out of scope) must delete the Foyer block-device files it wrote to disk."""
+    """Drop (when dataset goes out of scope) must delete the IPC cache files written to disk."""
     n_batches = 5
     rows_per_batch = 100
     table = pa.table(
@@ -523,7 +632,7 @@ def test_drop_removes_disk_files(tmp_path):
     ds.ingest_all()
 
     disk_files = list(tmp_path.rglob("*"))
-    assert len(disk_files) > 0, "Expected Foyer to write cache files before drop()"
+    assert len(disk_files) > 0, "Expected disk tier to write cache files before drop()"
 
     # Let ds go out of scope (drop is called automatically)
     del ds
