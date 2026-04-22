@@ -33,7 +33,7 @@ fn total_system_memory() -> usize {
     sys.total_memory() as usize
 }
 
-use arrow_array::{ArrayRef, RecordBatch, StructArray};
+use arrow_array::{Array, ArrayRef, RecordBatch, StructArray};
 use arrow_schema::{ArrowError, Field, SchemaRef};
 use pyo3::exceptions::PyIOError;
 use pyo3::prelude::*;
@@ -53,6 +53,10 @@ static DATASET_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// In-memory cache: batches stored as `Arc<RecordBatch>`, zero-copy reads.
 struct MemoryCacheTier {
     batches: RwLock<Vec<Arc<RecordBatch>>>,
+    /// Byte budget for all cached batches combined.
+    capacity: usize,
+    /// Bytes currently held across all cached batches.
+    used: AtomicUsize,
 }
 
 /// Disk-backed write state (mutated only during ingestion).
@@ -97,6 +101,19 @@ impl CacheTier {
     fn insert(&self, batch: RecordBatch) -> Result<(), ArrowError> {
         match self {
             CacheTier::Memory(m) => {
+                let batch_size: usize = batch
+                    .columns()
+                    .iter()
+                    .map(|c| c.get_array_memory_size())
+                    .sum();
+                let used = m.used.load(Ordering::Relaxed);
+                if used + batch_size > m.capacity {
+                    return Err(other_arrow_err(format!(
+                        "Memory cache capacity ({} bytes) exceeded",
+                        m.capacity
+                    )));
+                }
+                m.used.fetch_add(batch_size, Ordering::Relaxed);
                 m.batches.write().unwrap().push(Arc::new(batch));
                 Ok(())
             }
@@ -115,7 +132,10 @@ impl CacheTier {
                     ws.file
                         .flush()
                         .map_err(|e| other_arrow_err(format!("Disk flush failed: {e}")))?;
-                    ws.offset += length as u64;
+                    ws.offset = ws
+                        .offset
+                        .checked_add(length as u64)
+                        .ok_or_else(|| other_arrow_err("Cache file offset overflowed"))?;
                     off
                 };
                 // Try to keep a hot copy if the budget allows.
@@ -244,7 +264,17 @@ fn serialize_batch(batch: &RecordBatch) -> Result<Vec<u8>, ArrowError> {
     Ok(buf)
 }
 
+// Arrow's practical per-batch limit (int32 offset arrays cap at ~2^31 elements).
+const MAX_BATCH_BYTES: usize = 2 * 1024 * 1024 * 1024;
+
 fn deserialize_batch(bytes: &[u8]) -> Result<RecordBatch, ArrowError> {
+    if bytes.len() > MAX_BATCH_BYTES {
+        return Err(other_arrow_err(format!(
+            "Batch size {} exceeds maximum of {} bytes",
+            bytes.len(),
+            MAX_BATCH_BYTES
+        )));
+    }
     let mut reader = arrow_ipc::reader::StreamReader::try_new(Cursor::new(bytes), None)?;
     reader
         .next()
@@ -617,16 +647,24 @@ impl PyStreamCache {
                     std::fs::create_dir_all(&dir_path)
                         .map_err(|e| format!("Failed to create cache directory: {e}"))?;
                     let file_path = dir_path.join("cache.arrow");
-                    let write_file = std::fs::OpenOptions::new()
-                        .write(true)
-                        .create(true)
-                        .truncate(true)
+                    let mut open_opts = std::fs::OpenOptions::new();
+                    open_opts.write(true).create_new(true);
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::OpenOptionsExt;
+                        open_opts.mode(0o600);
+                    }
+                    let write_file = open_opts
                         .open(&file_path)
                         .map_err(|e| format!("Failed to create cache file: {e}"))?;
                     let read_file = std::fs::File::open(&file_path)
                         .map_err(|e| format!("Failed to open cache file for reading: {e}"))?;
 
-                    let hot_capacity = memory_capacity.unwrap_or_else(total_system_memory);
+                    let hot_capacity = memory_capacity.unwrap_or_else(|| {
+                        // Cap at half of system RAM so multiple caches don't
+                        // collectively exhaust memory; floor at 64 MiB.
+                        (total_system_memory() / 2).max(64 * 1024 * 1024)
+                    });
                     Ok::<_, String>(CacheTier::Disk(DiskCacheTier {
                         dir_path,
                         write_state: Mutex::new(DiskWriteState {
@@ -644,9 +682,17 @@ impl PyStreamCache {
                 })
                 .map_err(PyIOError::new_err)?
             }
-            (None, None) => CacheTier::Memory(MemoryCacheTier {
-                batches: RwLock::new(Vec::new()),
-            }),
+            (None, None) => {
+                let capacity = memory_capacity.unwrap_or_else(|| {
+                    // Default to 10% of system RAM, floor at 64 MiB.
+                    (total_system_memory() / 10).max(64 * 1024 * 1024)
+                });
+                CacheTier::Memory(MemoryCacheTier {
+                    batches: RwLock::new(Vec::new()),
+                    capacity,
+                    used: AtomicUsize::new(0),
+                })
+            }
             _ => {
                 return Err(PyIOError::new_err(
                     "disk_path and disk_capacity must both be provided, or both omitted",
