@@ -33,9 +33,9 @@ fn total_system_memory() -> usize {
     sys.total_memory() as usize
 }
 
-use arrow_array::{ArrayRef, RecordBatch, StructArray};
+use arrow_array::{Array, ArrayRef, RecordBatch, StructArray};
 use arrow_schema::{ArrowError, Field, SchemaRef};
-use pyo3::exceptions::PyIOError;
+use pyo3::exceptions::{PyIOError, PyMemoryError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyCapsule;
 use pyo3_arrow::error::{PyArrowError, PyArrowResult};
@@ -53,6 +53,10 @@ static DATASET_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// In-memory cache: batches stored as `Arc<RecordBatch>`, zero-copy reads.
 struct MemoryCacheTier {
     batches: RwLock<Vec<Arc<RecordBatch>>>,
+    /// Byte budget for all cached batches combined.
+    capacity: usize,
+    /// Bytes currently held across all cached batches.
+    used: AtomicUsize,
 }
 
 /// Disk-backed write state (mutated only during ingestion).
@@ -97,6 +101,19 @@ impl CacheTier {
     fn insert(&self, batch: RecordBatch) -> Result<(), ArrowError> {
         match self {
             CacheTier::Memory(m) => {
+                let batch_size: usize = batch
+                    .columns()
+                    .iter()
+                    .map(|c| c.get_array_memory_size())
+                    .sum();
+                let used = m.used.load(Ordering::Relaxed);
+                if used + batch_size > m.capacity {
+                    return Err(ArrowError::MemoryError(format!(
+                        "Memory cache capacity ({} bytes) exceeded",
+                        m.capacity
+                    )));
+                }
+                m.used.fetch_add(batch_size, Ordering::Relaxed);
                 m.batches.write().unwrap().push(Arc::new(batch));
                 Ok(())
             }
@@ -115,7 +132,10 @@ impl CacheTier {
                     ws.file
                         .flush()
                         .map_err(|e| other_arrow_err(format!("Disk flush failed: {e}")))?;
-                    ws.offset += length as u64;
+                    ws.offset = ws
+                        .offset
+                        .checked_add(length as u64)
+                        .ok_or_else(|| other_arrow_err("Cache file offset overflowed"))?;
                     off
                 };
                 // Try to keep a hot copy if the budget allows.
@@ -232,6 +252,45 @@ fn other_arrow_err(msg: impl std::fmt::Display) -> ArrowError {
     ArrowError::ExternalError(Box::new(std::io::Error::other(msg.to_string())))
 }
 
+/// Semantic error type for `without_gil` closures, so each kind maps to the
+/// right Python exception at the boundary rather than everything becoming OSError.
+enum BoundaryError {
+    Value(String),
+    Io(String),
+    Memory(String),
+    Runtime(String),
+}
+
+impl From<BoundaryError> for PyErr {
+    fn from(e: BoundaryError) -> PyErr {
+        match e {
+            BoundaryError::Value(s) => PyValueError::new_err(s),
+            BoundaryError::Io(s) => PyIOError::new_err(s),
+            BoundaryError::Memory(s) => PyMemoryError::new_err(s),
+            BoundaryError::Runtime(s) => PyRuntimeError::new_err(s),
+        }
+    }
+}
+
+/// Classify an [`ArrowError`] into the right [`BoundaryError`] variant.
+fn arrow_to_boundary(e: ArrowError) -> BoundaryError {
+    match e {
+        ArrowError::MemoryError(msg) => BoundaryError::Memory(msg),
+        ArrowError::InvalidArgumentError(msg) => BoundaryError::Value(msg),
+        _ => BoundaryError::Io(e.to_string()),
+    }
+}
+
+/// Convert an [`ArrowError`] into the right [`PyArrowError`] variant so
+/// iterator callers receive a meaningful Python exception type.
+fn arrow_to_pyarrow_error(e: ArrowError) -> PyArrowError {
+    match e {
+        ArrowError::MemoryError(msg) => PyArrowError::PyErr(PyMemoryError::new_err(msg)),
+        ArrowError::InvalidArgumentError(msg) => PyArrowError::PyErr(PyValueError::new_err(msg)),
+        _ => PyArrowError::ArrowError(e),
+    }
+}
+
 // ── IPC serialization ────────────────────────────────────────────────────────
 
 fn serialize_batch(batch: &RecordBatch) -> Result<Vec<u8>, ArrowError> {
@@ -244,7 +303,17 @@ fn serialize_batch(batch: &RecordBatch) -> Result<Vec<u8>, ArrowError> {
     Ok(buf)
 }
 
+// Arrow's practical per-batch limit (int32 offset arrays cap at ~2^31 elements).
+const MAX_BATCH_BYTES: usize = 2 * 1024 * 1024 * 1024;
+
 fn deserialize_batch(bytes: &[u8]) -> Result<RecordBatch, ArrowError> {
+    if bytes.len() > MAX_BATCH_BYTES {
+        return Err(other_arrow_err(format!(
+            "Batch size {} exceeds maximum of {} bytes",
+            bytes.len(),
+            MAX_BATCH_BYTES
+        )));
+    }
     let mut reader = arrow_ipc::reader::StreamReader::try_new(Cursor::new(bytes), None)?;
     reader
         .next()
@@ -294,7 +363,9 @@ struct DatasetInner {
 impl DatasetInner {
     fn ingest_up_to(&mut self, target_index: u64) -> Result<bool, ArrowError> {
         if self.closed {
-            return Err(other_arrow_err("Dataset has been closed"));
+            return Err(ArrowError::InvalidArgumentError(
+                "Dataset has been closed".into(),
+            ));
         }
         while self.ingested_count <= target_index {
             if self.upstream_exhausted {
@@ -337,7 +408,9 @@ impl Iterator for StreamCacheReaderImpl {
                 Err(e) => return Some(Err(other_arrow_err(format!("Mutex poisoned: {e}")))),
             };
             if inner.closed {
-                return Some(Err(other_arrow_err("Dataset has been closed")));
+                return Some(Err(ArrowError::InvalidArgumentError(
+                    "Dataset has been closed".into(),
+                )));
             }
             match inner.ingest_up_to(idx) {
                 Err(e) => return Some(Err(e)),
@@ -353,7 +426,9 @@ impl Iterator for StreamCacheReaderImpl {
             Ok(None) => {
                 let closed = self.inner.lock().map(|g| g.closed).unwrap_or(false);
                 if closed {
-                    Some(Err(other_arrow_err("Dataset has been closed")))
+                    Some(Err(ArrowError::InvalidArgumentError(
+                        "Dataset has been closed".into(),
+                    )))
                 } else {
                     // Should not happen: ingest_up_to returned Ok(true).
                     Some(Err(other_arrow_err(format!(
@@ -420,7 +495,7 @@ impl PyStreamCacheReader {
     ) -> PyArrowResult<Bound<'py, PyCapsule>> {
         let reader =
             self.0.lock().unwrap().take().ok_or_else(|| {
-                PyArrowError::PyErr(PyIOError::new_err("Reader already consumed"))
+                PyArrowError::PyErr(PyValueError::new_err("Reader already consumed"))
             })?;
         Self::to_stream_pycapsule(py, reader, requested_schema)
     }
@@ -430,7 +505,7 @@ impl PyStreamCacheReader {
         let inner = self.0.lock().unwrap();
         let reader = inner
             .as_ref()
-            .ok_or_else(|| PyArrowError::PyErr(PyIOError::new_err("Reader already consumed")))?;
+            .ok_or_else(|| PyArrowError::PyErr(PyValueError::new_err("Reader already consumed")))?;
         to_schema_pycapsule(py, reader.schema.as_ref())
     }
 
@@ -440,7 +515,7 @@ impl PyStreamCacheReader {
         let inner = self.0.lock().unwrap();
         let reader = inner
             .as_ref()
-            .ok_or_else(|| PyIOError::new_err("Reader already consumed"))?;
+            .ok_or_else(|| PyValueError::new_err("Reader already consumed"))?;
         Ok(PySchema::new(reader.schema.clone()).into())
     }
 
@@ -465,7 +540,7 @@ impl PyStreamCacheReader {
             .lock()
             .unwrap()
             .take()
-            .ok_or_else(|| PyIOError::new_err("Reader already consumed"))?;
+            .ok_or_else(|| PyValueError::new_err("Reader already consumed"))?;
         let new_reader = PyStreamCacheReader::new(impl_);
         let kwargs = pyo3::types::PyDict::new(py);
         kwargs.set_item("schema", target_schema)?;
@@ -481,7 +556,7 @@ impl PyStreamCacheReader {
         let mut guard = self.0.lock().unwrap();
         let impl_ = match guard.as_mut() {
             None => {
-                return Err(PyArrowError::PyErr(PyIOError::new_err(
+                return Err(PyArrowError::PyErr(PyValueError::new_err(
                     "Reader already consumed",
                 )));
             }
@@ -490,7 +565,7 @@ impl PyStreamCacheReader {
         let result = without_gil(py, || impl_.next());
         match result {
             None => Ok(None),
-            Some(Err(e)) => Err(PyArrowError::ArrowError(e)),
+            Some(Err(e)) => Err(arrow_to_pyarrow_error(e)),
             Some(Ok(batch)) => Ok(Some(Arro3RecordBatch::from(batch))),
         }
     }
@@ -509,17 +584,20 @@ pub struct PyCastingStreamCache {
 impl PyCastingStreamCache {
     fn make_reader_impl(&self, py: Python<'_>) -> PyResult<StreamCacheReaderImpl> {
         without_gil(py, || {
-            let inner = self.inner.lock().map_err(|e| e.to_string())?;
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|e| BoundaryError::Runtime(format!("Internal mutex error: {e}")))?;
             if inner.closed {
-                return Err("Dataset has been closed".to_string());
+                return Err(BoundaryError::Value("Dataset has been closed".into()));
             }
-            Ok::<_, String>(StreamCacheReaderImpl {
+            Ok::<_, BoundaryError>(StreamCacheReaderImpl {
                 schema: self.source_schema.clone(),
                 inner: self.inner.clone(),
                 current_index: 0,
             })
         })
-        .map_err(PyIOError::new_err)
+        .map_err(PyErr::from)
     }
 }
 
@@ -614,20 +692,30 @@ impl PyStreamCache {
                 // Create the subdirectory and both file descriptors while the
                 // GIL is released (pure OS I/O — no Python objects touched).
                 without_gil(py, || {
-                    std::fs::create_dir_all(&dir_path)
-                        .map_err(|e| format!("Failed to create cache directory: {e}"))?;
+                    std::fs::create_dir_all(&dir_path).map_err(|e| {
+                        BoundaryError::Io(format!("Failed to create cache directory: {e}"))
+                    })?;
                     let file_path = dir_path.join("cache.arrow");
-                    let write_file = std::fs::OpenOptions::new()
-                        .write(true)
-                        .create(true)
-                        .truncate(true)
-                        .open(&file_path)
-                        .map_err(|e| format!("Failed to create cache file: {e}"))?;
-                    let read_file = std::fs::File::open(&file_path)
-                        .map_err(|e| format!("Failed to open cache file for reading: {e}"))?;
+                    let mut open_opts = std::fs::OpenOptions::new();
+                    open_opts.write(true).create_new(true);
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::OpenOptionsExt;
+                        open_opts.mode(0o600);
+                    }
+                    let write_file = open_opts.open(&file_path).map_err(|e| {
+                        BoundaryError::Io(format!("Failed to create cache file: {e}"))
+                    })?;
+                    let read_file = std::fs::File::open(&file_path).map_err(|e| {
+                        BoundaryError::Io(format!("Failed to open cache file for reading: {e}"))
+                    })?;
 
-                    let hot_capacity = memory_capacity.unwrap_or_else(total_system_memory);
-                    Ok::<_, String>(CacheTier::Disk(DiskCacheTier {
+                    let hot_capacity = memory_capacity.unwrap_or_else(|| {
+                        // Cap at half of system RAM so multiple caches don't
+                        // collectively exhaust memory; floor at 64 MiB.
+                        (total_system_memory() / 2).max(64 * 1024 * 1024)
+                    });
+                    Ok::<_, BoundaryError>(CacheTier::Disk(DiskCacheTier {
                         dir_path,
                         write_state: Mutex::new(DiskWriteState {
                             file: write_file,
@@ -642,13 +730,21 @@ impl PyStreamCache {
                         hot_used: AtomicUsize::new(0),
                     }))
                 })
-                .map_err(PyIOError::new_err)?
+                .map_err(PyErr::from)?
             }
-            (None, None) => CacheTier::Memory(MemoryCacheTier {
-                batches: RwLock::new(Vec::new()),
-            }),
+            (None, None) => {
+                let capacity = memory_capacity.unwrap_or_else(|| {
+                    // Default to 10% of system RAM, floor at 64 MiB.
+                    (total_system_memory() / 10).max(64 * 1024 * 1024)
+                });
+                CacheTier::Memory(MemoryCacheTier {
+                    batches: RwLock::new(Vec::new()),
+                    capacity,
+                    used: AtomicUsize::new(0),
+                })
+            }
             _ => {
-                return Err(PyIOError::new_err(
+                return Err(PyValueError::new_err(
                     "disk_path and disk_capacity must both be provided, or both omitted",
                 ));
             }
@@ -677,18 +773,21 @@ impl PyStreamCache {
     #[pyo3(signature = (from_start = true))]
     pub fn reader(&self, py: Python<'_>, from_start: bool) -> PyResult<PyStreamCacheReader> {
         without_gil(py, || {
-            let inner = self.inner.lock().map_err(|e| e.to_string())?;
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|e| BoundaryError::Runtime(format!("Internal mutex error: {e}")))?;
             if inner.closed {
-                return Err("Dataset has been closed".to_string());
+                return Err(BoundaryError::Value("Dataset has been closed".into()));
             }
             let start_index = if from_start { 0 } else { inner.ingested_count };
-            Ok::<_, String>(PyStreamCacheReader::new(StreamCacheReaderImpl {
+            Ok::<_, BoundaryError>(PyStreamCacheReader::new(StreamCacheReaderImpl {
                 schema: self.schema.clone(),
                 inner: self.inner.clone(),
                 current_index: start_index,
             }))
         })
-        .map_err(PyIOError::new_err)
+        .map_err(PyErr::from)
     }
 
     pub fn __iter__(&self, py: Python<'_>) -> PyResult<PyStreamCacheReader> {
@@ -732,11 +831,14 @@ impl PyStreamCache {
 
     pub fn ingest_all(&self, py: Python<'_>) -> PyResult<u64> {
         without_gil(py, || {
-            let mut inner = self.inner.lock().map_err(|e| e.to_string())?;
-            inner.ingest_up_to(u64::MAX).map_err(|e| e.to_string())?;
-            Ok::<_, String>(inner.ingested_count)
+            let mut inner = self
+                .inner
+                .lock()
+                .map_err(|e| BoundaryError::Runtime(format!("Internal mutex error: {e}")))?;
+            inner.ingest_up_to(u64::MAX).map_err(arrow_to_boundary)?;
+            Ok::<_, BoundaryError>(inner.ingested_count)
         })
-        .map_err(PyIOError::new_err)
+        .map_err(PyErr::from)
     }
 
     #[getter]
@@ -745,9 +847,9 @@ impl PyStreamCache {
             self.inner
                 .lock()
                 .map(|g| g.ingested_count)
-                .map_err(|e| e.to_string())
+                .map_err(|e| BoundaryError::Runtime(format!("Internal mutex error: {e}")))
         })
-        .map_err(PyIOError::new_err)
+        .map_err(PyErr::from)
     }
 
     #[getter]
@@ -756,14 +858,17 @@ impl PyStreamCache {
             self.inner
                 .lock()
                 .map(|g| g.upstream_exhausted)
-                .map_err(|e| e.to_string())
+                .map_err(|e| BoundaryError::Runtime(format!("Internal mutex error: {e}")))
         })
-        .map_err(PyIOError::new_err)
+        .map_err(PyErr::from)
     }
 
     pub fn close(&self, py: Python<'_>) -> PyResult<()> {
         without_gil(py, || {
-            let mut inner = self.inner.lock().map_err(|e| e.to_string())?;
+            let mut inner = self
+                .inner
+                .lock()
+                .map_err(|e| BoundaryError::Runtime(format!("Internal mutex error: {e}")))?;
             if inner.closed {
                 return Ok(());
             }
@@ -772,8 +877,8 @@ impl PyStreamCache {
             drop(inner);
             cache.cleanup_disk();
             cache.clear();
-            Ok::<_, String>(())
+            Ok::<_, BoundaryError>(())
         })
-        .map_err(PyIOError::new_err)
+        .map_err(PyErr::from)
     }
 }

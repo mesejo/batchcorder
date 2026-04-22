@@ -52,38 +52,38 @@ def _assert_readable_traceback(exc_info) -> str:
     return text
 
 
-# The stub documents IOError for __arrow_c_stream__, __arrow_c_schema__, and
-# .schema.  __next__ also raises IOError (from the same Rust arm) rather than
-# StopIteration when the reader has been consumed, not merely exhausted.
+# Accessing a consumed reader raises ValueError (invalid state, not an I/O
+# failure).  __next__ also raises ValueError rather than StopIteration when
+# the reader has been consumed, not merely exhausted.
 
 
-def test_reader_c_stream_consumed_raises_ioerror(tmp_path):
+def test_reader_c_stream_consumed_raises_valueerror(tmp_path):
     r = _consumed_reader(tmp_path)
-    with pytest.raises(OSError, match="consumed") as exc_info:
+    with pytest.raises(ValueError, match="consumed") as exc_info:
         r.__arrow_c_stream__()
     _assert_readable_traceback(exc_info)
 
 
-def test_reader_c_schema_consumed_raises_ioerror(tmp_path):
+def test_reader_c_schema_consumed_raises_valueerror(tmp_path):
     r = _consumed_reader(tmp_path)
-    with pytest.raises(OSError, match="consumed") as exc_info:
+    with pytest.raises(ValueError, match="consumed") as exc_info:
         r.__arrow_c_schema__()
     _assert_readable_traceback(exc_info)
 
 
-def test_reader_schema_property_consumed_raises_ioerror(tmp_path):
+def test_reader_schema_property_consumed_raises_valueerror(tmp_path):
     r = _consumed_reader(tmp_path)
-    with pytest.raises(OSError, match="consumed") as exc_info:
+    with pytest.raises(ValueError, match="consumed") as exc_info:
         _ = r.schema
     _assert_readable_traceback(exc_info)
 
 
-def test_reader_next_consumed_raises_ioerror(tmp_path):
-    # next() on a consumed (not merely exhausted) reader raises OSError, not
+def test_reader_next_consumed_raises_valueerror(tmp_path):
+    # next() on a consumed (not merely exhausted) reader raises ValueError, not
     # StopIteration.  Python's built-in next() propagates non-StopIteration
-    # exceptions as-is, so the OSError surfaces directly.
+    # exceptions as-is, so the ValueError surfaces directly.
     r = _consumed_reader(tmp_path)
-    with pytest.raises(OSError, match="consumed") as exc_info:
+    with pytest.raises(ValueError, match="consumed") as exc_info:
         next(r)
     assert "consumed" in str(exc_info.value).lower()
     _assert_readable_traceback(exc_info)

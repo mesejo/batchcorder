@@ -357,7 +357,7 @@ class StreamCacheReader:
 
         Raises
         ------
-        IOError
+        ValueError
             If the reader has already been consumed.
 
         """
@@ -391,7 +391,7 @@ class StreamCacheReader:
 
         Raises
         ------
-        IOError
+        ValueError
             If the reader has already been consumed.
 
         """
@@ -410,7 +410,7 @@ class StreamCacheReader:
 
         Raises
         ------
-        IOError
+        ValueError
             If the reader has already been consumed.
 
         """
@@ -440,7 +440,7 @@ class StreamCacheReader:
 
         Raises
         ------
-        IOError
+        ValueError
             If the reader has already been consumed.
 
         """
