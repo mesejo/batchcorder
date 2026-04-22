@@ -3,12 +3,9 @@ use pyo3_stub_gen::define_stub_info_gatherer;
 
 mod cached_dataset;
 
-/// Register the `batchcorder._batchcorder` Python extension module.
-///
-/// Exposes:
-/// * [`cached_dataset::PyStreamCache`] — cached Arrow dataset (memory-only or hybrid)
-/// * [`cached_dataset::PyStreamCacheReader`] — independent reader handle
-/// * [`cached_dataset::PyCastingStreamCache`] — replayable cast view of a dataset
+// LCOV_EXCL_START — PyO3 module init and stub gatherer are macro-generated
+// entry points exercised only through the C FFI boundary; the instrumentation
+// cannot reliably attribute coverage to them.
 #[pymodule]
 fn _batchcorder(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<cached_dataset::PyStreamCache>()?;
@@ -18,3 +15,4 @@ fn _batchcorder(m: &Bound<'_, PyModule>) -> PyResult<()> {
 }
 
 define_stub_info_gatherer!(stub_info);
+// LCOV_EXCL_STOP
