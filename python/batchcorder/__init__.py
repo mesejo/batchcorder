@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from importlib.metadata import version
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 
 if TYPE_CHECKING:
-    from typing import Any
+    from typing import Any, Self
 
 from ._batchcorder import (
     CastingStreamCache as _PyCastingStreamCache,
@@ -48,16 +49,19 @@ class StreamCache:
       (``memory_capacity``) keeps recently ingested batches in RAM to reduce
       disk reads.
 
+    Prefer the named constructors :meth:`in_memory` and :meth:`on_disk` over
+    calling this class directly.
+
     Parameters
     ----------
-    reader : object
+    reader : ArrowStreamExportable
         Any object implementing ``__arrow_c_stream__`` (e.g.
         :class:`pyarrow.Table`, :class:`pyarrow.RecordBatchReader`,
         :class:`arro3.core.RecordBatchReader`).
     memory_capacity : int, optional
         Hot-layer budget in bytes for disk mode.  Defaults to total physical
         RAM.  Ignored in memory-only mode.
-    disk_path : str, optional
+    disk_path : str or Path, optional
         Directory for the on-disk IPC file.  Created on first use.
         Must be provided together with ``disk_capacity``.
     disk_capacity : int, optional
@@ -71,7 +75,7 @@ class StreamCache:
     >>> import pyarrow as pa
     >>> from batchcorder import StreamCache
     >>> table = pa.table({"id": [1, 2, 3], "val": [0.5, 1.0, 1.5]})
-    >>> ds = StreamCache(table)
+    >>> ds = StreamCache.in_memory(table)
     >>> pa.RecordBatchReader.from_stream(ds).read_all().equals(table)
     True
 
@@ -79,11 +83,16 @@ class StreamCache:
 
     >>> import tempfile
     >>> tmp = tempfile.mkdtemp()
-    >>> ds = StreamCache(table, memory_capacity=16 << 20, disk_path=tmp, disk_capacity=64 << 20)
+    >>> ds = StreamCache.on_disk(table, path=tmp, disk_capacity=64 << 20)
     >>> pa.RecordBatchReader.from_stream(ds).read_all().equals(table)
     True
     >>> ds.upstream_exhausted
     True
+
+    As a context manager:
+
+    >>> with StreamCache.on_disk(table, path=tmp, disk_capacity=64 << 20) as ds:
+    ...     result = pa.RecordBatchReader.from_stream(ds).read_all()
 
     """
 
@@ -91,11 +100,108 @@ class StreamCache:
         self,
         reader: Any,
         memory_capacity: int | None = None,
-        disk_path: str | None = None,
+        disk_path: str | Path | None = None,
         disk_capacity: int | None = None,
     ):
         """See class docstring for parameter documentation."""
-        self._impl = _PyStreamCache(reader, memory_capacity, disk_path, disk_capacity)
+        self._impl = _PyStreamCache(
+            reader,
+            memory_capacity,
+            str(disk_path) if disk_path is not None else None,
+            disk_capacity,
+        )
+
+    # ── named constructors ────────────────────────────────────────────────────
+
+    @classmethod
+    def in_memory(cls, reader: Any, capacity: int | None = None) -> StreamCache:
+        """
+        Create a memory-only :class:`StreamCache`.
+
+        Batches are stored as reference-counted pointers; reads are zero-copy.
+
+        Parameters
+        ----------
+        reader : ArrowStreamExportable
+            Any object implementing ``__arrow_c_stream__``.
+        capacity : int, optional
+            Memory budget in bytes.  Defaults to a fraction of system RAM.
+
+        Returns
+        -------
+        StreamCache
+
+        Examples
+        --------
+        >>> import pyarrow as pa
+        >>> from batchcorder import StreamCache
+        >>> table = pa.table({"x": [1, 2, 3]})
+        >>> ds = StreamCache.in_memory(table)
+        >>> ds.ingest_all()
+        1
+
+        """
+        return cls(reader, memory_capacity=capacity)
+
+    @classmethod
+    def on_disk(
+        cls,
+        reader: Any,
+        path: str | Path,
+        disk_capacity: int,
+        memory_capacity: int | None = None,
+    ) -> StreamCache:
+        """
+        Create a disk-backed :class:`StreamCache` with an optional hot layer.
+
+        Batches are serialised to an append-only Arrow IPC file under *path*.
+        Recently ingested batches are kept in a configurable hot layer in RAM
+        to reduce disk reads.
+
+        Parameters
+        ----------
+        reader : ArrowStreamExportable
+            Any object implementing ``__arrow_c_stream__``.
+        path : str or Path
+            Directory for the on-disk IPC file.  Created on first use.
+        disk_capacity : int
+            On-disk storage budget in bytes.
+        memory_capacity : int, optional
+            Hot-layer budget in bytes.  Defaults to a fraction of system RAM.
+
+        Returns
+        -------
+        StreamCache
+
+        Examples
+        --------
+        >>> import tempfile, pyarrow as pa
+        >>> from batchcorder import StreamCache
+        >>> table = pa.table({"x": [1, 2, 3]})
+        >>> tmp = tempfile.mkdtemp()
+        >>> ds = StreamCache.on_disk(table, path=tmp, disk_capacity=64 << 20)
+        >>> ds.ingest_all()
+        1
+
+        """
+        return cls(
+            reader,
+            memory_capacity=memory_capacity,
+            disk_path=path,
+            disk_capacity=disk_capacity,
+        )
+
+    # ── context manager ───────────────────────────────────────────────────────
+
+    def __enter__(self) -> Self:
+        """Enter the context manager, returning self."""
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        """Exit the context manager, closing the cache."""
+        self.close()
+
+    # ── properties ────────────────────────────────────────────────────────────
 
     @property
     def schema(self) -> Any:
@@ -112,7 +218,7 @@ class StreamCache:
         >>> from batchcorder import StreamCache
         >>> table = pa.table({"id": [1, 2], "val": [0.5, 1.0]})
         >>> tmp = tempfile.mkdtemp()
-        >>> ds = StreamCache(table, 16 << 20, tmp, 64 << 20)
+        >>> ds = StreamCache.on_disk(table, tmp, 64 << 20)
         >>> [f.name for f in ds.schema]
         ['id', 'val']
 
@@ -136,7 +242,7 @@ class StreamCache:
         >>> from batchcorder import StreamCache
         >>> table = pa.table({"x": [1, 2, 3]})
         >>> tmp = tempfile.mkdtemp()
-        >>> ds = StreamCache(table, 16 << 20, tmp, 64 << 20)
+        >>> ds = StreamCache.on_disk(table, tmp, 64 << 20)
         >>> ds.ingested_count
         0
         >>> ds.ingest_all()
@@ -162,7 +268,7 @@ class StreamCache:
         >>> from batchcorder import StreamCache
         >>> table = pa.table({"x": [1, 2, 3]})
         >>> tmp = tempfile.mkdtemp()
-        >>> ds = StreamCache(table, 16 << 20, tmp, 64 << 20)
+        >>> ds = StreamCache.on_disk(table, tmp, 64 << 20)
         >>> ds.upstream_exhausted
         False
         >>> ds.ingest_all()
@@ -173,35 +279,35 @@ class StreamCache:
         """
         return self._impl.upstream_exhausted
 
-    def reader(self, from_start: bool = True) -> StreamCacheReader:
+    # ── dunder methods ────────────────────────────────────────────────────────
+
+    def __repr__(self) -> str:
+        """Return a string representation of the cache."""
+        return (
+            f"StreamCache("
+            f"ingested={self.ingested_count}, "
+            f"exhausted={self.upstream_exhausted}, "
+            f"schema={self.schema}"
+            f")"
+        )
+
+    def __len__(self) -> int:
         """
-        Return a new :class:`StreamCacheReader` handle.
+        Return the number of ingested batches.
 
-        Parameters
-        ----------
-        from_start : bool, optional
-            If ``True`` (default), the reader starts at batch 0 and replays the
-            full stream.  If ``False``, it starts at the current ingestion
-            frontier and yields only batches ingested after this call.
-
-        Returns
-        -------
-        StreamCacheReader
-
-        Examples
-        --------
-        >>> import tempfile, pyarrow as pa
-        >>> from batchcorder import StreamCache
-        >>> table = pa.table({"x": [1, 2, 3]})
-        >>> tmp = tempfile.mkdtemp()
-        >>> ds = StreamCache(table, 16 << 20, tmp, 64 << 20)
-        >>> r1 = ds.reader()
-        >>> r2 = ds.reader()
-        >>> r1.closed, r2.closed
-        (False, False)
+        Raises
+        ------
+        TypeError
+            If the upstream source has not been fully consumed yet.  Call
+            :meth:`ingest_all` first, or check :attr:`upstream_exhausted`.
 
         """
-        return StreamCacheReader(self._impl.reader(from_start))
+        if not self.upstream_exhausted:
+            raise TypeError(
+                "len() is not available until the stream is fully ingested; "
+                "call ingest_all() first or check upstream_exhausted"
+            )
+        return self.ingested_count
 
     def __iter__(self) -> StreamCacheReader:
         """
@@ -250,6 +356,38 @@ class StreamCache:
         """
         return self._impl.__arrow_c_schema__()
 
+    # ── methods ───────────────────────────────────────────────────────────────
+
+    def reader(self, from_start: bool = True) -> StreamCacheReader:
+        """
+        Return a new :class:`StreamCacheReader` handle.
+
+        Parameters
+        ----------
+        from_start : bool, optional
+            If ``True`` (default), the reader starts at batch 0 and replays the
+            full stream.  If ``False``, it starts at the current ingestion
+            frontier and yields only batches ingested after this call.
+
+        Returns
+        -------
+        StreamCacheReader
+
+        Examples
+        --------
+        >>> import tempfile, pyarrow as pa
+        >>> from batchcorder import StreamCache
+        >>> table = pa.table({"x": [1, 2, 3]})
+        >>> tmp = tempfile.mkdtemp()
+        >>> ds = StreamCache.on_disk(table, tmp, 64 << 20)
+        >>> r1 = ds.reader()
+        >>> r2 = ds.reader()
+        >>> r1.closed, r2.closed
+        (False, False)
+
+        """
+        return StreamCacheReader(self._impl.reader(from_start))
+
     def cast(self, target_schema: Any) -> CastingStreamCache:
         """
         Cast the dataset to produce batches with the given schema.
@@ -261,7 +399,7 @@ class StreamCache:
 
         Parameters
         ----------
-        target_schema : object
+        target_schema : ArrowSchemaExportable
             Any Arrow schema-compatible object (e.g. :class:`pyarrow.Schema`,
             :class:`arro3.core.Schema`).
 
@@ -291,7 +429,7 @@ class StreamCache:
         >>> from batchcorder import StreamCache
         >>> table = pa.table({"x": [1, 2, 3]})
         >>> tmp = tempfile.mkdtemp()
-        >>> ds = StreamCache(table, 16 << 20, tmp, 64 << 20)
+        >>> ds = StreamCache.on_disk(table, tmp, 64 << 20)
         >>> ds.ingest_all()
         1
         >>> ds.upstream_exhausted
@@ -317,7 +455,7 @@ class StreamCache:
         >>> from batchcorder import StreamCache
         >>> table = pa.table({"x": [1, 2, 3]})
         >>> tmp = tempfile.mkdtemp()
-        >>> ds = StreamCache(table, 16 << 20, tmp, 64 << 20)
+        >>> ds = StreamCache.on_disk(table, tmp, 64 << 20)
         >>> ds.close()
 
         """
@@ -345,6 +483,18 @@ class StreamCacheReader:
     def __init__(self, impl: _PyStreamCacheReader):
         """Obtain via :meth:`StreamCache.reader`."""
         self._impl = impl
+
+    # ── context manager ───────────────────────────────────────────────────────
+
+    def __enter__(self) -> Self:
+        """Enter the context manager, returning self."""
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        """Exit the context manager; reader is consumed by iteration."""
+        pass
+
+    # ── properties ────────────────────────────────────────────────────────────
 
     @property
     def schema(self) -> Any:
@@ -374,6 +524,20 @@ class StreamCacheReader:
 
         """
         return self._impl.closed
+
+    # ── dunder methods ────────────────────────────────────────────────────────
+
+    def __repr__(self) -> str:
+        """Return a string representation of the reader."""
+        return f"StreamCacheReader(closed={self.closed}, schema={self._impl.schema})"
+
+    def __iter__(self) -> StreamCacheReader:
+        """Return self as the iterator."""
+        return self
+
+    def __next__(self) -> Any:
+        """Get the next batch from the reader."""
+        return next(self._impl)
 
     def __arrow_c_stream__(self, requested_schema: Any = None) -> Any:
         """
@@ -416,9 +580,7 @@ class StreamCacheReader:
         """
         return self._impl.__arrow_c_schema__()
 
-    def __iter__(self) -> StreamCacheReader:
-        """Return self as the iterator."""
-        return self
+    # ── methods ───────────────────────────────────────────────────────────────
 
     def cast(self, target_schema: Any) -> Any:
         """
@@ -430,7 +592,7 @@ class StreamCacheReader:
 
         Parameters
         ----------
-        target_schema : object
+        target_schema : ArrowSchemaExportable
             Any Arrow schema-compatible object (e.g. :class:`pyarrow.Schema`,
             :class:`arro3.core.Schema`).
 
@@ -445,10 +607,6 @@ class StreamCacheReader:
 
         """
         return self._impl.cast(target_schema)
-
-    def __next__(self) -> Any:
-        """Get the next batch from the reader."""
-        return next(iter(self._impl))
 
 
 class CastingStreamCache:
@@ -470,6 +628,8 @@ class CastingStreamCache:
         """Obtain via :meth:`StreamCache.cast`."""
         self._impl = impl
 
+    # ── properties ────────────────────────────────────────────────────────────
+
     @property
     def schema(self) -> Any:
         """
@@ -481,6 +641,12 @@ class CastingStreamCache:
 
         """
         return self._impl.schema
+
+    # ── dunder methods ────────────────────────────────────────────────────────
+
+    def __repr__(self) -> str:
+        """Return a string representation of the casting cache."""
+        return f"CastingStreamCache(schema={self.schema})"
 
     def __arrow_c_stream__(self, requested_schema: Any = None) -> Any:
         """
@@ -507,13 +673,15 @@ class CastingStreamCache:
         """
         return self._impl.__arrow_c_schema__()
 
+    # ── methods ───────────────────────────────────────────────────────────────
+
     def cast(self, target_schema: Any) -> CastingStreamCache:
         """
         Cast to a further target schema, returning a new :class:`CastingStreamCache`.
 
         Parameters
         ----------
-        target_schema : object
+        target_schema : ArrowSchemaExportable
             Any Arrow schema-compatible object.
 
         Returns

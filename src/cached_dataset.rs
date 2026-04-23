@@ -532,7 +532,7 @@ impl PyStreamCacheReader {
     fn cast<'py>(
         &self,
         py: Python<'py>,
-        #[gen_stub(override_type(type_repr = "typing.Any", imports = ("typing",)))]
+        #[gen_stub(override_type(type_repr = "arro3.core.types.ArrowSchemaExportable", imports = ("arro3.core.types",)))]
         target_schema: Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let impl_ = self
@@ -635,7 +635,7 @@ impl PyCastingStreamCache {
     #[gen_stub(override_return_type(type_repr = "CastingStreamCache", imports = ()))]
     pub fn cast(
         &self,
-        #[gen_stub(override_type(type_repr = "typing.Any", imports = ("typing",)))]
+        #[gen_stub(override_type(type_repr = "arro3.core.types.ArrowSchemaExportable", imports = ("arro3.core.types",)))]
         target_schema: PySchema,
     ) -> PyResult<PyCastingStreamCache> {
         Ok(PyCastingStreamCache {
@@ -675,7 +675,7 @@ impl PyStreamCache {
     #[pyo3(signature = (reader, memory_capacity = None, disk_path = None, disk_capacity = None))]
     pub fn new(
         py: Python<'_>,
-        #[gen_stub(override_type(type_repr = "typing.Any", imports = ("typing",)))]
+        #[gen_stub(override_type(type_repr = "arro3.core.types.ArrowStreamExportable", imports = ("arro3.core.types",)))]
         reader: PyRecordBatchReader,
         memory_capacity: Option<usize>,
         disk_path: Option<String>,
@@ -819,7 +819,7 @@ impl PyStreamCache {
 
     pub fn cast(
         &self,
-        #[gen_stub(override_type(type_repr = "typing.Any", imports = ("typing",)))]
+        #[gen_stub(override_type(type_repr = "arro3.core.types.ArrowSchemaExportable", imports = ("arro3.core.types",)))]
         target_schema: PySchema,
     ) -> PyResult<PyCastingStreamCache> {
         Ok(PyCastingStreamCache {
