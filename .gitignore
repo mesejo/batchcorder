@@ -95,3 +95,8 @@ drafts
 coverage.lcov
 
 .claude
+
+# roborev snapshots
+/.roborev/
+
+.roborev.toml
