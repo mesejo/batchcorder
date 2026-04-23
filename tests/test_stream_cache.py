@@ -1,4 +1,5 @@
 import threading
+from pathlib import Path
 
 import pyarrow as pa
 import pytest
@@ -712,3 +713,202 @@ def test_disk_params_must_both_be_provided_or_omitted():
         StreamCache(table, memory_capacity=16 << 20, disk_path="/tmp")
     with pytest.raises(ValueError, match="disk_path and disk_capacity"):
         StreamCache(table, memory_capacity=16 << 20, disk_capacity=64 << 20)
+
+
+# ── named constructors ────────────────────────────────────────────────────────
+
+
+def test_in_memory_constructor_returns_stream_cache():
+    table = _make_table()
+    ds = StreamCache.in_memory(table)
+    assert isinstance(ds, StreamCache)
+
+
+def test_in_memory_constructor_returns_correct_data():
+    table = _make_table(n_batches=4, rows_per_batch=3)
+    ds = StreamCache.in_memory(table)
+    result = pa.RecordBatchReader.from_stream(ds).read_all()
+    assert result.equals(table)
+
+
+def test_in_memory_constructor_with_capacity():
+    table = _make_table()
+    ds = StreamCache.in_memory(table, capacity=64 << 20)
+    result = pa.RecordBatchReader.from_stream(ds).read_all()
+    assert result.equals(table)
+
+
+def test_in_memory_constructor_no_capacity_uses_defaults():
+    table = _make_table(n_batches=2, rows_per_batch=3)
+    ds = StreamCache.in_memory(table.to_reader(max_chunksize=3))
+    assert ds.ingest_all() == 2
+    assert ds.upstream_exhausted
+
+
+def test_on_disk_constructor_returns_stream_cache(tmp_path):
+    table = _make_table()
+    ds = StreamCache.on_disk(table, path=tmp_path, disk_capacity=64 << 20)
+    assert isinstance(ds, StreamCache)
+
+
+def test_on_disk_constructor_returns_correct_data(tmp_path):
+    table = _make_table(n_batches=4, rows_per_batch=3)
+    ds = StreamCache.on_disk(table, path=tmp_path, disk_capacity=64 << 20)
+    result = pa.RecordBatchReader.from_stream(ds).read_all()
+    assert result.equals(table)
+
+
+def test_on_disk_constructor_with_memory_capacity(tmp_path):
+    table = _make_table()
+    ds = StreamCache.on_disk(
+        table, path=tmp_path, disk_capacity=64 << 20, memory_capacity=16 << 20
+    )
+    result = pa.RecordBatchReader.from_stream(ds).read_all()
+    assert result.equals(table)
+
+
+def test_on_disk_constructor_str_path(tmp_path):
+    table = _make_table()
+    ds = StreamCache.on_disk(table, path=str(tmp_path), disk_capacity=64 << 20)
+    result = pa.RecordBatchReader.from_stream(ds).read_all()
+    assert result.equals(table)
+
+
+def test_on_disk_constructor_path_object(tmp_path):
+    table = _make_table()
+    ds = StreamCache.on_disk(table, path=Path(tmp_path), disk_capacity=64 << 20)
+    result = pa.RecordBatchReader.from_stream(ds).read_all()
+    assert result.equals(table)
+
+
+def test_disk_path_accepts_path_object(tmp_path):
+    """StreamCache.__init__ accepts pathlib.Path for disk_path."""
+    table = _make_table()
+    ds = StreamCache(table, disk_path=Path(tmp_path), disk_capacity=64 << 20)
+    result = pa.RecordBatchReader.from_stream(ds).read_all()
+    assert result.equals(table)
+
+
+# ── context managers ──────────────────────────────────────────────────────────
+
+
+def test_stream_cache_context_manager_returns_self(tmp_path):
+    table = _make_table()
+    ds = StreamCache.on_disk(table, path=tmp_path, disk_capacity=64 << 20)
+    with ds as entered:
+        assert entered is ds
+
+
+def test_stream_cache_context_manager_calls_close(tmp_path):
+    table = _make_table()
+    with StreamCache.on_disk(table, path=tmp_path, disk_capacity=64 << 20) as ds:
+        ds.ingest_all()
+    # after exit, further ingest should raise
+    with pytest.raises(ValueError, match="closed"):
+        ds.ingest_all()
+
+
+def test_stream_cache_in_memory_context_manager():
+    table = _make_table()
+    with StreamCache.in_memory(table) as ds:
+        result = pa.RecordBatchReader.from_stream(ds).read_all()
+    assert result.equals(table)
+
+
+def test_stream_cache_reader_context_manager_returns_self(tmp_path):
+    table = _make_table()
+    ds = StreamCache.on_disk(table, path=tmp_path, disk_capacity=64 << 20)
+    ds.ingest_all()
+    reader = ds.reader()
+    with reader as entered:
+        assert entered is reader
+
+
+def test_stream_cache_reader_context_manager_iterates(tmp_path):
+    table = _make_table(n_batches=3, rows_per_batch=3)
+    ds = StreamCache.on_disk(
+        table.to_reader(max_chunksize=3), path=tmp_path, disk_capacity=64 << 20
+    )
+    ds.ingest_all()
+    with ds.reader() as reader:
+        batches = list(reader)
+    assert len(batches) == 3
+
+
+# ── __repr__ ──────────────────────────────────────────────────────────────────
+
+
+def test_stream_cache_repr_contains_key_fields(tmp_path):
+    table = _make_table()
+    ds = StreamCache.on_disk(table, path=tmp_path, disk_capacity=64 << 20)
+    r = repr(ds)
+    assert "StreamCache" in r
+    assert "ingested=" in r
+    assert "exhausted=" in r
+    assert "schema=" in r
+
+
+def test_stream_cache_repr_reflects_state(tmp_path):
+    table = _make_table(n_batches=2, rows_per_batch=3)
+    ds = StreamCache.on_disk(
+        table.to_reader(max_chunksize=3), path=tmp_path, disk_capacity=64 << 20
+    )
+    assert "exhausted=False" in repr(ds)
+    ds.ingest_all()
+    assert "exhausted=True" in repr(ds)
+    assert "ingested=2" in repr(ds)
+
+
+def test_stream_cache_reader_repr_contains_key_fields(tmp_path):
+    table = _make_table()
+    ds = StreamCache.on_disk(table, path=tmp_path, disk_capacity=64 << 20)
+    reader = ds.reader()
+    r = repr(reader)
+    assert "StreamCacheReader" in r
+    assert "closed=" in r
+    assert "schema=" in r
+
+
+def test_casting_stream_cache_repr_contains_key_fields(tmp_path):
+    table = _make_table()
+    ds = StreamCache.on_disk(table, path=tmp_path, disk_capacity=64 << 20)
+    ds.ingest_all()
+    casting = ds.cast(ds.schema)
+    r = repr(casting)
+    assert "CastingStreamCache" in r
+    assert "schema=" in r
+
+
+# ── __len__ ───────────────────────────────────────────────────────────────────
+
+
+def test_len_raises_before_fully_ingested(tmp_path):
+    table = _make_table()
+    ds = StreamCache.on_disk(table, path=tmp_path, disk_capacity=64 << 20)
+    with pytest.raises(TypeError, match="ingest_all"):
+        len(ds)
+
+
+def test_len_returns_batch_count_after_ingest_all(tmp_path):
+    table = _make_table(n_batches=4, rows_per_batch=3)
+    ds = StreamCache.on_disk(
+        table.to_reader(max_chunksize=3), path=tmp_path, disk_capacity=64 << 20
+    )
+    ds.ingest_all()
+    assert len(ds) == 4
+
+
+def test_len_memory_only_after_ingest_all():
+    table = _make_table(n_batches=3, rows_per_batch=3)
+    ds = StreamCache.in_memory(table.to_reader(max_chunksize=3))
+    ds.ingest_all()
+    assert len(ds) == 3
+
+
+def test_len_matches_ingested_count(tmp_path):
+    table = _make_table(n_batches=5, rows_per_batch=2)
+    ds = StreamCache.on_disk(
+        table.to_reader(max_chunksize=2), path=tmp_path, disk_capacity=64 << 20
+    )
+    ds.ingest_all()
+    assert len(ds) == ds.ingested_count
