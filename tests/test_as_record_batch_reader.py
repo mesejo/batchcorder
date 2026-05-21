@@ -1,13 +1,10 @@
 """Tests verifying that StreamCache and StreamCacheReader behave as
-well-behaved Arrow stream sources — compatible with PyArrow, arro3, IPC
+well-behaved Arrow stream sources — compatible with PyArrow, IPC
 serialisation, and the full Arrow PyCapsule protocol.
-
-Inspired by /home/daniel/PycharmProjects/arro3/tests/core/.
 """
 
 import io
 
-import arro3.core as ac
 import pyarrow as pa
 
 from batchcorder import StreamCache
@@ -69,6 +66,16 @@ def test_batch_iteration_yields_correct_batches(tmp_path):
     batches = list(pa_reader)
     assert sum(b.num_rows for b in batches) == TABLE.num_rows
     assert pa.Table.from_batches(batches).equals(TABLE)
+
+
+def test_schema_and_next_return_pyarrow_types(tmp_path):
+    """`.schema` returns `pa.Schema`; `__next__` returns `pa.RecordBatch`."""
+    ds = _ds(tmp_path, TABLE)
+    reader = ds.reader()
+
+    assert isinstance(ds.schema, pa.Schema)
+    assert isinstance(reader.schema, pa.Schema)
+    assert isinstance(next(iter(reader)), pa.RecordBatch)
 
 
 # ── schema metadata preservation ─────────────────────────────────────────────
@@ -150,30 +157,3 @@ def test_ipc_stream_round_trip_reader(tmp_path):
             writer.write_batch(batch)
     buf.seek(0)
     assert pa.ipc.open_stream(buf).read_all().equals(TABLE)
-
-
-# ── arro3 interop ─────────────────────────────────────────────────────────────
-
-
-def test_arro3_from_stream_dataset(tmp_path):
-    """`arro3.core.RecordBatchReader.from_stream` accepts StreamCache."""
-    arro3_reader = ac.RecordBatchReader.from_stream(_ds(tmp_path, TABLE))
-    assert pa.table(arro3_reader).equals(TABLE)
-
-
-def test_arro3_from_stream_reader(tmp_path):
-    """`arro3.core.RecordBatchReader.from_stream` accepts StreamCacheReader."""
-    arro3_reader = ac.RecordBatchReader.from_stream(_ds(tmp_path, TABLE).reader())
-    assert pa.table(arro3_reader).equals(TABLE)
-
-
-def test_arro3_schema_metadata_preserved(tmp_path):
-    """arro3 preserves schema metadata when consuming a StreamCache."""
-    metadata = {b"hello": b"world"}
-    table = TABLE.replace_schema_metadata(metadata)
-
-    arro3_reader = ac.RecordBatchReader.from_stream(_ds(tmp_path, table))
-    assert (
-        pa.RecordBatchReader.from_stream(arro3_reader).read_all().schema.metadata
-        == metadata
-    )

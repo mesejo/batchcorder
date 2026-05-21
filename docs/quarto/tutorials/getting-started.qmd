@@ -34,7 +34,7 @@ print(batchcorder.__version__)
 ## Step 2 — Wrap a PyArrow table in a StreamCache
 
 Any object that implements `__arrow_c_stream__` can be wrapped — a
-`pyarrow.Table`, a `pyarrow.RecordBatchReader`, an `arro3.core.RecordBatchReader`, etc.
+`pyarrow.Table`, a `pyarrow.RecordBatchReader`, etc.
 
 ```{python}
 import tempfile

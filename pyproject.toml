@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "batchcorder"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 description = "A Rust-backed Python library for caching Arrow record-batch streams so they can be replayed multiple times"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -14,6 +14,7 @@ classifiers = [
   "Programming Language :: Python :: Implementation :: CPython",
   "Programming Language :: Python :: Implementation :: PyPy",
   "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
@@ -22,7 +23,7 @@ classifiers = [
   "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dynamic = ["version"]
-dependencies = ["arro3-core>=0.4.0"]
+dependencies = ["pyarrow>=18"]
 
 [project.urls]
 Homepage = "https://github.com/mesejo/batchcorder"
@@ -37,7 +38,7 @@ module-name = "batchcorder._batchcorder"
 [dependency-groups]
 dev = [
   "maturin>=1.7,<2.0",
-  "pyarrow>=14",
+  "pyarrow>=18",
   "pytest>=8",
   "duckdb>=1.5",
   "ruff>=0.15.6",
@@ -52,12 +53,12 @@ dev = [
 ]
 docs = [
   "jupyter>=1.1.1",
-  "myst-parser>=5.0.0",
+  "myst-parser>=5.0.0; python_version >= '3.11'",
   "nbformat>=5.10.4",
-  "pandas>=3.0.1",
-  "sphinx>=9.0.4",
+  "pandas>=2.3.3",
+  "sphinx>=9.0.4; python_version >= '3.12'",
   "sphinx-autoapi>=3.8.0",
-  "sphinx-autodoc-typehints>=3.6.1",
+  "sphinx-autodoc-typehints>=3.6.1; python_version >= '3.12'",
   "sphinx-immaterial>=0.13.9",
 ]
 
@@ -101,6 +102,12 @@ section-order = [
   "local-folder",
 ]
 lines-after-imports = 2
+
+[tool.mypy]
+
+[[tool.mypy.overrides]]
+module = ["pyarrow", "pyarrow.*"]
+ignore_missing_imports = true
 
 [tool.coverage.run]
 source = ["batchcorder"]

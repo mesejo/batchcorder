@@ -35,7 +35,7 @@ sequence. Obtain one via `StreamCache.reader()` — do not construct directly.
 | Method / property        | Description |
 |--------------------------|-------------|
 | `__iter__()`             | Return `self` (readers are their own iterators). |
-| `__next__()`             | Return the next `arro3.core.RecordBatch`. |
+| `__next__()`             | Return the next `pyarrow.RecordBatch`. |
 | `schema`                 | Arrow schema of batches produced by this reader. |
 | `closed`                 | `True` if the reader has been consumed. |
 | `__arrow_c_stream__()`   | Consume the reader (for PyCapsule consumers). |

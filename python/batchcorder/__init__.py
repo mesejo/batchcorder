@@ -52,8 +52,7 @@ class StreamCache:
     ----------
     reader : object
         Any object implementing ``__arrow_c_stream__`` (e.g.
-        :class:`pyarrow.Table`, :class:`pyarrow.RecordBatchReader`,
-        :class:`arro3.core.RecordBatchReader`).
+        :class:`pyarrow.Table`, :class:`pyarrow.RecordBatchReader`).
     memory_capacity : int, optional
         Hot-layer budget in bytes for disk mode.  Defaults to total physical
         RAM.  Ignored in memory-only mode.
@@ -104,7 +103,7 @@ class StreamCache:
 
         Returns
         -------
-        arro3.core.Schema
+        pyarrow.Schema
 
         Examples
         --------
@@ -263,7 +262,7 @@ class StreamCache:
         ----------
         target_schema : object
             Any Arrow schema-compatible object (e.g. :class:`pyarrow.Schema`,
-            :class:`arro3.core.Schema`).
+            :class:`pyarrow.Schema`).
 
         Returns
         -------
@@ -353,7 +352,7 @@ class StreamCacheReader:
 
         Returns
         -------
-        arro3.core.Schema
+        pyarrow.Schema
 
         Raises
         ------
@@ -432,7 +431,7 @@ class StreamCacheReader:
         ----------
         target_schema : object
             Any Arrow schema-compatible object (e.g. :class:`pyarrow.Schema`,
-            :class:`arro3.core.Schema`).
+            :class:`pyarrow.Schema`).
 
         Returns
         -------
@@ -477,7 +476,7 @@ class CastingStreamCache:
 
         Returns
         -------
-        arro3.core.Schema
+        pyarrow.Schema
 
         """
         return self._impl.schema
