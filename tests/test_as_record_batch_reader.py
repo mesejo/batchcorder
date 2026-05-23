@@ -75,6 +75,7 @@ def test_schema_and_next_return_pyarrow_types(tmp_path):
 
     assert isinstance(ds.schema, pa.Schema)
     assert isinstance(reader.schema, pa.Schema)
+    assert isinstance(ds.cast(ds.schema).schema, pa.Schema)
     assert isinstance(next(iter(reader)), pa.RecordBatch)
 
 
