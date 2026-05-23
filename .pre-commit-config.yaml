@@ -110,7 +110,7 @@ repos:
       - id: mypy-stubtest
         name: mypy stubtest
         description: Validate _batchcorder.pyi matches the compiled extension at runtime.
-        entry: .venv/bin/python -m mypy.stubtest batchcorder._batchcorder
+        entry: .venv/bin/python -m mypy.stubtest --mypy-config-file pyproject.toml batchcorder._batchcorder
         language: system
         pass_filenames: false
         types_or: [python, pyi]

@@ -33,16 +33,16 @@ fn total_system_memory() -> usize {
     sys.total_memory() as usize
 }
 
-use arrow_array::{Array, ArrayRef, RecordBatch, StructArray};
-use arrow_schema::{ArrowError, Field, SchemaRef};
-use pyo3::exceptions::{PyIOError, PyMemoryError, PyRuntimeError, PyValueError};
+use arrow_array::RecordBatch;
+use arrow_array::ffi::FFI_ArrowSchema;
+use arrow_array::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
+use arrow_pyarrow::{IntoPyArrow, PyArrowType};
+use arrow_schema::{ArrowError, Schema, SchemaRef};
+use pyo3::exceptions::{PyIOError, PyMemoryError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyCapsule;
-use pyo3_arrow::error::{PyArrowError, PyArrowResult};
-use pyo3_arrow::export::{Arro3RecordBatch, Arro3Schema};
-use pyo3_arrow::ffi::{ArrayIterator, to_schema_pycapsule, to_stream_pycapsule};
-use pyo3_arrow::{PyRecordBatchReader, PySchema};
 use pyo3_stub_gen::derive::*;
+use std::ffi::CString;
 
 // ── dataset counter ───────────────────────────────────────────────────────────
 
@@ -281,14 +281,22 @@ fn arrow_to_boundary(e: ArrowError) -> BoundaryError {
     }
 }
 
-/// Convert an [`ArrowError`] into the right [`PyArrowError`] variant so
-/// iterator callers receive a meaningful Python exception type.
-fn arrow_to_pyarrow_error(e: ArrowError) -> PyArrowError {
+/// Convert an [`ArrowError`] into the appropriate Python exception.
+fn arrow_to_py_err(e: ArrowError) -> PyErr {
     match e {
-        ArrowError::MemoryError(msg) => PyArrowError::PyErr(PyMemoryError::new_err(msg)),
-        ArrowError::InvalidArgumentError(msg) => PyArrowError::PyErr(PyValueError::new_err(msg)),
-        _ => PyArrowError::ArrowError(e),
+        ArrowError::MemoryError(msg) => PyMemoryError::new_err(msg),
+        ArrowError::InvalidArgumentError(msg) => PyValueError::new_err(msg),
+        _ => arrow_pyarrow::PyArrowException::new_err(e.to_string()),
     }
+}
+
+/// Export `schema` as an `"arrow_schema"` [`PyCapsule`] via Arrow FFI —
+/// no pyarrow Python object is allocated.
+fn to_schema_pycapsule<'py>(py: Python<'py>, schema: &Schema) -> PyResult<Bound<'py, PyCapsule>> {
+    let ffi_schema =
+        FFI_ArrowSchema::try_from(schema).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let name = CString::new("arrow_schema").map_err(|e| PyValueError::new_err(e.to_string()))?;
+    PyCapsule::new(py, ffi_schema, Some(name))
 }
 
 // ── IPC serialization ────────────────────────────────────────────────────────
@@ -465,20 +473,30 @@ impl PyStreamCacheReader {
     fn to_stream_pycapsule<'py>(
         py: Python<'py>,
         reader: StreamCacheReaderImpl,
-        requested_schema: Option<Bound<'py, PyCapsule>>,
-    ) -> PyArrowResult<Bound<'py, PyCapsule>> {
-        let schema = reader.schema.clone();
-        let array_iter = reader.map(|maybe_batch| {
-            let arr: ArrayRef = Arc::new(StructArray::from(maybe_batch?));
-            Ok(arr)
-        });
-        let array_reader = Box::new(ArrayIterator::new(
-            array_iter,
-            Field::new_struct("", schema.fields().clone(), false)
-                .with_metadata(schema.metadata.clone())
-                .into(),
-        ));
-        to_stream_pycapsule(py, array_reader, requested_schema)
+        requested_schema: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyCapsule>> {
+        let boxed: Box<dyn arrow_array::RecordBatchReader + Send> = Box::new(reader);
+        match requested_schema {
+            None => {
+                // Fast path: export directly via Arrow C Stream FFI, no Python allocation.
+                let ffi_stream = FFI_ArrowArrayStream::new(boxed);
+                let name = CString::new("arrow_array_stream")
+                    .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                PyCapsule::new(py, ffi_stream, Some(name))
+            }
+            Some(schema) => {
+                // Schema-casting path: let pyarrow handle the requested_schema negotiation.
+                let py_reader = boxed.into_pyarrow(py)?;
+                py_reader
+                    .call_method1("__arrow_c_stream__", (schema,))?
+                    .cast_into::<PyCapsule>()
+                    .map_err(|_| {
+                        PyTypeError::new_err(
+                            "pyarrow __arrow_c_stream__ did not return a PyCapsule",
+                        )
+                    })
+            }
+        }
     }
 }
 
@@ -492,31 +510,33 @@ impl PyStreamCacheReader {
         py: Python<'py>,
         #[gen_stub(override_type(type_repr = "typing.Any", imports = ("typing",)))]
         requested_schema: Option<Bound<'py, PyCapsule>>,
-    ) -> PyArrowResult<Bound<'py, PyCapsule>> {
-        let reader =
-            self.0.lock().unwrap().take().ok_or_else(|| {
-                PyArrowError::PyErr(PyValueError::new_err("Reader already consumed"))
-            })?;
-        Self::to_stream_pycapsule(py, reader, requested_schema)
+    ) -> PyResult<Bound<'py, PyCapsule>> {
+        let reader = self
+            .0
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or_else(|| PyValueError::new_err("Reader already consumed"))?;
+        Self::to_stream_pycapsule(py, reader, requested_schema.map(|c| c.into_any()))
     }
 
     #[gen_stub(override_return_type(type_repr = "typing.Any", imports = ("typing",)))]
-    fn __arrow_c_schema__<'py>(&self, py: Python<'py>) -> PyArrowResult<Bound<'py, PyCapsule>> {
-        let inner = self.0.lock().unwrap();
-        let reader = inner
-            .as_ref()
-            .ok_or_else(|| PyArrowError::PyErr(PyValueError::new_err("Reader already consumed")))?;
-        to_schema_pycapsule(py, reader.schema.as_ref())
-    }
-
-    #[gen_stub(override_return_type(type_repr = "arro3.core.Schema", imports = ("arro3.core",)))]
-    #[getter]
-    fn schema(&self) -> PyResult<Arro3Schema> {
+    fn __arrow_c_schema__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyCapsule>> {
         let inner = self.0.lock().unwrap();
         let reader = inner
             .as_ref()
             .ok_or_else(|| PyValueError::new_err("Reader already consumed"))?;
-        Ok(PySchema::new(reader.schema.clone()).into())
+        to_schema_pycapsule(py, reader.schema.as_ref())
+    }
+
+    #[gen_stub(override_return_type(type_repr = "pa.Schema", imports = ("pyarrow as pa",)))]
+    #[getter]
+    fn schema(&self) -> PyResult<PyArrowType<Schema>> {
+        let inner = self.0.lock().unwrap();
+        let reader = inner
+            .as_ref()
+            .ok_or_else(|| PyValueError::new_err("Reader already consumed"))?;
+        Ok(PyArrowType((*reader.schema).clone()))
     }
 
     #[getter]
@@ -551,22 +571,20 @@ impl PyStreamCacheReader {
             .call((py_reader,), Some(&kwargs))
     }
 
-    #[gen_stub(override_return_type(type_repr = "arro3.core.RecordBatch", imports = ("arro3.core",)))]
-    fn __next__(&self, py: Python<'_>) -> PyArrowResult<Option<Arro3RecordBatch>> {
+    #[gen_stub(override_return_type(type_repr = "pa.RecordBatch", imports = ("pyarrow as pa",)))]
+    fn __next__(&self, py: Python<'_>) -> PyResult<Option<PyArrowType<RecordBatch>>> {
         let mut guard = self.0.lock().unwrap();
         let impl_ = match guard.as_mut() {
             None => {
-                return Err(PyArrowError::PyErr(PyValueError::new_err(
-                    "Reader already consumed",
-                )));
+                return Err(PyValueError::new_err("Reader already consumed"));
             }
             Some(r) => r,
         };
         let result = without_gil(py, || impl_.next());
         match result {
             None => Ok(None),
-            Some(Err(e)) => Err(arrow_to_pyarrow_error(e)),
-            Some(Ok(batch)) => Ok(Some(Arro3RecordBatch::from(batch))),
+            Some(Err(e)) => Err(arrow_to_py_err(e)),
+            Some(Ok(batch)) => Ok(Some(PyArrowType(batch))),
         }
     }
 }
@@ -604,10 +622,10 @@ impl PyCastingStreamCache {
 #[gen_stub_pymethods]
 #[pymethods]
 impl PyCastingStreamCache {
-    #[gen_stub(override_return_type(type_repr = "arro3.core.Schema", imports = ("arro3.core",)))]
+    #[gen_stub(override_return_type(type_repr = "pa.Schema", imports = ("pyarrow as pa",)))]
     #[getter]
-    pub fn schema(&self) -> PyResult<Arro3Schema> {
-        Ok(PySchema::new(self.target_schema.clone()).into())
+    pub fn schema(&self) -> PyResult<PyArrowType<Schema>> {
+        Ok(PyArrowType((*self.target_schema).clone()))
     }
 
     #[pyo3(signature = (requested_schema = None))]
@@ -617,18 +635,18 @@ impl PyCastingStreamCache {
         py: Python<'py>,
         #[gen_stub(override_type(type_repr = "typing.Any", imports = ("typing",)))]
         requested_schema: Option<Bound<'py, PyCapsule>>,
-    ) -> PyArrowResult<Bound<'py, PyCapsule>> {
-        let impl_ = self.make_reader_impl(py).map_err(PyArrowError::PyErr)?;
-        let effective_schema = if requested_schema.is_some() {
-            requested_schema
+    ) -> PyResult<Bound<'py, PyCapsule>> {
+        let impl_ = self.make_reader_impl(py)?;
+        let effective_schema: Option<Bound<'py, PyAny>> = if requested_schema.is_some() {
+            requested_schema.map(|c| c.into_any())
         } else {
-            Some(to_schema_pycapsule(py, self.target_schema.as_ref())?)
+            Some(to_schema_pycapsule(py, self.target_schema.as_ref())?.into_any())
         };
         PyStreamCacheReader::to_stream_pycapsule(py, impl_, effective_schema)
     }
 
     #[gen_stub(override_return_type(type_repr = "typing.Any", imports = ("typing",)))]
-    pub fn __arrow_c_schema__<'py>(&self, py: Python<'py>) -> PyArrowResult<Bound<'py, PyCapsule>> {
+    pub fn __arrow_c_schema__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyCapsule>> {
         to_schema_pycapsule(py, self.target_schema.as_ref())
     }
 
@@ -636,12 +654,12 @@ impl PyCastingStreamCache {
     pub fn cast(
         &self,
         #[gen_stub(override_type(type_repr = "typing.Any", imports = ("typing",)))]
-        target_schema: PySchema,
+        target_schema: PyArrowType<Schema>,
     ) -> PyResult<PyCastingStreamCache> {
         Ok(PyCastingStreamCache {
             inner: self.inner.clone(),
             source_schema: self.source_schema.clone(),
-            target_schema: target_schema.into_inner(),
+            target_schema: Arc::new(target_schema.0),
         })
     }
 }
@@ -676,12 +694,12 @@ impl PyStreamCache {
     pub fn new(
         py: Python<'_>,
         #[gen_stub(override_type(type_repr = "typing.Any", imports = ("typing",)))]
-        reader: PyRecordBatchReader,
+        reader: PyArrowType<ArrowArrayStreamReader>,
         memory_capacity: Option<usize>,
         disk_path: Option<String>,
         disk_capacity: Option<u64>,
     ) -> PyResult<Self> {
-        let upstream = reader.into_reader()?;
+        let upstream: Box<dyn arrow_array::RecordBatchReader + Send> = Box::new(reader.0);
         let schema = upstream.schema();
 
         let cache = match (disk_path, disk_capacity) {
@@ -764,10 +782,10 @@ impl PyStreamCache {
         })
     }
 
-    #[gen_stub(override_return_type(type_repr = "arro3.core.Schema", imports = ("arro3.core",)))]
+    #[gen_stub(override_return_type(type_repr = "pa.Schema", imports = ("pyarrow as pa",)))]
     #[getter]
-    pub fn schema(&self) -> PyResult<Arro3Schema> {
-        Ok(PySchema::new(self.schema.clone()).into())
+    pub fn schema(&self) -> PyResult<PyArrowType<Schema>> {
+        Ok(PyArrowType((*self.schema).clone()))
     }
 
     #[pyo3(signature = (from_start = true))]
@@ -801,31 +819,31 @@ impl PyStreamCache {
         py: Python<'py>,
         #[gen_stub(override_type(type_repr = "typing.Any", imports = ("typing",)))]
         requested_schema: Option<Bound<'py, PyCapsule>>,
-    ) -> PyArrowResult<Bound<'py, PyCapsule>> {
-        let reader = self.reader(py, true).map_err(PyArrowError::PyErr)?;
+    ) -> PyResult<Bound<'py, PyCapsule>> {
+        let reader = self.reader(py, true)?;
         let impl_ = reader
             .0
             .lock()
             .unwrap()
             .take()
             .expect("freshly created reader cannot be closed");
-        PyStreamCacheReader::to_stream_pycapsule(py, impl_, requested_schema)
+        PyStreamCacheReader::to_stream_pycapsule(py, impl_, requested_schema.map(|c| c.into_any()))
     }
 
     #[gen_stub(override_return_type(type_repr = "typing.Any", imports = ("typing",)))]
-    pub fn __arrow_c_schema__<'py>(&self, py: Python<'py>) -> PyArrowResult<Bound<'py, PyCapsule>> {
+    pub fn __arrow_c_schema__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyCapsule>> {
         to_schema_pycapsule(py, self.schema.as_ref())
     }
 
     pub fn cast(
         &self,
         #[gen_stub(override_type(type_repr = "typing.Any", imports = ("typing",)))]
-        target_schema: PySchema,
+        target_schema: PyArrowType<Schema>,
     ) -> PyResult<PyCastingStreamCache> {
         Ok(PyCastingStreamCache {
             inner: self.inner.clone(),
             source_schema: self.schema.clone(),
-            target_schema: target_schema.into_inner(),
+            target_schema: Arc::new(target_schema.0),
         })
     }
 
