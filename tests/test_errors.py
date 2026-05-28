@@ -146,3 +146,92 @@ def test_upstream_error_has_readable_traceback(tmp_path):
     assert "upstream exploded" in text, (
         f"Original error message not in traceback:\n{text}"
     )
+
+
+# ── disk capacity enforcement (Gap 1) ─────────────────────────────────────────
+
+
+def _make_disk_cache(tmp_path, subdir, disk_capacity, memory_capacity=1):
+    """Helper: StreamCache forced to disk tier with controlled capacities."""
+    table = pa.table(
+        {
+            "id": list(range(200)),
+            "payload": pa.array([b"x" * 512] * 200, type=pa.large_binary()),
+        }
+    )
+    return StreamCache(
+        table.to_reader(max_chunksize=200),
+        memory_capacity=memory_capacity,
+        disk_path=str(tmp_path / subdir),
+        disk_capacity=disk_capacity,
+    )
+
+
+def test_disk_capacity_exceeded_raises_memory_error(tmp_path):
+    """disk_capacity smaller than one batch raises MemoryError on first ingest."""
+    ds = _make_disk_cache(tmp_path, "a", disk_capacity=10)
+    with pytest.raises(MemoryError, match="capacity") as exc_info:
+        ds.ingest_all()
+    _assert_readable_traceback(exc_info)
+
+
+def test_disk_capacity_error_message_contains_sizes(tmp_path):
+    """MemoryError message reports the capacity and bytes-written figures."""
+    ds = _make_disk_cache(tmp_path, "b", disk_capacity=10)
+    with pytest.raises(MemoryError) as exc_info:
+        ds.ingest_all()
+    msg = str(exc_info.value)
+    # Capacity value (10) and "0 bytes already written" must appear.
+    assert "10" in msg
+    assert "0" in msg
+
+
+def test_disk_capacity_ample_full_roundtrip(tmp_path):
+    """Ample disk_capacity: full ingest + replay returns identical data."""
+    table = pa.table({"x": list(range(300))})
+    ds = StreamCache(
+        table.to_reader(max_chunksize=100),
+        memory_capacity=1,
+        disk_path=str(tmp_path / "c"),
+        disk_capacity=64 * 1024 * 1024,
+    )
+    assert ds.ingest_all() == 3
+    result = pa.RecordBatchReader.from_stream(ds).read_all()
+    assert result.equals(table)
+
+
+def test_disk_capacity_exceeded_mid_stream(tmp_path):
+    """disk_capacity that fits some but not all batches errors mid-ingest;
+    already-ingested batches are still readable."""
+    # Ingest one batch into a large-capacity cache to measure its on-disk size.
+    probe = StreamCache(
+        pa.table(
+            {
+                "id": list(range(100)),
+                "payload": pa.array([b"y" * 512] * 100, type=pa.large_binary()),
+            }
+        ).to_reader(max_chunksize=100),
+        memory_capacity=1,
+        disk_path=str(tmp_path / "probe"),
+        disk_capacity=64 * 1024 * 1024,
+    )
+    probe.ingest_all()
+    cache_file = next((tmp_path / "probe").rglob("cache.arrow"))
+    one_batch_bytes = cache_file.stat().st_size
+
+    # Now use a capacity that fits exactly one batch.
+    table = pa.table(
+        {
+            "id": list(range(300)),
+            "payload": pa.array([b"y" * 512] * 300, type=pa.large_binary()),
+        }
+    )
+    ds = StreamCache(
+        table.to_reader(max_chunksize=100),
+        memory_capacity=1,
+        disk_path=str(tmp_path / "real"),
+        disk_capacity=one_batch_bytes + 1,
+    )
+    with pytest.raises(MemoryError, match="capacity"):
+        ds.ingest_all()
+    assert ds.ingested_count >= 1

@@ -89,6 +89,11 @@ struct DiskCacheTier {
     hot_capacity: usize,
     /// Bytes currently held in the hot layer.
     hot_used: AtomicUsize,
+    /// Hard byte limit on the on-disk cache file.
+    disk_capacity: u64,
+    /// Bytes written to disk so far.  Relaxed ordering is safe: single writer
+    /// (serialised by `DatasetInner` mutex), readers never inspect this field.
+    disk_used: AtomicU64,
 }
 
 enum CacheTier {
@@ -120,6 +125,18 @@ impl CacheTier {
             CacheTier::Disk(d) => {
                 let bytes = serialize_batch(&batch)?;
                 let length = bytes.len();
+                // Enforce disk capacity before touching the file.
+                let disk_prev = d.disk_used.load(Ordering::Relaxed);
+                if disk_prev
+                    .checked_add(length as u64)
+                    .is_none_or(|end| end > d.disk_capacity)
+                {
+                    return Err(ArrowError::MemoryError(format!(
+                        "Disk cache capacity ({} bytes) exceeded: {} bytes already written, \
+                         cannot fit {} more bytes",
+                        d.disk_capacity, disk_prev, length
+                    )));
+                }
                 // Write to file and advance the offset.
                 let offset = {
                     let mut ws = d.write_state.lock().unwrap();
@@ -138,6 +155,7 @@ impl CacheTier {
                         .ok_or_else(|| other_arrow_err("Cache file offset overflowed"))?;
                     off
                 };
+                d.disk_used.fetch_add(length as u64, Ordering::Relaxed);
                 // Try to keep a hot copy if the budget allows.
                 let hot = if d.hot_used.load(Ordering::Relaxed) + length <= d.hot_capacity {
                     d.hot_used.fetch_add(length, Ordering::Relaxed);
@@ -703,7 +721,7 @@ impl PyStreamCache {
         let schema = upstream.schema();
 
         let cache = match (disk_path, disk_capacity) {
-            (Some(path), Some(_capacity)) => {
+            (Some(path), Some(capacity)) => {
                 let id = DATASET_COUNTER.fetch_add(1, Ordering::Relaxed);
                 let dir_path = PathBuf::from(&path).join(format!("_{id}"));
 
@@ -746,6 +764,8 @@ impl PyStreamCache {
                         read_file,
                         hot_capacity,
                         hot_used: AtomicUsize::new(0),
+                        disk_capacity: capacity,
+                        disk_used: AtomicU64::new(0),
                     }))
                 })
                 .map_err(PyErr::from)?
