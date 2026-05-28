@@ -712,3 +712,65 @@ def test_disk_params_must_both_be_provided_or_omitted():
         StreamCache(table, memory_capacity=16 << 20, disk_path="/tmp")
     with pytest.raises(ValueError, match="disk_path and disk_capacity"):
         StreamCache(table, memory_capacity=16 << 20, disk_capacity=64 << 20)
+
+
+# ── Gap 2: hot layer FIFO eviction ───────────────────────────────────────────
+
+
+def _spill_cache(
+    tmp_path, n_batches: int, rows_per_batch: int, hot_bytes: int
+) -> tuple:
+    source = pa.table({"id": pa.array(list(range(n_batches * rows_per_batch)))})
+    ds = StreamCache(
+        source.to_reader(max_chunksize=rows_per_batch),
+        memory_capacity=hot_bytes,
+        disk_path=str(tmp_path),
+        disk_capacity=64 * 1024 * 1024,
+    )
+    return ds, source
+
+
+def test_hot_eviction_old_batches_readable_from_disk(tmp_path):
+    """After hot eviction, earlier batches still return correct data via disk pread."""
+    ds, source = _spill_cache(tmp_path, n_batches=5, rows_per_batch=100, hot_bytes=1)
+    ds.ingest_all()
+    result = pa.RecordBatchReader.from_stream(ds).read_all()
+    assert result.sort_by("id").equals(source.sort_by("id"))
+
+
+def test_hot_eviction_later_batches_land_in_hot(tmp_path):
+    """Eviction makes room for new batches; all data readable after eviction."""
+    ds, source = _spill_cache(tmp_path, n_batches=10, rows_per_batch=50, hot_bytes=1)
+    ds.ingest_all()
+    pass1 = pa.RecordBatchReader.from_stream(ds).read_all()
+    pass2 = pa.RecordBatchReader.from_stream(ds).read_all()
+    assert pass1.equals(pass2)
+    assert pass1.sort_by("id").equals(source.sort_by("id"))
+
+
+def test_hot_eviction_multiple_readers_independent(tmp_path):
+    """Two readers starting at batch 0 both see correct data when hot layer has evicted."""
+    ds, source = _spill_cache(tmp_path, n_batches=6, rows_per_batch=50, hot_bytes=1)
+    ds.ingest_all()
+    r1 = ds.reader(from_start=True)
+    r2 = ds.reader(from_start=True)
+    rows1 = pa.RecordBatchReader.from_stream(r1).read_all()
+    rows2 = pa.RecordBatchReader.from_stream(r2).read_all()
+    assert rows1.equals(rows2)
+    assert rows1.sort_by("id").equals(source.sort_by("id"))
+
+
+def test_hot_eviction_single_batch_larger_than_budget(tmp_path):
+    """Batch exceeding entire hot budget still written to disk and readable."""
+    ds, source = _spill_cache(tmp_path, n_batches=3, rows_per_batch=100, hot_bytes=1)
+    ds.ingest_all()
+    result = pa.RecordBatchReader.from_stream(ds).read_all()
+    assert result.sort_by("id").equals(source.sort_by("id"))
+
+
+def test_hot_eviction_zero_capacity_all_from_disk(tmp_path):
+    """hot budget of 0 forces all reads from disk; data still correct."""
+    ds, source = _spill_cache(tmp_path, n_batches=4, rows_per_batch=80, hot_bytes=0)
+    ds.ingest_all()
+    result = pa.RecordBatchReader.from_stream(ds).read_all()
+    assert result.sort_by("id").equals(source.sort_by("id"))

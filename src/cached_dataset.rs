@@ -18,6 +18,7 @@
 //! Multiple independent [`PyStreamCacheReader`] handles can be obtained from a
 //! single dataset, each maintaining its own read position.
 
+use std::collections::VecDeque;
 use std::io::{Cursor, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -65,12 +66,72 @@ struct DiskWriteState {
     offset: u64,
 }
 
+/// FIFO in-memory read cache for the disk tier.
+///
+/// Entries are keyed by a monotonic batch index.  When the byte budget is
+/// exceeded the oldest entry is evicted first — optimal for sequential replay
+/// because batch N is always read before batch N+1.
+struct HotLayer {
+    /// `entries[0]` corresponds to batch `head_batch_idx`.
+    entries: VecDeque<Option<(Arc<RecordBatch>, usize)>>,
+    /// Global batch index of `entries[0]`.
+    head_batch_idx: u64,
+    /// Bytes currently held (sum of ipc_byte_len across all `Some` entries).
+    used: usize,
+    /// Byte budget.
+    capacity: usize,
+}
+
+impl HotLayer {
+    fn new(capacity: usize) -> Self {
+        Self {
+            entries: VecDeque::new(),
+            head_batch_idx: 0,
+            used: 0,
+            capacity,
+        }
+    }
+
+    /// Insert `batch` at `batch_idx`, evicting from the front until there is room.
+    /// Returns `false` when the batch is larger than the entire budget (not cached,
+    /// but callers must still write it to disk — returning false is not an error).
+    fn try_insert(&mut self, batch_idx: u64, batch: Arc<RecordBatch>, ipc_len: usize) -> bool {
+        while self.used + ipc_len > self.capacity {
+            match self.entries.pop_front() {
+                None => return false,
+                Some(evicted) => {
+                    if let Some((_, len)) = evicted {
+                        self.used -= len;
+                    }
+                    self.head_batch_idx += 1;
+                }
+            }
+        }
+        debug_assert_eq!(batch_idx, self.head_batch_idx + self.entries.len() as u64);
+        self.entries.push_back(Some((batch, ipc_len)));
+        self.used += ipc_len;
+        true
+    }
+
+    fn get(&self, batch_idx: u64) -> Option<Arc<RecordBatch>> {
+        if batch_idx < self.head_batch_idx {
+            return None;
+        }
+        let slot = (batch_idx - self.head_batch_idx) as usize;
+        self.entries.get(slot)?.as_ref().map(|(arc, _)| arc.clone())
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.used = 0;
+    }
+}
+
 /// Combined index + hot layer for the disk tier.
 struct DiskIndex {
-    /// `(file_offset, byte_length)` for each ingested batch.
+    /// `(file_offset, ipc_byte_length)` for each ingested batch.
     entries: Vec<(u64, usize)>,
-    /// In-memory copy of a batch, or `None` when the hot budget was exceeded.
-    hot: Vec<Option<Arc<RecordBatch>>>,
+    hot: HotLayer,
 }
 
 /// Disk-backed cache: append-only IPC file + optional hot in-memory layer.
@@ -85,10 +146,6 @@ struct DiskCacheTier {
     index: RwLock<DiskIndex>,
     /// File descriptor used for positional reads (pread-style, no seek lock).
     read_file: std::fs::File,
-    /// Byte budget for the hot in-memory layer.
-    hot_capacity: usize,
-    /// Bytes currently held in the hot layer.
-    hot_used: AtomicUsize,
     /// Hard byte limit on the on-disk cache file.
     disk_capacity: u64,
     /// Bytes written to disk so far.  Relaxed ordering is safe: single writer
@@ -156,16 +213,11 @@ impl CacheTier {
                     off
                 };
                 d.disk_used.fetch_add(length as u64, Ordering::Relaxed);
-                // Try to keep a hot copy if the budget allows.
-                let hot = if d.hot_used.load(Ordering::Relaxed) + length <= d.hot_capacity {
-                    d.hot_used.fetch_add(length, Ordering::Relaxed);
-                    Some(Arc::new(batch))
-                } else {
-                    None
-                };
+                let batch_arc = Arc::new(batch);
                 let mut idx = d.index.write().unwrap();
+                let batch_idx = idx.entries.len() as u64;
+                idx.hot.try_insert(batch_idx, batch_arc, length);
                 idx.entries.push((offset, length));
-                idx.hot.push(hot);
                 Ok(())
             }
         }
@@ -181,14 +233,7 @@ impl CacheTier {
                     let index = d.index.read().unwrap();
                     match index.entries.get(idx as usize) {
                         None => return Ok(None),
-                        Some(&(off, len)) => {
-                            let hot = index
-                                .hot
-                                .get(idx as usize)
-                                .and_then(|o| o.as_ref())
-                                .cloned();
-                            (off, len, hot)
-                        }
+                        Some(&(off, len)) => (off, len, index.hot.get(idx)),
                     }
                 }; // read lock released before any I/O
 
@@ -210,8 +255,7 @@ impl CacheTier {
         match self {
             CacheTier::Memory(m) => m.batches.write().unwrap().clear(),
             CacheTier::Disk(d) => {
-                let mut idx = d.index.write().unwrap();
-                idx.hot.iter_mut().for_each(|h| *h = None);
+                d.index.write().unwrap().hot.clear();
             }
         }
     }
@@ -759,11 +803,9 @@ impl PyStreamCache {
                         }),
                         index: RwLock::new(DiskIndex {
                             entries: Vec::new(),
-                            hot: Vec::new(),
+                            hot: HotLayer::new(hot_capacity),
                         }),
                         read_file,
-                        hot_capacity,
-                        hot_used: AtomicUsize::new(0),
                         disk_capacity: capacity,
                         disk_used: AtomicU64::new(0),
                     }))
