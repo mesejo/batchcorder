@@ -1188,3 +1188,319 @@ impl PyStreamCache {
         .map_err(PyErr::from)
     }
 }
+
+// ── unit tests ─────────────────────────────────────────────────────────────────
+//
+// These exercise the pure cache machinery (HotLayer FIFO, the disk index state
+// machine, and CacheTier::get) directly in Rust.  The Python suite covers the
+// end-to-end behaviour; these cover the defensive branches that are unreachable
+// through the public API but must still behave correctly.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::Int32Array;
+    use arrow_schema::{DataType, Field};
+
+    fn make_batch(vals: &[i32]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+        let arr = Arc::new(Int32Array::from(vals.to_vec()));
+        RecordBatch::try_new(schema, vec![arr]).expect("valid batch")
+    }
+
+    fn batch_mem_size(batch: &RecordBatch) -> usize {
+        batch
+            .columns()
+            .iter()
+            .map(|c| c.get_array_memory_size())
+            .sum()
+    }
+
+    /// Build a disk tier backed by a fresh temp file.  Uses the global dataset
+    /// counter to avoid name collisions across parallel tests.
+    fn temp_disk_tier(
+        disk_capacity: u64,
+        hot_capacity: usize,
+        policy: WritePolicy,
+    ) -> DiskCacheTier {
+        let id = DATASET_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir_path = std::env::temp_dir().join(format!("batchcorder_unit_{id}"));
+        std::fs::create_dir_all(&dir_path).expect("create temp dir");
+        let file_path = dir_path.join("cache.arrow");
+        let write_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&file_path)
+            .expect("open write file");
+        let read_file = std::fs::File::open(&file_path).expect("open read file");
+        DiskCacheTier {
+            dir_path,
+            write_state: Mutex::new(DiskWriteState {
+                file: write_file,
+                offset: 0,
+            }),
+            index: RwLock::new(DiskIndex {
+                entries: Vec::new(),
+                hot: HotLayer::new(hot_capacity),
+            }),
+            read_file,
+            disk_capacity,
+            disk_used: AtomicU64::new(0),
+            policy,
+        }
+    }
+
+    // ── HotLayer ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn hot_layer_insert_and_get() {
+        let mut hot = HotLayer::new(1024);
+        let b = Arc::new(make_batch(&[1, 2, 3]));
+        assert!(hot.try_insert(0, b.clone(), 16));
+        assert!(hot.get(0).is_some());
+        // Index below head and beyond the tail both miss.
+        assert!(hot.get(1).is_none());
+    }
+
+    #[test]
+    fn hot_layer_get_below_head_returns_none() {
+        let mut hot = HotLayer::new(32);
+        // Two small entries, then force the first out so head advances past 0.
+        hot.try_insert(0, Arc::new(make_batch(&[0])), 16);
+        hot.try_insert(1, Arc::new(make_batch(&[1])), 16);
+        hot.try_insert(2, Arc::new(make_batch(&[2])), 16); // evicts batch 0
+        assert!(hot.get(0).is_none()); // below head
+        assert!(hot.get(2).is_some());
+    }
+
+    #[test]
+    fn hot_layer_oversized_not_stored() {
+        let mut hot = HotLayer::new(8);
+        // Larger than the whole budget: try_insert returns false and stores nothing.
+        assert!(!hot.try_insert(0, Arc::new(make_batch(&[0])), 64));
+        assert!(hot.get(0).is_none());
+    }
+
+    #[test]
+    fn hot_layer_fifo_eviction_order() {
+        let mut hot = HotLayer::new(40); // ~2 entries of 16 bytes
+        for i in 0..4u64 {
+            hot.try_insert(i, Arc::new(make_batch(&[i as i32])), 16);
+        }
+        // Oldest evicted first; only the two most recent remain.
+        assert!(hot.get(0).is_none());
+        assert!(hot.get(1).is_none());
+        assert!(hot.get(2).is_some());
+        assert!(hot.get(3).is_some());
+    }
+
+    #[test]
+    fn hot_layer_stage_and_commit_evictions() {
+        let mut hot = HotLayer::new(40);
+        hot.try_insert(0, Arc::new(make_batch(&[0])), 16);
+        hot.try_insert(1, Arc::new(make_batch(&[1])), 16);
+        // Staging a third entry returns batch 0 as the eviction candidate but does
+        // NOT remove it yet — it stays readable.
+        let evicted = hot.stage_evictions(2, Arc::new(make_batch(&[2])), 16);
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(evicted[0].0, 0);
+        assert!(
+            hot.get(0).is_some(),
+            "staged-but-not-committed stays readable"
+        );
+        // Commit removes it.
+        hot.commit_evictions(evicted.len());
+        assert!(hot.get(0).is_none());
+        assert!(hot.get(2).is_some());
+    }
+
+    #[test]
+    fn hot_layer_commit_more_than_present_is_safe() {
+        // Exercises the `None => break` arm of commit_evictions: asking to commit
+        // more entries than exist must stop at empty instead of underflowing.
+        let mut hot = HotLayer::new(1024);
+        hot.try_insert(0, Arc::new(make_batch(&[0])), 16);
+        hot.commit_evictions(5); // only 1 present
+        assert_eq!(hot.used, 0);
+        assert!(hot.get(0).is_none());
+    }
+
+    #[test]
+    fn hot_layer_stage_with_no_room_to_free() {
+        // Capacity smaller than the newcomer and nothing evictable: stage_evictions
+        // breaks out of its loop and still appends the newcomer.
+        let mut hot = HotLayer::new(8);
+        let evicted = hot.stage_evictions(0, Arc::new(make_batch(&[0])), 64);
+        assert!(evicted.is_empty());
+        assert!(hot.get(0).is_some());
+    }
+
+    // ── CacheTier::get (disk) defensive branches ────────────────────────────────
+
+    #[test]
+    fn disk_get_out_of_range_returns_none() {
+        // Line: `None => return Ok(None)` — index past the end of `entries`.
+        let tier = CacheTier::Disk(temp_disk_tier(1 << 20, 1 << 20, WritePolicy::OnInsertion));
+        assert!(tier.get(99).expect("ok").is_none());
+        tier.cleanup_disk();
+    }
+
+    #[test]
+    fn disk_get_none_slot_not_hot_is_inconsistency_error() {
+        // Lines: `slot.ok_or_else(...)` — an entry that is neither on disk (None
+        // slot) nor in the hot layer is a cache-index inconsistency, not user data.
+        let d = temp_disk_tier(1 << 20, 1 << 20, WritePolicy::OnInsertion);
+        d.index.write().unwrap().entries.push(None); // placeholder, never committed
+        let tier = CacheTier::Disk(d);
+        let err = tier.get(0).expect_err("must be an error");
+        assert!(err.to_string().contains("inconsistency"));
+        tier.cleanup_disk();
+    }
+
+    // ── insert + read round-trips ───────────────────────────────────────────────
+
+    #[test]
+    fn disk_on_insertion_reads_back_from_disk() {
+        // hot_capacity of 1 forces the batch out of hot, so get() must read it back
+        // from disk and pass the checksum verification.
+        let tier = CacheTier::Disk(temp_disk_tier(1 << 20, 1, WritePolicy::OnInsertion));
+        let batch = make_batch(&[10, 20, 30]);
+        tier.insert(batch.clone()).expect("insert");
+        let got = tier.get(0).expect("ok").expect("present");
+        assert_eq!(got.as_ref(), &batch);
+        tier.cleanup_disk();
+    }
+
+    #[test]
+    fn disk_on_eviction_writes_only_evicted_batches() {
+        // Tiny hot: each new batch evicts the previous one to disk.  The most recent
+        // batch is served from hot; older ones from disk.
+        let first = make_batch(&[1]);
+        let mem = batch_mem_size(&first);
+        let tier = CacheTier::Disk(temp_disk_tier(1 << 20, mem, WritePolicy::OnEviction));
+        tier.insert(first.clone()).expect("insert 0");
+        tier.insert(make_batch(&[2])).expect("insert 1");
+        tier.insert(make_batch(&[3])).expect("insert 2");
+
+        // Batch 0 was evicted to disk and reads back correctly.
+        assert_eq!(tier.get(0).expect("ok").expect("present").as_ref(), &first);
+        // Batch 2 (most recent) is still hot.
+        assert_eq!(
+            tier.get(2).expect("ok").expect("present").as_ref(),
+            &make_batch(&[3])
+        );
+        tier.cleanup_disk();
+    }
+
+    #[test]
+    fn disk_capacity_exceeded_errors() {
+        // disk_capacity smaller than 8 + ipc_len: the capacity check fires.
+        let tier = CacheTier::Disk(temp_disk_tier(4, 1, WritePolicy::OnInsertion));
+        let err = tier.insert(make_batch(&[1, 2, 3])).expect_err("capacity");
+        assert!(matches!(err, ArrowError::MemoryError(_)));
+        tier.cleanup_disk();
+    }
+
+    #[test]
+    fn serialize_deserialize_roundtrip() {
+        let batch = make_batch(&[7, 8, 9]);
+        let bytes = serialize_batch(&batch).expect("serialize");
+        let back = deserialize_batch(&bytes).expect("deserialize");
+        assert_eq!(back, batch);
+    }
+
+    // ── Memory tier ─────────────────────────────────────────────────────────────
+
+    fn memory_tier(capacity: usize) -> CacheTier {
+        CacheTier::Memory(MemoryCacheTier {
+            batches: RwLock::new(Vec::new()),
+            capacity,
+            used: AtomicUsize::new(0),
+        })
+    }
+
+    #[test]
+    fn memory_tier_insert_get_and_clear() {
+        let tier = memory_tier(1 << 20);
+        tier.insert(make_batch(&[1])).expect("insert 0");
+        tier.insert(make_batch(&[2])).expect("insert 1");
+        assert!(tier.get(0).expect("ok").is_some());
+        assert!(tier.get(1).expect("ok").is_some());
+        assert!(tier.get(2).expect("ok").is_none()); // beyond end
+        tier.clear();
+        assert!(tier.get(0).expect("ok").is_none());
+    }
+
+    #[test]
+    fn memory_tier_capacity_exceeded_errors() {
+        let tier = memory_tier(4); // smaller than one batch
+        let err = tier.insert(make_batch(&[1, 2, 3])).expect_err("capacity");
+        assert!(matches!(err, ArrowError::MemoryError(_)));
+    }
+
+    // ── disk corruption detection (mirrors the Python error tests) ───────────────
+
+    #[test]
+    fn disk_checksum_mismatch_is_detected() {
+        let d = temp_disk_tier(1 << 20, 1, WritePolicy::OnInsertion); // hot=1 → disk read
+        let path = d.dir_path.join("cache.arrow");
+        let tier = CacheTier::Disk(d);
+        tier.insert(make_batch(&[1, 2, 3])).expect("insert");
+
+        // Flip a byte in the middle of the payload (offset 8 is the IPC
+        // continuation marker 0xFFFFFFFF, so writing 0xFF there is a no-op — pick a
+        // mid-payload byte and XOR it to guarantee a real change).
+        use std::io::{Read, Seek, SeekFrom};
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("reopen");
+        let len = f.metadata().expect("metadata").len();
+        let mid = 8 + (len - 8) / 2;
+        f.seek(SeekFrom::Start(mid)).expect("seek");
+        let mut byte = [0u8; 1];
+        f.read_exact(&mut byte).expect("read byte");
+        f.seek(SeekFrom::Start(mid)).expect("seek back");
+        f.write_all(&[byte[0] ^ 0xFF]).expect("corrupt");
+        f.flush().expect("flush");
+
+        let err = tier.get(0).expect_err("must detect corruption");
+        assert!(err.to_string().contains("Checksum mismatch"));
+        tier.cleanup_disk();
+    }
+
+    #[test]
+    fn disk_clear_empties_hot_but_keeps_disk_readable() {
+        // CacheTier::clear on a disk tier drops the hot layer (HotLayer::clear) but
+        // leaves the on-disk data intact, so reads still succeed afterwards.
+        let tier = CacheTier::Disk(temp_disk_tier(1 << 20, 1 << 20, WritePolicy::OnInsertion));
+        let batch = make_batch(&[5, 6]);
+        tier.insert(batch.clone()).expect("insert");
+        tier.clear(); // empties the hot layer
+        // Still readable — served from disk now that hot is empty.
+        assert_eq!(tier.get(0).expect("ok").expect("present").as_ref(), &batch);
+        tier.cleanup_disk();
+    }
+
+    #[test]
+    fn disk_truncated_read_errors() {
+        let d = temp_disk_tier(1 << 20, 1, WritePolicy::OnInsertion);
+        let path = d.dir_path.join("cache.arrow");
+        let tier = CacheTier::Disk(d);
+        tier.insert(make_batch(&[1, 2, 3])).expect("insert");
+
+        // Chop the file so the payload can no longer be fully read.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("reopen")
+            .set_len(4)
+            .expect("truncate");
+
+        let err = tier.get(0).expect_err("must fail on short read");
+        assert!(matches!(err, ArrowError::IoError(_, _)));
+        tier.cleanup_disk();
+    }
+}
