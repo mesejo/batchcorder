@@ -326,3 +326,36 @@ def test_checksum_hot_hit_bypasses_disk(tmp_path):
 
     result = pa.RecordBatchReader.from_stream(ds.reader(from_start=True)).read_all()
     assert result.equals(source)
+
+
+# ── Gap 4: I/O error type mapping ─────────────────────────────────────────────
+
+
+def test_capacity_error_is_memoryerror_not_ioerror(tmp_path):
+    """Disk capacity exhaustion surfaces as MemoryError, not OSError."""
+    source = pa.table({"x": list(range(100))})
+    with pytest.raises(MemoryError, match="capacity"):
+        StreamCache(
+            source.to_reader(max_chunksize=100),
+            memory_capacity=1,
+            disk_path=str(tmp_path / "small"),
+            disk_capacity=1,  # below one batch → capacity check fires
+        ).ingest_all()
+
+
+def test_disk_read_failure_raises_oserror(tmp_path):
+    """A read failure (payload truncated away) raises OSError, not ArrowException."""
+    ds, _ = _disk_cache_checksums(tmp_path, "read_fail")
+    ds.ingest_all()
+
+    cache_file = _find_cache_file(tmp_path, "read_fail")
+    os.truncate(cache_file, 9)  # leave checksum header only, no payload
+
+    try:
+        pa.RecordBatchReader.from_stream(ds.reader(from_start=True)).read_all()
+    except OSError:
+        pass  # correct: short read maps to OSError
+    except Exception as e:
+        pytest.fail(f"Expected OSError, got {type(e).__name__}: {e}")
+    else:
+        pytest.fail("Expected OSError")

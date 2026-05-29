@@ -218,12 +218,12 @@ impl CacheTier {
                     on_disk.extend_from_slice(&bytes);
                     ws.file
                         .write_all(&on_disk)
-                        .map_err(|e| other_arrow_err(format!("Disk write failed: {e}")))?;
+                        .map_err(|e| ArrowError::IoError(format!("Disk write failed: {e}"), e))?;
                     // Flush so subsequent pread calls on the read_file FD see
                     // the written bytes (kernel buffer cache shared between FDs).
                     ws.file
                         .flush()
-                        .map_err(|e| other_arrow_err(format!("Disk flush failed: {e}")))?;
+                        .map_err(|e| ArrowError::IoError(format!("Disk flush failed: {e}"), e))?;
                     ws.offset = ws
                         .offset
                         .checked_add((8 + length) as u64)
@@ -355,6 +355,7 @@ fn pread_exact(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Re
 
 // ── error helpers ────────────────────────────────────────────────────────────
 
+#[cold]
 fn other_arrow_err(msg: impl std::fmt::Display) -> ArrowError {
     ArrowError::ExternalError(Box::new(std::io::Error::other(msg.to_string())))
 }
@@ -384,6 +385,7 @@ fn arrow_to_boundary(e: ArrowError) -> BoundaryError {
     match e {
         ArrowError::MemoryError(msg) => BoundaryError::Memory(msg),
         ArrowError::InvalidArgumentError(msg) => BoundaryError::Value(msg),
+        ArrowError::IoError(msg, _) => BoundaryError::Io(msg),
         _ => BoundaryError::Io(e.to_string()),
     }
 }
