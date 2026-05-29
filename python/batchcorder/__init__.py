@@ -62,6 +62,12 @@ class StreamCache:
     disk_capacity : int, optional
         On-disk storage budget in bytes.
         Must be provided together with ``disk_path``.
+    write_policy : str, optional
+        When batches are flushed to disk (disk mode only; ignored in
+        memory-only mode).  ``"on_insertion"`` (default) writes every batch to
+        disk immediately.  ``"on_eviction"`` keeps batches in the hot layer and
+        only writes them to disk when evicted, so a hot layer large enough to
+        hold the whole stream never touches disk.
 
     Examples
     --------
@@ -92,9 +98,12 @@ class StreamCache:
         memory_capacity: int | None = None,
         disk_path: str | None = None,
         disk_capacity: int | None = None,
+        write_policy: str = "on_insertion",
     ):
         """See class docstring for parameter documentation."""
-        self._impl = _PyStreamCache(reader, memory_capacity, disk_path, disk_capacity)
+        self._impl = _PyStreamCache(
+            reader, memory_capacity, disk_path, disk_capacity, write_policy
+        )
 
     @property
     def schema(self) -> Any:

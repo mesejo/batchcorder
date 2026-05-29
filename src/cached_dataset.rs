@@ -50,6 +50,21 @@ use xxhash_rust::xxh3::xxh3_64;
 
 static DATASET_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+// ── write policy ───────────────────────────────────────────────────────────────
+
+/// Controls when batches are written to the disk tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WritePolicy {
+    /// Write every batch to disk immediately on insertion.  The hot layer is a
+    /// read-only cache; disk is always the source of truth.  Lower memory use,
+    /// more I/O.
+    OnInsertion,
+    /// Write a batch to disk only when it is evicted from the hot layer.  If the
+    /// hot layer is large enough, nothing ever hits disk.  Higher memory use for
+    /// hot entries; far less I/O for small-to-medium streams.
+    OnEviction,
+}
+
 // ── cache tiers ──────────────────────────────────────────────────────────────
 
 /// In-memory cache: batches stored as `Arc<RecordBatch>`, zero-copy reads.
@@ -114,6 +129,59 @@ impl HotLayer {
         true
     }
 
+    /// Add `batch` to the back and return the front entries that must be evicted
+    /// to make room, **without removing them yet**.  The returned entries stay in
+    /// the hot layer (accessible to concurrent readers) until [`Self::commit_evictions`]
+    /// is called — this is the two-phase commit that closes the window where a
+    /// batch would be neither in hot nor on disk.
+    ///
+    /// Used by the `OnEviction` policy: the caller writes each returned batch to
+    /// disk, then calls `commit_evictions` with the returned count.
+    fn stage_evictions(
+        &mut self,
+        batch_idx: u64,
+        batch: Arc<RecordBatch>,
+        ipc_len: usize,
+    ) -> Vec<(u64, Arc<RecordBatch>, usize)> {
+        let mut evicted = Vec::new();
+        let mut cursor = 0usize;
+        let mut freed = 0usize;
+        // Collect just enough front entries to fit the newcomer; do not pop them.
+        while self.used - freed + ipc_len > self.capacity {
+            match self.entries.get(cursor) {
+                None => break, // nothing left to evict
+                Some(slot) => {
+                    if let Some((arc, len)) = slot {
+                        evicted.push((self.head_batch_idx + cursor as u64, arc.clone(), *len));
+                        freed += len;
+                    }
+                    cursor += 1;
+                }
+            }
+        }
+        debug_assert_eq!(batch_idx, self.head_batch_idx + self.entries.len() as u64);
+        let _ = batch_idx;
+        self.entries.push_back(Some((batch, ipc_len)));
+        self.used += ipc_len;
+        evicted
+    }
+
+    /// Pop the first `n` entries after their disk writes have been confirmed.
+    /// `n` must equal the length returned by the matching [`Self::stage_evictions`].
+    fn commit_evictions(&mut self, n: usize) {
+        for _ in 0..n {
+            match self.entries.pop_front() {
+                None => break,
+                Some(evicted) => {
+                    if let Some((_, len)) = evicted {
+                        self.used -= len;
+                    }
+                    self.head_batch_idx += 1;
+                }
+            }
+        }
+    }
+
     fn get(&self, batch_idx: u64) -> Option<Arc<RecordBatch>> {
         if batch_idx < self.head_batch_idx {
             return None;
@@ -141,7 +209,10 @@ struct DiskEntry {
 
 /// Combined index + hot layer for the disk tier.
 struct DiskIndex {
-    entries: Vec<DiskEntry>,
+    /// `entries[i]` is `Some` once batch `i` is on disk, `None` while it lives only
+    /// in the hot layer (the `OnEviction` policy before eviction).  Under
+    /// `OnInsertion` every slot is `Some` immediately.
+    entries: Vec<Option<DiskEntry>>,
     hot: HotLayer,
 }
 
@@ -162,6 +233,137 @@ struct DiskCacheTier {
     /// Bytes written to disk so far.  Relaxed ordering is safe: single writer
     /// (serialised by `DatasetInner` mutex), readers never inspect this field.
     disk_used: AtomicU64,
+    /// When batches are flushed to disk (immediately, or on hot eviction).
+    policy: WritePolicy,
+}
+
+impl DiskCacheTier {
+    /// Fail unless `8 + length` more bytes fit within `disk_capacity`.
+    fn check_disk_capacity(&self, length: usize) -> Result<(), ArrowError> {
+        let prev = self.disk_used.load(Ordering::Relaxed);
+        if prev
+            .checked_add((8 + length) as u64)
+            .is_none_or(|end| end > self.disk_capacity)
+        {
+            return Err(ArrowError::MemoryError(format!(
+                "Disk cache capacity ({} bytes) exceeded: {} bytes already written, \
+                 cannot fit {} more bytes",
+                self.disk_capacity,
+                prev,
+                8 + length
+            )));
+        }
+        Ok(())
+    }
+
+    /// Append `[checksum_le | bytes]` to the cache file and return the start
+    /// offset.  Advances `disk_used` and the write offset.  Caller must have
+    /// already passed [`Self::check_disk_capacity`].
+    fn write_ipc_to_disk(&self, bytes: &[u8], checksum: u64) -> Result<u64, ArrowError> {
+        let length = bytes.len();
+        let offset = {
+            let mut ws = self.write_state.lock().unwrap();
+            let off = ws.offset;
+            let mut on_disk = Vec::with_capacity(8 + length);
+            on_disk.extend_from_slice(&checksum.to_le_bytes());
+            on_disk.extend_from_slice(bytes);
+            ws.file
+                .write_all(&on_disk)
+                .map_err(|e| ArrowError::IoError(format!("Disk write failed: {e}"), e))?;
+            // Flush so subsequent pread calls on read_file see the bytes
+            // (the kernel buffer cache is shared between the two FDs).
+            ws.file
+                .flush()
+                .map_err(|e| ArrowError::IoError(format!("Disk flush failed: {e}"), e))?;
+            ws.offset = ws
+                .offset
+                .checked_add((8 + length) as u64)
+                .ok_or_else(|| other_arrow_err("Cache file offset overflowed"))?;
+            off
+        };
+        self.disk_used
+            .fetch_add((8 + length) as u64, Ordering::Relaxed);
+        Ok(offset)
+    }
+
+    /// `OnInsertion`: serialise and write the batch immediately, then record it
+    /// in the hot layer as a read-through cache.  Identical to the pre-Gap-5 path.
+    fn insert_on_insertion(&self, batch: RecordBatch) -> Result<(), ArrowError> {
+        let bytes = serialize_batch(&batch)?;
+        let length = bytes.len();
+        let checksum = xxh3_64(&bytes);
+        self.check_disk_capacity(length)?;
+        let offset = self.write_ipc_to_disk(&bytes, checksum)?;
+
+        let batch_arc = Arc::new(batch);
+        let mut idx = self.index.write().unwrap();
+        let batch_idx = idx.entries.len() as u64;
+        idx.hot.try_insert(batch_idx, batch_arc, length);
+        idx.entries.push(Some(DiskEntry {
+            file_offset: offset,
+            ipc_len: length,
+            checksum,
+        }));
+        Ok(())
+    }
+
+    /// `OnEviction`: keep the batch in the hot layer; only the batches evicted to
+    /// make room are written to disk.  Two-phase commit keeps evicted batches
+    /// readable from hot throughout the disk write.
+    fn insert_on_eviction(&self, batch: RecordBatch) -> Result<(), ArrowError> {
+        // Hot-budget accounting note: under OnEviction a batch enters the hot layer
+        // *before* it is ever serialised, so its true IPC byte length is unknown
+        // here.  We use the in-memory size (`get_array_memory_size`) as a proxy for
+        // the budget.  This is deliberately an estimate: `hot.used` may drift from
+        // the actual on-disk size, since Arrow's in-memory layout (padding, child
+        // arrays, dictionaries) rarely equals the IPC-serialised size.  The drift
+        // only affects *when* eviction triggers, never correctness — every batch is
+        // still serialised with its exact length at eviction time.  Storing the
+        // serialised bytes in hot to get an exact figure would double memory use for
+        // pending batches; not worth it unless drift proves a problem in practice.
+        let mem_size: usize = batch
+            .columns()
+            .iter()
+            .map(|c| c.get_array_memory_size())
+            .sum();
+        let batch_arc = Arc::new(batch);
+
+        // Phase 1: stage evictions and append the placeholder slot, under the lock.
+        let evicted = {
+            let mut idx = self.index.write().unwrap();
+            let batch_idx = idx.entries.len() as u64;
+            let evicted = idx.hot.stage_evictions(batch_idx, batch_arc, mem_size);
+            idx.entries.push(None); // "in hot, not yet on disk"
+            evicted
+        }; // lock released — evicted batches remain in hot for readers
+
+        // Phase 2: write each evicted batch to disk (no lock held).
+        let mut disk_entries: Vec<(u64, DiskEntry)> = Vec::with_capacity(evicted.len());
+        for (evicted_idx, evicted_arc, _est) in &evicted {
+            let bytes = serialize_batch(evicted_arc)?;
+            let length = bytes.len();
+            let checksum = xxh3_64(&bytes);
+            self.check_disk_capacity(length)?;
+            let offset = self.write_ipc_to_disk(&bytes, checksum)?;
+            disk_entries.push((
+                *evicted_idx,
+                DiskEntry {
+                    file_offset: offset,
+                    ipc_len: length,
+                    checksum,
+                },
+            ));
+        }
+
+        // Phase 3: pop the evicted entries from hot and record their disk slots,
+        // atomically under one write lock so readers never see a gap.
+        let mut idx = self.index.write().unwrap();
+        idx.hot.commit_evictions(evicted.len());
+        for (evicted_idx, disk_entry) in disk_entries {
+            idx.entries[evicted_idx as usize] = Some(disk_entry);
+        }
+        Ok(())
+    }
 }
 
 enum CacheTier {
@@ -190,59 +392,10 @@ impl CacheTier {
                 m.batches.write().unwrap().push(Arc::new(batch));
                 Ok(())
             }
-            CacheTier::Disk(d) => {
-                let bytes = serialize_batch(&batch)?;
-                let length = bytes.len();
-                let checksum = xxh3_64(&bytes);
-                // Enforce disk capacity before touching the file.
-                // Each entry occupies 8 (checksum header) + ipc_len bytes on disk.
-                let disk_prev = d.disk_used.load(Ordering::Relaxed);
-                if disk_prev
-                    .checked_add((8 + length) as u64)
-                    .is_none_or(|end| end > d.disk_capacity)
-                {
-                    return Err(ArrowError::MemoryError(format!(
-                        "Disk cache capacity ({} bytes) exceeded: {} bytes already written, \
-                         cannot fit {} more bytes",
-                        d.disk_capacity,
-                        disk_prev,
-                        8 + length
-                    )));
-                }
-                // Write [checksum_le | ipc_payload] and advance the offset.
-                let offset = {
-                    let mut ws = d.write_state.lock().unwrap();
-                    let off = ws.offset;
-                    let mut on_disk = Vec::with_capacity(8 + length);
-                    on_disk.extend_from_slice(&checksum.to_le_bytes());
-                    on_disk.extend_from_slice(&bytes);
-                    ws.file
-                        .write_all(&on_disk)
-                        .map_err(|e| ArrowError::IoError(format!("Disk write failed: {e}"), e))?;
-                    // Flush so subsequent pread calls on the read_file FD see
-                    // the written bytes (kernel buffer cache shared between FDs).
-                    ws.file
-                        .flush()
-                        .map_err(|e| ArrowError::IoError(format!("Disk flush failed: {e}"), e))?;
-                    ws.offset = ws
-                        .offset
-                        .checked_add((8 + length) as u64)
-                        .ok_or_else(|| other_arrow_err("Cache file offset overflowed"))?;
-                    off
-                };
-                d.disk_used
-                    .fetch_add((8 + length) as u64, Ordering::Relaxed);
-                let batch_arc = Arc::new(batch);
-                let mut idx = d.index.write().unwrap();
-                let batch_idx = idx.entries.len() as u64;
-                idx.hot.try_insert(batch_idx, batch_arc, length);
-                idx.entries.push(DiskEntry {
-                    file_offset: offset,
-                    ipc_len: length,
-                    checksum,
-                });
-                Ok(())
-            }
+            CacheTier::Disk(d) => match d.policy {
+                WritePolicy::OnInsertion => d.insert_on_insertion(batch),
+                WritePolicy::OnEviction => d.insert_on_eviction(batch),
+            },
         }
     }
 
@@ -251,18 +404,30 @@ impl CacheTier {
         match self {
             CacheTier::Memory(m) => Ok(m.batches.read().unwrap().get(idx as usize).cloned()),
             CacheTier::Disk(d) => {
-                // Copy the DiskEntry and check hot while holding the read lock (brief).
-                let (entry, maybe_hot) = {
+                // Copy the index slot and check hot while holding the read lock.
+                // Both are read from the SAME snapshot so an `OnEviction` batch is
+                // never observed as neither hot nor on-disk (the commit that pops it
+                // from hot and the write that sets its slot happen under one lock).
+                let (slot, maybe_hot) = {
                     let index = d.index.read().unwrap();
                     match index.entries.get(idx as usize) {
                         None => return Ok(None),
-                        Some(&e) => (e, index.hot.get(idx)),
+                        Some(&slot) => (slot, index.hot.get(idx)),
                     }
                 }; // read lock released before any I/O
 
                 if let Some(arc) = maybe_hot {
                     return Ok(Some(arc)); // hot hit: no disk I/O, no checksum needed
                 }
+
+                // Not hot: the slot must be on disk by now.  A `None` here would
+                // mean an evicted batch vanished from both tiers — a bug, not user data.
+                let entry = slot.ok_or_else(|| {
+                    other_arrow_err(format!(
+                        "Batch {idx} is neither in the hot layer nor on disk \
+                         — cache index inconsistency"
+                    ))
+                })?;
 
                 // Disk read: pull the 8-byte header and the IPC payload in one
                 // pread.  The header is the on-disk source of truth; the RAM
@@ -799,7 +964,7 @@ impl Drop for PyStreamCache {
 #[pymethods]
 impl PyStreamCache {
     #[new]
-    #[pyo3(signature = (reader, memory_capacity = None, disk_path = None, disk_capacity = None))]
+    #[pyo3(signature = (reader, memory_capacity = None, disk_path = None, disk_capacity = None, write_policy = "on_insertion".to_string()))]
     pub fn new(
         py: Python<'_>,
         #[gen_stub(override_type(type_repr = "typing.Any", imports = ("typing",)))]
@@ -807,9 +972,22 @@ impl PyStreamCache {
         memory_capacity: Option<usize>,
         disk_path: Option<String>,
         disk_capacity: Option<u64>,
+        write_policy: String,
     ) -> PyResult<Self> {
         let upstream: Box<dyn arrow_array::RecordBatchReader + Send> = Box::new(reader.0);
         let schema = upstream.schema();
+
+        // Parse the write policy up front (applies to the disk tier only; ignored
+        // for memory-only caches).
+        let policy = match write_policy.as_str() {
+            "on_insertion" => WritePolicy::OnInsertion,
+            "on_eviction" => WritePolicy::OnEviction,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "write_policy must be 'on_insertion' or 'on_eviction', got {other:?}"
+                )));
+            }
+        };
 
         let cache = match (disk_path, disk_capacity) {
             (Some(path), Some(capacity)) => {
@@ -855,6 +1033,7 @@ impl PyStreamCache {
                         read_file,
                         disk_capacity: capacity,
                         disk_used: AtomicU64::new(0),
+                        policy,
                     }))
                 })
                 .map_err(PyErr::from)?
