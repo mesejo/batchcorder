@@ -114,7 +114,16 @@ impl HotLayer {
     fn try_insert(&mut self, batch_idx: u64, batch: Arc<RecordBatch>, ipc_len: usize) -> bool {
         while self.used + ipc_len > self.capacity {
             match self.entries.pop_front() {
-                None => return false,
+                None => {
+                    // The batch exceeds the whole budget, so it is not cached.
+                    // It still consumes a global batch index, so advance head
+                    // past it to keep `entries[0] == head_batch_idx` (the
+                    // mapping `get` relies on).  Without this, a later batch
+                    // that *does* fit would be stored at — and read back under —
+                    // the wrong index when batch sizes vary.
+                    self.head_batch_idx += 1;
+                    return false;
+                }
                 Some(evicted) => {
                     if let Some((_, len)) = evicted {
                         self.used -= len;
@@ -1280,6 +1289,24 @@ mod tests {
         // Larger than the whole budget: try_insert returns false and stores nothing.
         assert!(!hot.try_insert(0, Arc::new(make_batch(&[0])), 64));
         assert!(hot.get(0).is_none());
+    }
+
+    #[test]
+    fn hot_layer_oversized_then_fitting_keeps_index_mapping() {
+        // Regression: with variable batch sizes an oversized batch is rejected
+        // (not cached), but a later fitting batch must still be readable under
+        // its own index.  The rejected batch has to advance head so the mapping
+        // `entries[0] == head_batch_idx` holds.
+        let mut hot = HotLayer::new(32);
+        assert!(!hot.try_insert(0, Arc::new(make_batch(&[0])), 64)); // oversized
+        assert!(!hot.try_insert(1, Arc::new(make_batch(&[1])), 64)); // oversized
+        assert!(hot.try_insert(2, Arc::new(make_batch(&[2])), 16)); // fits
+        assert_eq!(hot.head_batch_idx, 2);
+        assert!(hot.get(0).is_none());
+        assert!(hot.get(1).is_none());
+        // Must return batch 2's data, not a misindexed slot.
+        let got = hot.get(2).expect("batch 2 readable");
+        assert_eq!(got.as_ref(), &make_batch(&[2]));
     }
 
     #[test]

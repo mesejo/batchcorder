@@ -12,6 +12,8 @@ repos:
         args: ["--maxkb=500"]
       - id: name-tests-test
         args: ["--pytest-test-first"]
+        # strategies.py is a shared Hypothesis helper module, not a test file.
+        exclude: ^tests/strategies\.py$
 
   - repo: https://github.com/abravalheri/validate-pyproject
     rev: v0.25
