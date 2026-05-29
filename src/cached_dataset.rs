@@ -44,6 +44,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyCapsule;
 use pyo3_stub_gen::derive::*;
 use std::ffi::CString;
+use xxhash_rust::xxh3::xxh3_64;
 
 // ── dataset counter ───────────────────────────────────────────────────────────
 
@@ -127,10 +128,20 @@ impl HotLayer {
     }
 }
 
+/// Per-batch index record for the disk tier.
+#[derive(Copy, Clone)]
+struct DiskEntry {
+    /// Byte offset of `[checksum_header | ipc_payload]` in the cache file.
+    file_offset: u64,
+    /// IPC payload length in bytes (excludes the 8-byte checksum header).
+    ipc_len: usize,
+    /// xxh3_64 of the IPC payload, cached in RAM to avoid re-reading the header.
+    checksum: u64,
+}
+
 /// Combined index + hot layer for the disk tier.
 struct DiskIndex {
-    /// `(file_offset, ipc_byte_length)` for each ingested batch.
-    entries: Vec<(u64, usize)>,
+    entries: Vec<DiskEntry>,
     hot: HotLayer,
 }
 
@@ -182,24 +193,31 @@ impl CacheTier {
             CacheTier::Disk(d) => {
                 let bytes = serialize_batch(&batch)?;
                 let length = bytes.len();
+                let checksum = xxh3_64(&bytes);
                 // Enforce disk capacity before touching the file.
+                // Each entry occupies 8 (checksum header) + ipc_len bytes on disk.
                 let disk_prev = d.disk_used.load(Ordering::Relaxed);
                 if disk_prev
-                    .checked_add(length as u64)
+                    .checked_add((8 + length) as u64)
                     .is_none_or(|end| end > d.disk_capacity)
                 {
                     return Err(ArrowError::MemoryError(format!(
                         "Disk cache capacity ({} bytes) exceeded: {} bytes already written, \
                          cannot fit {} more bytes",
-                        d.disk_capacity, disk_prev, length
+                        d.disk_capacity,
+                        disk_prev,
+                        8 + length
                     )));
                 }
-                // Write to file and advance the offset.
+                // Write [checksum_le | ipc_payload] and advance the offset.
                 let offset = {
                     let mut ws = d.write_state.lock().unwrap();
                     let off = ws.offset;
+                    let mut on_disk = Vec::with_capacity(8 + length);
+                    on_disk.extend_from_slice(&checksum.to_le_bytes());
+                    on_disk.extend_from_slice(&bytes);
                     ws.file
-                        .write_all(&bytes)
+                        .write_all(&on_disk)
                         .map_err(|e| other_arrow_err(format!("Disk write failed: {e}")))?;
                     // Flush so subsequent pread calls on the read_file FD see
                     // the written bytes (kernel buffer cache shared between FDs).
@@ -208,16 +226,21 @@ impl CacheTier {
                         .map_err(|e| other_arrow_err(format!("Disk flush failed: {e}")))?;
                     ws.offset = ws
                         .offset
-                        .checked_add(length as u64)
+                        .checked_add((8 + length) as u64)
                         .ok_or_else(|| other_arrow_err("Cache file offset overflowed"))?;
                     off
                 };
-                d.disk_used.fetch_add(length as u64, Ordering::Relaxed);
+                d.disk_used
+                    .fetch_add((8 + length) as u64, Ordering::Relaxed);
                 let batch_arc = Arc::new(batch);
                 let mut idx = d.index.write().unwrap();
                 let batch_idx = idx.entries.len() as u64;
                 idx.hot.try_insert(batch_idx, batch_arc, length);
-                idx.entries.push((offset, length));
+                idx.entries.push(DiskEntry {
+                    file_offset: offset,
+                    ipc_len: length,
+                    checksum,
+                });
                 Ok(())
             }
         }
@@ -228,24 +251,46 @@ impl CacheTier {
         match self {
             CacheTier::Memory(m) => Ok(m.batches.read().unwrap().get(idx as usize).cloned()),
             CacheTier::Disk(d) => {
-                // Grab offset + hot copy while holding the read lock (brief).
-                let (offset, length, maybe_hot) = {
+                // Copy the DiskEntry and check hot while holding the read lock (brief).
+                let (entry, maybe_hot) = {
                     let index = d.index.read().unwrap();
                     match index.entries.get(idx as usize) {
                         None => return Ok(None),
-                        Some(&(off, len)) => (off, len, index.hot.get(idx)),
+                        Some(&e) => (e, index.hot.get(idx)),
                     }
                 }; // read lock released before any I/O
 
                 if let Some(arc) = maybe_hot {
-                    return Ok(Some(arc));
+                    return Ok(Some(arc)); // hot hit: no disk I/O, no checksum needed
                 }
 
-                // Fall through to disk: positional read, no seek required.
-                let mut buf = vec![0u8; length];
-                pread_exact(&d.read_file, &mut buf, offset)
-                    .map_err(|e| other_arrow_err(format!("Disk read failed: {e}")))?;
-                deserialize_batch(&buf).map(|b| Some(Arc::new(b)))
+                // Disk read: pull the 8-byte header and the IPC payload in one
+                // pread.  The header is the on-disk source of truth; the RAM
+                // checksum guards against header corruption itself.
+                let mut buf = vec![0u8; 8 + entry.ipc_len];
+                pread_exact(&d.read_file, &mut buf, entry.file_offset).map_err(|e| {
+                    // A short read here means the cache file was truncated/corrupted;
+                    // surface it as an I/O error (→ PyIOError) like a checksum mismatch.
+                    ArrowError::IoError(format!("Disk read failed: {e}"), e)
+                })?;
+
+                let header =
+                    u64::from_le_bytes(buf[..8].try_into().expect("slice is exactly 8 bytes"));
+                let payload = &buf[8..];
+                let actual = xxh3_64(payload);
+                if actual != entry.checksum || header != entry.checksum {
+                    return Err(ArrowError::IoError(
+                        format!(
+                            "Checksum mismatch for batch {idx}: \
+                             expected {:#018x}, header {:#018x}, payload {:#018x} \
+                             — cache file may be corrupted",
+                            entry.checksum, header, actual
+                        ),
+                        std::io::Error::other("checksum mismatch"),
+                    ));
+                }
+
+                deserialize_batch(payload).map(|b| Some(Arc::new(b)))
             }
         }
     }

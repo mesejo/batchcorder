@@ -7,6 +7,7 @@ Each test verifies three things for a given error condition:
      is set and format_exception produces something useful).
 """
 
+import os
 import traceback
 
 import pyarrow as pa
@@ -235,3 +236,93 @@ def test_disk_capacity_exceeded_mid_stream(tmp_path):
     with pytest.raises(MemoryError, match="capacity"):
         ds.ingest_all()
     assert ds.ingested_count >= 1
+
+
+# ── Gap 3: checksum / corruption detection ────────────────────────────────────
+
+
+def _disk_cache_checksums(tmp_path, subdir="cache") -> tuple:
+    source = pa.table({"id": list(range(300)), "v": list(range(300))})
+    ds = StreamCache(
+        source.to_reader(max_chunksize=100),
+        memory_capacity=1,  # force all to disk
+        disk_path=str(tmp_path / subdir),
+        disk_capacity=64 * 1024 * 1024,
+    )
+    return ds, source
+
+
+def _find_cache_file(tmp_path, subdir="cache"):
+    return next((tmp_path / subdir).rglob("cache.arrow"))
+
+
+def test_checksum_valid_roundtrip(tmp_path):
+    """Normal round-trip is unaffected by the checksum layer."""
+    ds, source = _disk_cache_checksums(tmp_path)
+    ds.ingest_all()
+    result = pa.RecordBatchReader.from_stream(ds).read_all()
+    assert result.sort_by("id").equals(source.sort_by("id"))
+
+
+def test_checksum_mismatch_raises_ioerror(tmp_path):
+    """Flipping a byte in the IPC payload raises OSError mentioning checksum."""
+    ds, _ = _disk_cache_checksums(tmp_path)
+    ds.ingest_all()
+
+    cache_file = _find_cache_file(tmp_path)
+    with open(cache_file, "r+b") as f:
+        # Skip 8-byte checksum header for batch 0; corrupt byte 100 of payload.
+        f.seek(8 + 100)
+        original = f.read(1)
+        f.seek(8 + 100)
+        f.write(bytes([original[0] ^ 0xFF]))
+
+    with pytest.raises(OSError, match=r"[Cc]hecksum|mismatch|corrupt"):
+        pa.RecordBatchReader.from_stream(ds.reader(from_start=True)).read_all()
+
+
+def test_checksum_truncated_file_raises_ioerror(tmp_path):
+    """A truncated cache file raises OSError, not a silent short read."""
+    ds, _ = _disk_cache_checksums(tmp_path)
+    ds.ingest_all()
+
+    cache_file = _find_cache_file(tmp_path)
+    size = cache_file.stat().st_size
+    os.truncate(cache_file, size // 2)
+
+    with pytest.raises(OSError, match=r"[Dd]isk read|fill whole buffer|EOF|truncated"):
+        pa.RecordBatchReader.from_stream(ds.reader(from_start=True)).read_all()
+
+
+def test_checksum_header_corruption_raises_ioerror(tmp_path):
+    """Corrupting the 8-byte checksum header raises OSError."""
+    ds, _ = _disk_cache_checksums(tmp_path)
+    ds.ingest_all()
+
+    cache_file = _find_cache_file(tmp_path)
+    with open(cache_file, "r+b") as f:
+        f.seek(0)
+        f.write(b"\x00" * 8)
+
+    with pytest.raises(OSError, match=r"[Cc]hecksum|mismatch|corrupt"):
+        pa.RecordBatchReader.from_stream(ds.reader(from_start=True)).read_all()
+
+
+def test_checksum_hot_hit_bypasses_disk(tmp_path):
+    """Batch served from hot layer skips disk; corrupting file doesn't affect hot reads."""
+    source = pa.table({"id": list(range(100))})
+    ds = StreamCache(
+        source.to_reader(max_chunksize=100),
+        memory_capacity=64 * 1024 * 1024,  # large hot — batch stays hot
+        disk_path=str(tmp_path / "cache"),
+        disk_capacity=64 * 1024 * 1024,
+    )
+    ds.ingest_all()
+
+    cache_file = _find_cache_file(tmp_path, "cache")
+    with open(cache_file, "r+b") as f:
+        f.seek(8 + 100)
+        f.write(b"\xff" * 10)
+
+    result = pa.RecordBatchReader.from_stream(ds.reader(from_start=True)).read_all()
+    assert result.equals(source)

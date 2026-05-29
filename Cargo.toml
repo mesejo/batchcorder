@@ -29,6 +29,9 @@ arrow-ipc = "58"
 # System information for detecting total physical RAM (used as default hot-cache budget)
 sysinfo = { version = "0.33", default-features = false, features = ["system"] }
 
+# Fast non-cryptographic hash for cache entry integrity checks
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
 [lints.rust]
 # Py_GIL_DISABLED is a cfg set by pyo3's build script to indicate free-threaded Python.
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(Py_GIL_DISABLED)'] }
