@@ -69,6 +69,30 @@ ds.ingest_all()   # upstream fully consumed; cache is complete
 readers = [ds.reader() for _ in range(8)]
 ```
 
+## Bounded concurrent reads with `max_readers`
+
+If you know the number of concurrent readers upfront, set `max_readers` to
+enable automatic eviction.  Batches are freed from cache once all readers
+have advanced past them:
+
+```{python}
+#| eval: false
+ds = StreamCache(source, max_readers=4)
+
+def read(i):
+    results[i] = pa.RecordBatchReader.from_stream(ds.reader()).read_all()
+
+threads = [threading.Thread(target=read, args=(i,)) for i in range(4)]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+```
+
+This keeps memory proportional to the gap between the fastest and slowest
+reader.  Without `max_readers`, all batches are retained for the lifetime of
+the cache.
+
 ## Reading from `__arrow_c_stream__`
 
 `StreamCache` itself implements `__arrow_c_stream__`, which creates a fresh

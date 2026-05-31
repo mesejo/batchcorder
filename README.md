@@ -75,6 +75,12 @@ for batch in ds:
 reader = ds.reader()
 result = pa.RecordBatchReader.from_stream(reader).read_all()
 
+# Bounded-memory: evict batches once all readers have passed them
+ds = StreamCache(
+    table.to_reader(max_chunksize=1),
+    max_readers=2,  # at most 2 reads; batches evicted when both advance
+)
+
 # Pre-ingest everything upfront
 ds.ingest_all()
 ```
@@ -105,6 +111,9 @@ duckdb.table("ds")  # DuckDB
 - **Replay from any position**: `ds.reader(from_start=True)` (default) replays
   from batch 0; `ds.reader(from_start=False)` starts from the current ingestion
   frontier (next batch not yet ingested).
+- **Bounded-memory streaming**: set `max_readers=N` to evict batches once all
+  `N` readers have advanced past them.  When unset, all batches are retained
+  indefinitely.
 
 ## Development
 

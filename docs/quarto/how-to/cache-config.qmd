@@ -64,6 +64,32 @@ Set `memory_capacity` to cover the data your hottest readers are actively
 consuming.  Batches that exceed the hot budget are served directly from disk
 with no in-memory copy.
 
+## Bounded-memory streaming with `max_readers`
+
+When you know how many times the stream will be read, set `max_readers` to
+evict batches once all readers have advanced past them.  This keeps memory
+usage proportional to the window between the slowest and fastest reader,
+rather than the full stream.
+
+```{python}
+#| eval: false
+ds = StreamCache(
+    source,
+    max_readers=2,   # at most 2 reads of the stream
+)
+
+r1 = ds.reader()
+r2 = ds.reader()
+
+# As both readers advance, batches behind the slowest are freed.
+result1 = pa.RecordBatchReader.from_stream(r1).read_all()
+result2 = pa.RecordBatchReader.from_stream(r2).read_all()
+```
+
+Once all `max_readers` readers have been created and consumed, no further
+readers can be obtained.  When `max_readers` is omitted (default), all
+batches are retained indefinitely and unlimited readers are allowed.
+
 ## Training-loop workloads
 
 For ML training loops where you replay the full stream each epoch, call

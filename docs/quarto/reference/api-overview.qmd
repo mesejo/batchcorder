@@ -15,7 +15,7 @@ hybrid memory + disk cache.
 
 | Method / property        | Description |
 |--------------------------|-------------|
-| `__init__(...)`          | Create a StreamCache from any `__arrow_c_stream__` source. |
+| `__init__(...)`          | Create a StreamCache from any `__arrow_c_stream__` source. Accepts optional `max_readers` to enable bounded-memory eviction. |
 | `reader(from_start=True)`| Return a new independent reader handle. |
 | `ingest_all()`           | Eagerly consume the upstream source into the cache. |
 | `schema`                 | Arrow schema of the stream. |
