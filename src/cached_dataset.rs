@@ -383,13 +383,19 @@ enum CacheTier {
 impl CacheTier {
     /// Store a batch.  Called while `DatasetInner`'s mutex is held.
     fn insert(&self, batch: RecordBatch) -> Result<(), ArrowError> {
+        let batch_size: usize = batch
+            .columns()
+            .iter()
+            .map(|c| c.get_array_memory_size())
+            .sum();
+        if batch_size > MAX_BATCH_BYTES {
+            return Err(other_arrow_err(format!(
+                "Single batch ({batch_size} bytes) exceeds the {} byte Arrow limit",
+                MAX_BATCH_BYTES
+            )));
+        }
         match self {
             CacheTier::Memory(m) => {
-                let batch_size: usize = batch
-                    .columns()
-                    .iter()
-                    .map(|c| c.get_array_memory_size())
-                    .sum();
                 let used = m.used.load(Ordering::Relaxed);
                 if used + batch_size > m.capacity {
                     return Err(ArrowError::MemoryError(format!(
