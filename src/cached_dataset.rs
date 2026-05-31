@@ -621,6 +621,15 @@ fn deserialize_batch(bytes: &[u8]) -> Result<RecordBatch, ArrowError> {
 }
 
 // ── GIL management ───────────────────────────────────────────────────────────
+//
+// We use raw CPython FFI instead of PyO3's safe wrappers because:
+//  - `py.allow_threads(f)` requires `F: Ungil`, which forbids reacquiring the
+//    GIL inside `f`.  `ingest_up_to` needs to reacquire for `upstream.next()`.
+//  - `Python::with_gil()` was removed in PyO3 0.28.
+//
+// Safety contract: `without_gil` saves the thread state and restores it on
+// drop; `with_gil_acquired` ensures/releases via `PyGILState_Ensure/Release`.
+// Both are no-ops under the free-threaded build (`Py_GIL_DISABLED`).
 
 fn without_gil<T, F: FnOnce() -> T>(_py: Python<'_>, f: F) -> T {
     struct RestoreGuard(*mut pyo3::ffi::PyThreadState);
