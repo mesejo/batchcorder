@@ -978,9 +978,10 @@ pub struct PyStreamCache {
 
 impl Drop for PyStreamCache {
     fn drop(&mut self) {
-        if let Ok(inner) = self.inner.lock()
+        if let Ok(mut inner) = self.inner.lock()
             && !inner.closed
         {
+            inner.closed = true;
             let cache = inner.cache.clone();
             drop(inner);
             cache.cleanup_disk();
