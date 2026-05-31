@@ -22,17 +22,17 @@ use std::collections::VecDeque;
 use std::io::{Cursor, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
 
 // ── system memory detection ───────────────────────────────────────────────────
 
-fn total_system_memory() -> usize {
+static TOTAL_SYSTEM_MEMORY: LazyLock<usize> = LazyLock::new(|| {
     let sys = sysinfo::System::new_with_specifics(
         sysinfo::RefreshKind::nothing()
             .with_memory(sysinfo::MemoryRefreshKind::nothing().with_ram()),
     );
     sys.total_memory() as usize
-}
+});
 
 use arrow_array::RecordBatch;
 use arrow_array::ffi::FFI_ArrowSchema;
@@ -1027,7 +1027,7 @@ impl PyStreamCache {
                     let hot_capacity = memory_capacity.unwrap_or_else(|| {
                         // Cap at half of system RAM so multiple caches don't
                         // collectively exhaust memory; floor at 64 MiB.
-                        (total_system_memory() / 2).max(64 * 1024 * 1024)
+                        (*TOTAL_SYSTEM_MEMORY / 2).max(64 * 1024 * 1024)
                     });
                     Ok::<_, BoundaryError>(CacheTier::Disk(DiskCacheTier {
                         dir_path,
@@ -1050,7 +1050,7 @@ impl PyStreamCache {
             (None, None) => {
                 let capacity = memory_capacity.unwrap_or_else(|| {
                     // Default to 10% of system RAM, floor at 64 MiB.
-                    (total_system_memory() / 10).max(64 * 1024 * 1024)
+                    (*TOTAL_SYSTEM_MEMORY / 10).max(64 * 1024 * 1024)
                 });
                 CacheTier::Memory(MemoryCacheTier {
                     batches: RwLock::new(Vec::new()),
