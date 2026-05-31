@@ -271,7 +271,7 @@ impl DiskCacheTier {
     fn write_ipc_to_disk(&self, bytes: &[u8], checksum: u64) -> Result<u64, ArrowError> {
         let length = bytes.len();
         let offset = {
-            let mut ws = self.write_state.lock().unwrap();
+            let mut ws = self.write_state.lock().map_err(poisoned_lock_err)?;
             let off = ws.offset;
             let mut on_disk = Vec::with_capacity(8 + length);
             on_disk.extend_from_slice(&checksum.to_le_bytes());
@@ -305,7 +305,7 @@ impl DiskCacheTier {
         let offset = self.write_ipc_to_disk(&bytes, checksum)?;
 
         let batch_arc = Arc::new(batch);
-        let mut idx = self.index.write().unwrap();
+        let mut idx = self.index.write().map_err(poisoned_lock_err)?;
         let batch_idx = idx.entries.len() as u64;
         idx.hot.try_insert(batch_idx, batch_arc, length);
         idx.entries.push(Some(DiskEntry {
@@ -339,7 +339,7 @@ impl DiskCacheTier {
 
         // Phase 1: stage evictions and append the placeholder slot, under the lock.
         let evicted = {
-            let mut idx = self.index.write().unwrap();
+            let mut idx = self.index.write().map_err(poisoned_lock_err)?;
             let batch_idx = idx.entries.len() as u64;
             let evicted = idx.hot.stage_evictions(batch_idx, batch_arc, mem_size);
             idx.entries.push(None); // "in hot, not yet on disk"
@@ -366,7 +366,7 @@ impl DiskCacheTier {
 
         // Phase 3: pop the evicted entries from hot and record their disk slots,
         // atomically under one write lock so readers never see a gap.
-        let mut idx = self.index.write().unwrap();
+        let mut idx = self.index.write().map_err(poisoned_lock_err)?;
         idx.hot.commit_evictions(evicted.len());
         for (evicted_idx, disk_entry) in disk_entries {
             idx.entries[evicted_idx as usize] = Some(disk_entry);
@@ -404,7 +404,7 @@ impl CacheTier {
                     )));
                 }
                 m.used.fetch_add(batch_size, Ordering::Relaxed);
-                m.batches.write().unwrap().push(Arc::new(batch));
+                m.batches.write().map_err(poisoned_lock_err)?.push(Arc::new(batch));
                 Ok(())
             }
             CacheTier::Disk(d) => match d.policy {
@@ -417,14 +417,14 @@ impl CacheTier {
     /// Retrieve batch `idx`, or `None` if not yet ingested.
     fn get(&self, idx: u64) -> Result<Option<Arc<RecordBatch>>, ArrowError> {
         match self {
-            CacheTier::Memory(m) => Ok(m.batches.read().unwrap().get(idx as usize).cloned()),
+            CacheTier::Memory(m) => Ok(m.batches.read().map_err(poisoned_lock_err)?.get(idx as usize).cloned()),
             CacheTier::Disk(d) => {
                 // Copy the index slot and check hot while holding the read lock.
                 // Both are read from the SAME snapshot so an `OnEviction` batch is
                 // never observed as neither hot nor on-disk (the commit that pops it
                 // from hot and the write that sets its slot happen under one lock).
                 let (slot, maybe_hot) = {
-                    let index = d.index.read().unwrap();
+                    let index = d.index.read().map_err(poisoned_lock_err)?;
                     match index.entries.get(idx as usize) {
                         None => return Ok(None),
                         Some(&slot) => (slot, index.hot.get(idx)),
@@ -476,14 +476,19 @@ impl CacheTier {
     }
 
     /// Release in-memory data (hot layer and, for memory tiers, all batches).
+    /// Silently ignores poisoned locks since this runs during teardown.
     fn clear(&self) {
         match self {
             CacheTier::Memory(m) => {
-                m.batches.write().unwrap().clear();
+                if let Ok(mut batches) = m.batches.write() {
+                    batches.clear();
+                }
                 m.used.store(0, Ordering::Relaxed);
             }
             CacheTier::Disk(d) => {
-                d.index.write().unwrap().hot.clear();
+                if let Ok(mut index) = d.index.write() {
+                    index.hot.clear();
+                }
             }
         }
     }
@@ -541,6 +546,14 @@ fn pread_exact(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Re
 #[cold]
 fn other_arrow_err(msg: impl std::fmt::Display) -> ArrowError {
     ArrowError::ExternalError(Box::new(std::io::Error::other(msg.to_string())))
+}
+
+fn poisoned_lock_err<T>(_: std::sync::PoisonError<T>) -> ArrowError {
+    other_arrow_err("Internal lock poisoned by a prior panic")
+}
+
+fn poisoned_lock_pyerr<T>(_: std::sync::PoisonError<T>) -> PyErr {
+    PyRuntimeError::new_err("Internal lock poisoned by a prior panic")
 }
 
 /// Semantic error type for `without_gil` closures, so each kind maps to the
@@ -817,7 +830,7 @@ impl PyStreamCacheReader {
         let reader = self
             .0
             .lock()
-            .unwrap()
+            .map_err(poisoned_lock_pyerr)?
             .take()
             .ok_or_else(|| PyValueError::new_err("Reader already consumed"))?;
         Self::to_stream_pycapsule(py, reader, requested_schema.map(|c| c.into_any()))
@@ -825,7 +838,7 @@ impl PyStreamCacheReader {
 
     #[gen_stub(override_return_type(type_repr = "typing.Any", imports = ("typing",)))]
     fn __arrow_c_schema__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyCapsule>> {
-        let inner = self.0.lock().unwrap();
+        let inner = self.0.lock().map_err(poisoned_lock_pyerr)?;
         let reader = inner
             .as_ref()
             .ok_or_else(|| PyValueError::new_err("Reader already consumed"))?;
@@ -835,7 +848,7 @@ impl PyStreamCacheReader {
     #[gen_stub(override_return_type(type_repr = "pa.Schema", imports = ("pyarrow as pa",)))]
     #[getter]
     fn schema(&self) -> PyResult<PyArrowType<Schema>> {
-        let inner = self.0.lock().unwrap();
+        let inner = self.0.lock().map_err(poisoned_lock_pyerr)?;
         let reader = inner
             .as_ref()
             .ok_or_else(|| PyValueError::new_err("Reader already consumed"))?;
@@ -843,8 +856,8 @@ impl PyStreamCacheReader {
     }
 
     #[getter]
-    fn closed(&self) -> bool {
-        self.0.lock().unwrap().is_none()
+    fn closed(&self) -> PyResult<bool> {
+        Ok(self.0.lock().map_err(poisoned_lock_pyerr)?.is_none())
     }
 
     fn __iter__<'py>(slf: PyRef<'py, Self>) -> PyRef<'py, Self> {
@@ -861,7 +874,7 @@ impl PyStreamCacheReader {
         let impl_ = self
             .0
             .lock()
-            .unwrap()
+            .map_err(poisoned_lock_pyerr)?
             .take()
             .ok_or_else(|| PyValueError::new_err("Reader already consumed"))?;
         let new_reader = PyStreamCacheReader::new(impl_);
@@ -876,7 +889,7 @@ impl PyStreamCacheReader {
 
     #[gen_stub(override_return_type(type_repr = "pa.RecordBatch", imports = ("pyarrow as pa",)))]
     fn __next__(&self, py: Python<'_>) -> PyResult<Option<PyArrowType<RecordBatch>>> {
-        let mut guard = self.0.lock().unwrap();
+        let mut guard = self.0.lock().map_err(poisoned_lock_pyerr)?;
         let impl_ = match guard.as_mut() {
             None => {
                 return Err(PyValueError::new_err("Reader already consumed"));
@@ -1142,9 +1155,9 @@ impl PyStreamCache {
         let impl_ = reader
             .0
             .lock()
-            .unwrap()
+            .map_err(poisoned_lock_pyerr)?
             .take()
-            .expect("freshly created reader cannot be closed");
+            .ok_or_else(|| PyRuntimeError::new_err("freshly created reader was unexpectedly consumed"))?;
         PyStreamCacheReader::to_stream_pycapsule(py, impl_, requested_schema.map(|c| c.into_any()))
     }
 
