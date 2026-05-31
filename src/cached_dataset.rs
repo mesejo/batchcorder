@@ -550,6 +550,7 @@ enum BoundaryError {
     Io(String),
     Memory(String),
     Runtime(String),
+    Arrow(String),
 }
 
 impl From<BoundaryError> for PyErr {
@@ -559,6 +560,7 @@ impl From<BoundaryError> for PyErr {
             BoundaryError::Io(s) => PyIOError::new_err(s),
             BoundaryError::Memory(s) => PyMemoryError::new_err(s),
             BoundaryError::Runtime(s) => PyRuntimeError::new_err(s),
+            BoundaryError::Arrow(s) => arrow_pyarrow::PyArrowException::new_err(s),
         }
     }
 }
@@ -569,7 +571,7 @@ fn arrow_to_boundary(e: ArrowError) -> BoundaryError {
         ArrowError::MemoryError(msg) => BoundaryError::Memory(msg),
         ArrowError::InvalidArgumentError(msg) => BoundaryError::Value(msg),
         ArrowError::IoError(msg, _) => BoundaryError::Io(msg),
-        _ => BoundaryError::Io(e.to_string()),
+        _ => BoundaryError::Arrow(e.to_string()),
     }
 }
 
