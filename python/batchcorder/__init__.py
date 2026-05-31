@@ -68,6 +68,12 @@ class StreamCache:
         disk immediately.  ``"on_eviction"`` keeps batches in the hot layer and
         only writes them to disk when evicted, so a hot layer large enough to
         hold the whole stream never touches disk.
+    max_readers : int, optional
+        Maximum number of readers that will be created from this cache.  When
+        set, batches are evicted once all readers have advanced past them,
+        enabling bounded-memory streaming.  ``reader(from_start=True)`` raises
+        ``ValueError`` if batch 0 has already been evicted.  When ``None``
+        (default), all batches are retained indefinitely.
 
     Examples
     --------
@@ -99,10 +105,11 @@ class StreamCache:
         disk_path: str | None = None,
         disk_capacity: int | None = None,
         write_policy: str = "on_insertion",
+        max_readers: int | None = None,
     ):
         """See class docstring for parameter documentation."""
         self._impl = _PyStreamCache(
-            reader, memory_capacity, disk_path, disk_capacity, write_policy
+            reader, memory_capacity, disk_path, disk_capacity, write_policy, max_readers
         )
 
     @property

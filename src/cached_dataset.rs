@@ -22,7 +22,7 @@ use std::collections::VecDeque;
 use std::io::{Cursor, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, RwLock};
+use std::sync::{Arc, LazyLock, Mutex, RwLock, Weak};
 
 // ── system memory detection ───────────────────────────────────────────────────
 
@@ -67,9 +67,16 @@ enum WritePolicy {
 
 // ── cache tiers ──────────────────────────────────────────────────────────────
 
+/// In-memory index: VecDeque with a head offset so front eviction is O(1).
+struct MemoryIndex {
+    entries: VecDeque<Arc<RecordBatch>>,
+    /// Global batch index of `entries[0]`.
+    head_batch_idx: u64,
+}
+
 /// In-memory cache: batches stored as `Arc<RecordBatch>`, zero-copy reads.
 struct MemoryCacheTier {
-    batches: RwLock<Vec<Arc<RecordBatch>>>,
+    batches: RwLock<MemoryIndex>,
     /// Byte budget for all cached batches combined.
     capacity: usize,
     /// Bytes currently held across all cached batches.
@@ -404,7 +411,11 @@ impl CacheTier {
                     )));
                 }
                 m.used.fetch_add(batch_size, Ordering::Relaxed);
-                m.batches.write().map_err(poisoned_lock_err)?.push(Arc::new(batch));
+                m.batches
+                    .write()
+                    .map_err(poisoned_lock_err)?
+                    .entries
+                    .push_back(Arc::new(batch));
                 Ok(())
             }
             CacheTier::Disk(d) => match d.policy {
@@ -417,7 +428,14 @@ impl CacheTier {
     /// Retrieve batch `idx`, or `None` if not yet ingested.
     fn get(&self, idx: u64) -> Result<Option<Arc<RecordBatch>>, ArrowError> {
         match self {
-            CacheTier::Memory(m) => Ok(m.batches.read().map_err(poisoned_lock_err)?.get(idx as usize).cloned()),
+            CacheTier::Memory(m) => {
+                let index = m.batches.read().map_err(poisoned_lock_err)?;
+                if idx < index.head_batch_idx {
+                    return Ok(None);
+                }
+                let slot = (idx - index.head_batch_idx) as usize;
+                Ok(index.entries.get(slot).cloned())
+            }
             CacheTier::Disk(d) => {
                 // Copy the index slot and check hot while holding the read lock.
                 // Both are read from the SAME snapshot so an `OnEviction` batch is
@@ -435,14 +453,13 @@ impl CacheTier {
                     return Ok(Some(arc)); // hot hit: no disk I/O, no checksum needed
                 }
 
-                // Not hot: the slot must be on disk by now.  A `None` here would
-                // mean an evicted batch vanished from both tiers — a bug, not user data.
-                let entry = slot.ok_or_else(|| {
-                    other_arrow_err(format!(
-                        "Batch {idx} is neither in the hot layer nor on disk \
-                         — cache index inconsistency"
-                    ))
-                })?;
+                // Not hot and no disk slot: the batch was evicted by LWM
+                // eviction, or (under OnEviction policy before the two-phase
+                // commit) it is still in-flight.  Return None so the caller
+                // can surface the appropriate error.
+                let Some(entry) = slot else {
+                    return Ok(None);
+                };
 
                 // Disk read: pull the 8-byte header and the IPC payload in one
                 // pread.  The header is the on-disk source of truth; the RAM
@@ -480,8 +497,9 @@ impl CacheTier {
     fn clear(&self) {
         match self {
             CacheTier::Memory(m) => {
-                if let Ok(mut batches) = m.batches.write() {
-                    batches.clear();
+                if let Ok(mut index) = m.batches.write() {
+                    index.entries.clear();
+                    index.head_batch_idx = 0;
                 }
                 m.used.store(0, Ordering::Relaxed);
             }
@@ -497,6 +515,55 @@ impl CacheTier {
     fn cleanup_disk(&self) {
         if let CacheTier::Disk(d) = self {
             let _ = std::fs::remove_dir_all(&d.dir_path);
+        }
+    }
+
+    /// Evict all cache entries with index strictly below `lwm`.
+    fn evict_below(&self, lwm: u64) {
+        if lwm == 0 {
+            return;
+        }
+        match self {
+            CacheTier::Memory(m) => {
+                let mut index = match m.batches.write() {
+                    Ok(g) => g,
+                    Err(_) => return,
+                };
+                while index.head_batch_idx < lwm {
+                    match index.entries.pop_front() {
+                        None => break,
+                        Some(batch) => {
+                            let size: usize = batch
+                                .columns()
+                                .iter()
+                                .map(|c| c.get_array_memory_size())
+                                .sum();
+                            m.used.fetch_sub(size, Ordering::Relaxed);
+                            index.head_batch_idx += 1;
+                        }
+                    }
+                }
+            }
+            CacheTier::Disk(d) => {
+                let mut idx = match d.index.write() {
+                    Ok(g) => g,
+                    Err(_) => return,
+                };
+                while idx.hot.head_batch_idx < lwm {
+                    match idx.hot.entries.pop_front() {
+                        None => break,
+                        Some(evicted) => {
+                            if let Some((_, len)) = evicted {
+                                idx.hot.used -= len;
+                            }
+                            idx.hot.head_batch_idx += 1;
+                        }
+                    }
+                }
+                for i in 0..(lwm as usize).min(idx.entries.len()) {
+                    idx.entries[i] = None;
+                }
+            }
         }
     }
 }
@@ -682,9 +749,72 @@ struct DatasetInner {
     ingested_count: u64,
     upstream_exhausted: bool,
     closed: bool,
+    max_readers: Option<u64>,
+    readers_created: u64,
+    reader_positions: Vec<Weak<AtomicU64>>,
+    evicted_up_to: u64,
 }
 
 impl DatasetInner {
+    /// Register a new reader at `start_index`.  Returns the shared position
+    /// tracker, or `None` when `max_readers` is unset.
+    fn register_reader(
+        &mut self,
+        start_index: u64,
+        from_start: bool,
+    ) -> Result<Option<Arc<AtomicU64>>, BoundaryError> {
+        if let Some(max) = self.max_readers
+            && self.readers_created >= max
+        {
+            return Err(BoundaryError::Value(format!(
+                "Maximum number of readers ({max}) has been reached"
+            )));
+        }
+        if from_start && self.evicted_up_to > 0 {
+            return Err(BoundaryError::Value(
+                "Cannot create a from-start reader: earliest cached batch has been evicted".into(),
+            ));
+        }
+        if self.max_readers.is_some() {
+            let pos = Arc::new(AtomicU64::new(start_index));
+            self.reader_positions.push(Arc::downgrade(&pos));
+            self.readers_created += 1;
+            Ok(Some(pos))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Compute the low-water mark: the minimum position across all live
+    /// readers.  Prunes dead `Weak` references as a side effect.
+    fn compute_lwm(&mut self) -> Option<u64> {
+        self.max_readers?;
+        if self.readers_created < self.max_readers.expect("checked above") {
+            self.reader_positions.retain(|w| w.strong_count() > 0);
+            return Some(0);
+        }
+        let mut lwm = self.ingested_count;
+        self.reader_positions.retain(|w| {
+            if let Some(arc) = w.upgrade() {
+                lwm = lwm.min(arc.load(Ordering::Acquire));
+                true
+            } else {
+                false
+            }
+        });
+        Some(lwm)
+    }
+
+    /// Evict cache entries below the low-water mark if it has advanced.
+    fn maybe_evict(&mut self) {
+        if let Some(lwm) = self.compute_lwm()
+            && lwm > self.evicted_up_to
+        {
+            self.cache.evict_below(lwm);
+            self.evicted_up_to = lwm;
+        }
+    }
+
     fn ingest_up_to(&mut self, target_index: u64) -> Result<bool, ArrowError> {
         if self.closed {
             return Err(ArrowError::InvalidArgumentError(
@@ -717,6 +847,9 @@ struct StreamCacheReaderImpl {
     schema: SchemaRef,
     inner: Arc<Mutex<DatasetInner>>,
     current_index: u64,
+    /// Shared position visible to `DatasetInner` for LWM computation.
+    /// `None` when `max_readers` is not set (no tracking needed).
+    position: Option<Arc<AtomicU64>>,
 }
 
 impl Iterator for StreamCacheReaderImpl {
@@ -736,6 +869,7 @@ impl Iterator for StreamCacheReaderImpl {
                     "Dataset has been closed".into(),
                 )));
             }
+            inner.maybe_evict();
             match inner.ingest_up_to(idx) {
                 Err(e) => return Some(Err(e)),
                 Ok(false) => return None,
@@ -754,7 +888,6 @@ impl Iterator for StreamCacheReaderImpl {
                         "Dataset has been closed".into(),
                     )))
                 } else {
-                    // Should not happen: ingest_up_to returned Ok(true).
                     Some(Err(other_arrow_err(format!(
                         "Batch {idx} disappeared from the cache unexpectedly"
                     ))))
@@ -762,7 +895,9 @@ impl Iterator for StreamCacheReaderImpl {
             }
             Ok(Some(arc)) => {
                 self.current_index += 1;
-                // Clone the RecordBatch (cheap: clones Arc pointers to buffers).
+                if let Some(ref pos) = self.position {
+                    pos.store(self.current_index, Ordering::Release);
+                }
                 Some(Ok((*arc).clone()))
             }
         }
@@ -918,17 +1053,19 @@ pub struct PyCastingStreamCache {
 impl PyCastingStreamCache {
     fn make_reader_impl(&self, py: Python<'_>) -> PyResult<StreamCacheReaderImpl> {
         without_gil(py, || {
-            let inner = self
+            let mut inner = self
                 .inner
                 .lock()
                 .map_err(|e| BoundaryError::Runtime(format!("Internal mutex error: {e}")))?;
             if inner.closed {
                 return Err(BoundaryError::Value("Dataset has been closed".into()));
             }
+            let position = inner.register_reader(0, true)?;
             Ok::<_, BoundaryError>(StreamCacheReaderImpl {
                 schema: self.source_schema.clone(),
                 inner: self.inner.clone(),
                 current_index: 0,
+                position,
             })
         })
         .map_err(PyErr::from)
@@ -1007,7 +1144,7 @@ impl Drop for PyStreamCache {
 #[pymethods]
 impl PyStreamCache {
     #[new]
-    #[pyo3(signature = (reader, memory_capacity = None, disk_path = None, disk_capacity = None, write_policy = "on_insertion".to_string()))]
+    #[pyo3(signature = (reader, memory_capacity = None, disk_path = None, disk_capacity = None, write_policy = "on_insertion".to_string(), max_readers = None))]
     pub fn new(
         py: Python<'_>,
         #[gen_stub(override_type(type_repr = "typing.Any", imports = ("typing",)))]
@@ -1016,7 +1153,11 @@ impl PyStreamCache {
         disk_path: Option<String>,
         disk_capacity: Option<u64>,
         write_policy: String,
+        max_readers: Option<u64>,
     ) -> PyResult<Self> {
+        if max_readers == Some(0) {
+            return Err(PyValueError::new_err("max_readers must be at least 1"));
+        }
         let upstream: Box<dyn arrow_array::RecordBatchReader + Send> = Box::new(reader.0);
         let schema = upstream.schema();
 
@@ -1087,7 +1228,10 @@ impl PyStreamCache {
                     (*TOTAL_SYSTEM_MEMORY / 10).max(64 * 1024 * 1024)
                 });
                 CacheTier::Memory(MemoryCacheTier {
-                    batches: RwLock::new(Vec::new()),
+                    batches: RwLock::new(MemoryIndex {
+                        entries: VecDeque::new(),
+                        head_batch_idx: 0,
+                    }),
                     capacity,
                     used: AtomicUsize::new(0),
                 })
@@ -1105,6 +1249,10 @@ impl PyStreamCache {
             ingested_count: 0,
             upstream_exhausted: false,
             closed: false,
+            max_readers,
+            readers_created: 0,
+            reader_positions: Vec::new(),
+            evicted_up_to: 0,
         };
 
         Ok(Self {
@@ -1122,7 +1270,7 @@ impl PyStreamCache {
     #[pyo3(signature = (from_start = true))]
     pub fn reader(&self, py: Python<'_>, from_start: bool) -> PyResult<PyStreamCacheReader> {
         without_gil(py, || {
-            let inner = self
+            let mut inner = self
                 .inner
                 .lock()
                 .map_err(|e| BoundaryError::Runtime(format!("Internal mutex error: {e}")))?;
@@ -1130,10 +1278,12 @@ impl PyStreamCache {
                 return Err(BoundaryError::Value("Dataset has been closed".into()));
             }
             let start_index = if from_start { 0 } else { inner.ingested_count };
+            let position = inner.register_reader(start_index, from_start)?;
             Ok::<_, BoundaryError>(PyStreamCacheReader::new(StreamCacheReaderImpl {
                 schema: self.schema.clone(),
                 inner: self.inner.clone(),
                 current_index: start_index,
+                position,
             }))
         })
         .map_err(PyErr::from)
@@ -1157,7 +1307,9 @@ impl PyStreamCache {
             .lock()
             .map_err(poisoned_lock_pyerr)?
             .take()
-            .ok_or_else(|| PyRuntimeError::new_err("freshly created reader was unexpectedly consumed"))?;
+            .ok_or_else(|| {
+                PyRuntimeError::new_err("freshly created reader was unexpectedly consumed")
+            })?;
         PyStreamCacheReader::to_stream_pycapsule(py, impl_, requested_schema.map(|c| c.into_any()))
     }
 
@@ -1408,14 +1560,12 @@ mod tests {
     }
 
     #[test]
-    fn disk_get_none_slot_not_hot_is_inconsistency_error() {
-        // Lines: `slot.ok_or_else(...)` — an entry that is neither on disk (None
-        // slot) nor in the hot layer is a cache-index inconsistency, not user data.
+    fn disk_get_none_slot_returns_none() {
+        // A None slot (evicted or not-yet-committed) returns Ok(None).
         let d = temp_disk_tier(1 << 20, 1 << 20, WritePolicy::OnInsertion);
-        d.index.write().unwrap().entries.push(None); // placeholder, never committed
+        d.index.write().unwrap().entries.push(None);
         let tier = CacheTier::Disk(d);
-        let err = tier.get(0).expect_err("must be an error");
-        assert!(err.to_string().contains("inconsistency"));
+        assert!(tier.get(0).expect("ok").is_none());
         tier.cleanup_disk();
     }
 
@@ -1475,7 +1625,10 @@ mod tests {
 
     fn memory_tier(capacity: usize) -> CacheTier {
         CacheTier::Memory(MemoryCacheTier {
-            batches: RwLock::new(Vec::new()),
+            batches: RwLock::new(MemoryIndex {
+                entries: VecDeque::new(),
+                head_batch_idx: 0,
+            }),
             capacity,
             used: AtomicUsize::new(0),
         })
@@ -1562,6 +1715,60 @@ mod tests {
 
         let err = tier.get(0).expect_err("must fail on short read");
         assert!(matches!(err, ArrowError::IoError(_, _)));
+        tier.cleanup_disk();
+    }
+
+    // ── evict_below ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn memory_evict_below_frees_batches() {
+        let tier = memory_tier(1 << 20);
+        for i in 0..5 {
+            tier.insert(make_batch(&[i])).expect("insert");
+        }
+        tier.evict_below(3);
+        assert!(tier.get(0).expect("ok").is_none());
+        assert!(tier.get(1).expect("ok").is_none());
+        assert!(tier.get(2).expect("ok").is_none());
+        assert!(tier.get(3).expect("ok").is_some());
+        assert!(tier.get(4).expect("ok").is_some());
+    }
+
+    #[test]
+    fn memory_evict_below_updates_used() {
+        let tier = memory_tier(1 << 20);
+        let batch = make_batch(&[1, 2, 3]);
+        let size = batch_mem_size(&batch);
+        tier.insert(batch).expect("insert");
+        tier.insert(make_batch(&[4, 5])).expect("insert");
+        let CacheTier::Memory(ref m) = tier else {
+            panic!("expected memory tier");
+        };
+        let before = m.used.load(Ordering::Relaxed);
+        tier.evict_below(1);
+        let after = m.used.load(Ordering::Relaxed);
+        assert_eq!(before - after, size);
+    }
+
+    #[test]
+    fn memory_evict_below_zero_is_noop() {
+        let tier = memory_tier(1 << 20);
+        tier.insert(make_batch(&[1])).expect("insert");
+        tier.evict_below(0);
+        assert!(tier.get(0).expect("ok").is_some());
+    }
+
+    #[test]
+    fn disk_evict_below_clears_hot_and_index() {
+        let tier = CacheTier::Disk(temp_disk_tier(1 << 20, 1 << 20, WritePolicy::OnInsertion));
+        for i in 0..4 {
+            tier.insert(make_batch(&[i])).expect("insert");
+        }
+        tier.evict_below(2);
+        assert!(tier.get(0).expect("ok").is_none());
+        assert!(tier.get(1).expect("ok").is_none());
+        assert!(tier.get(2).expect("ok").is_some());
+        assert!(tier.get(3).expect("ok").is_some());
         tier.cleanup_disk();
     }
 }
