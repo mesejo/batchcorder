@@ -60,53 +60,55 @@ def test_upstream_not_exhausted_initially(tmp_path):
 
 def test_schema_via_c_schema_capsule(tmp_path):
     table = _make_table()
-    schema = _schema_from_capsule(_dataset(tmp_path, table).__arrow_c_schema__())
+    ds = _dataset(tmp_path, table)
+    schema = _schema_from_capsule(ds.__arrow_c_schema__())
     assert schema == table.schema
 
 
 def test_schema_property_matches_source(tmp_path):
     table = _make_table()
-    assert pa.schema(_dataset(tmp_path, table).schema) == table.schema
+    ds = _dataset(tmp_path, table)
+    assert pa.schema(ds.schema) == table.schema
 
 
 def test_reader_schema_matches_dataset(tmp_path):
     table = _make_table()
-    assert pa.schema(_dataset(tmp_path, table).reader().schema) == table.schema
+    ds = _dataset(tmp_path, table)
+    assert pa.schema(ds.reader().schema) == table.schema
 
 
 def test_reader_returns_correct_data(tmp_path):
     table = _make_table(n_batches=4, rows_per_batch=3)
-    result = pa.RecordBatchReader.from_stream(
-        _dataset(tmp_path, table).reader()
-    ).read_all()
+    ds = _dataset(tmp_path, table)
+    result = pa.RecordBatchReader.from_stream(ds.reader()).read_all()
     assert result.equals(table)
 
 
 def test_dataset_c_stream_returns_correct_data(tmp_path):
     table = _make_table(n_batches=4, rows_per_batch=3)
-    result = pa.RecordBatchReader.from_stream(_dataset(tmp_path, table)).read_all()
+    ds = _dataset(tmp_path, table)
+    result = pa.RecordBatchReader.from_stream(ds).read_all()
     assert result.equals(table)
 
 
 def test_single_batch(tmp_path):
     table = pa.table({"x": [1, 2, 3]})
-    result = pa.RecordBatchReader.from_stream(
-        _dataset(tmp_path, table, batch_size=100)
-    ).read_all()
+    ds = _dataset(tmp_path, table, batch_size=100)
+    result = pa.RecordBatchReader.from_stream(ds).read_all()
     assert result.equals(table)
 
 
 def test_many_small_batches(tmp_path):
     table = _make_table(n_batches=20, rows_per_batch=1)
-    result = pa.RecordBatchReader.from_stream(
-        _dataset(tmp_path, table, batch_size=1)
-    ).read_all()
+    ds = _dataset(tmp_path, table, batch_size=1)
+    result = pa.RecordBatchReader.from_stream(ds).read_all()
     assert result.equals(table)
 
 
 def test_empty_table(tmp_path):
     table = pa.table({"x": pa.array([], type=pa.int32())})
-    result = pa.RecordBatchReader.from_stream(_dataset(tmp_path, table)).read_all()
+    ds = _dataset(tmp_path, table)
+    result = pa.RecordBatchReader.from_stream(ds).read_all()
     assert result.num_rows == 0
     assert result.schema.equals(table.schema)
 
@@ -121,7 +123,8 @@ def test_various_dtypes(tmp_path):
             "bin": pa.array([b"x", b"y", b"z"], type=pa.binary()),
         }
     )
-    result = pa.RecordBatchReader.from_stream(_dataset(tmp_path, table)).read_all()
+    ds = _dataset(tmp_path, table)
+    result = pa.RecordBatchReader.from_stream(ds).read_all()
     assert result.equals(table)
 
 
@@ -132,9 +135,8 @@ def test_nullable_columns(tmp_path):
             "y": pa.array(["a", None, "c"], type=pa.string()),
         }
     )
-    result = pa.RecordBatchReader.from_stream(
-        _dataset(tmp_path, table, batch_size=2)
-    ).read_all()
+    ds = _dataset(tmp_path, table, batch_size=2)
+    result = pa.RecordBatchReader.from_stream(ds).read_all()
     assert result.equals(table)
 
 
@@ -669,7 +671,8 @@ def test_memory_only_construction():
 
 def test_memory_only_returns_correct_data():
     table = _make_table(n_batches=4, rows_per_batch=3)
-    result = pa.RecordBatchReader.from_stream(_memory_only_dataset(table)).read_all()
+    ds = _memory_only_dataset(table)
+    result = pa.RecordBatchReader.from_stream(ds).read_all()
     assert result.equals(table)
 
 

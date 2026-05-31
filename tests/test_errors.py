@@ -31,7 +31,8 @@ def _ds(tmp_path):
 
 def _consumed_reader(tmp_path):
     """Return a StreamCacheReader that has been consumed via __arrow_c_stream__."""
-    r = _ds(tmp_path).reader()
+    ds = _ds(tmp_path)
+    r = ds.reader()
     pa.RecordBatchReader.from_stream(r).read_all()
     assert r.closed
     return r

@@ -35,12 +35,14 @@ TABLE = pa.table(
 
 def test_pa_table_from_dataset(tmp_path):
     """pa.table(ds) should materialise all rows correctly."""
-    assert pa.table(_ds(tmp_path, TABLE)).equals(TABLE)
+    ds = _ds(tmp_path, TABLE)
+    assert pa.table(ds).equals(TABLE)
 
 
 def test_pa_table_from_reader(tmp_path):
     """pa.table(ds.reader()) should materialise all rows correctly."""
-    assert pa.table(_ds(tmp_path, TABLE).reader()).equals(TABLE)
+    ds = _ds(tmp_path, TABLE)
+    assert pa.table(ds.reader()).equals(TABLE)
 
 
 # ── pa.RecordBatchReader interop ──────────────────────────────────────────────
@@ -48,13 +50,15 @@ def test_pa_table_from_reader(tmp_path):
 
 def test_pa_record_batch_reader_from_stream_dataset(tmp_path):
     """`pa.RecordBatchReader.from_stream` accepts StreamCache directly."""
-    result = pa.RecordBatchReader.from_stream(_ds(tmp_path, TABLE)).read_all()
+    ds = _ds(tmp_path, TABLE)
+    result = pa.RecordBatchReader.from_stream(ds).read_all()
     assert result.equals(TABLE)
 
 
 def test_pa_record_batch_reader_from_stream_reader(tmp_path):
     """`pa.RecordBatchReader.from_stream` accepts StreamCacheReader."""
-    result = pa.RecordBatchReader.from_stream(_ds(tmp_path, TABLE).reader()).read_all()
+    ds = _ds(tmp_path, TABLE)
+    result = pa.RecordBatchReader.from_stream(ds.reader()).read_all()
     assert result.equals(TABLE)
 
 
@@ -87,7 +91,8 @@ def test_schema_metadata_preserved_through_cache(tmp_path):
     metadata = {b"author": b"test", b"version": b"1"}
     table = TABLE.replace_schema_metadata(metadata)
 
-    result = pa.RecordBatchReader.from_stream(_ds(tmp_path, table)).read_all()
+    ds = _ds(tmp_path, table)
+    result = pa.RecordBatchReader.from_stream(ds).read_all()
     assert result.schema.metadata == metadata
 
 
@@ -96,7 +101,8 @@ def test_schema_metadata_preserved_through_reader(tmp_path):
     metadata = {b"hello": b"world"}
     table = TABLE.replace_schema_metadata(metadata)
 
-    result = pa.RecordBatchReader.from_stream(_ds(tmp_path, table).reader()).read_all()
+    ds = _ds(tmp_path, table)
+    result = pa.RecordBatchReader.from_stream(ds.reader()).read_all()
     assert result.schema.metadata == metadata
 
 
@@ -104,12 +110,7 @@ def test_schema_metadata_preserved_through_reader(tmp_path):
 
 
 def test_requested_schema_casts_column_type_on_dataset(tmp_path):
-    """Passing a requested_schema to __arrow_c_stream__ triggers a cast.
-
-    This exercises the Arrow C Stream protocol's schema negotiation: the
-    consumer asks for large_utf8 and the producer (pyo3-arrow) casts
-    transparently.
-    """
+    """Passing a requested_schema to __arrow_c_stream__ triggers a cast."""
     ds = _ds(tmp_path, TABLE)
     requested = pa.schema(
         [
@@ -124,7 +125,8 @@ def test_requested_schema_casts_column_type_on_dataset(tmp_path):
 
 def test_requested_schema_casts_column_type_on_reader(tmp_path):
     """Same requested_schema negotiation works on a StreamCacheReader."""
-    r = _ds(tmp_path, TABLE).reader()
+    ds = _ds(tmp_path, TABLE)
+    r = ds.reader()
     requested = pa.schema(
         [
             pa.field("id", pa.int64()),
@@ -140,7 +142,8 @@ def test_requested_schema_casts_column_type_on_reader(tmp_path):
 
 def test_ipc_stream_round_trip_dataset(tmp_path):
     """StreamCache can be piped into an IPC stream writer and read back."""
-    pa_reader = pa.RecordBatchReader.from_stream(_ds(tmp_path, TABLE))
+    ds = _ds(tmp_path, TABLE)
+    pa_reader = pa.RecordBatchReader.from_stream(ds)
     buf = io.BytesIO()
     with pa.ipc.new_stream(buf, pa_reader.schema) as writer:
         for batch in pa_reader:
@@ -151,7 +154,8 @@ def test_ipc_stream_round_trip_dataset(tmp_path):
 
 def test_ipc_stream_round_trip_reader(tmp_path):
     """StreamCacheReader can be piped into an IPC stream writer and read back."""
-    pa_reader = pa.RecordBatchReader.from_stream(_ds(tmp_path, TABLE).reader())
+    ds = _ds(tmp_path, TABLE)
+    pa_reader = pa.RecordBatchReader.from_stream(ds.reader())
     buf = io.BytesIO()
     with pa.ipc.new_stream(buf, pa_reader.schema) as writer:
         for batch in pa_reader:

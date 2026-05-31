@@ -74,7 +74,8 @@ def test_dataset_cast_applies_schema(tmp_path):
 
 def test_dataset_cast_preserves_values(tmp_path):
     """CastingStreamCache does not alter row values, only types."""
-    result = pa.table(_ds(tmp_path, TABLE).cast(TARGET_SCHEMA))
+    ds = _ds(tmp_path, TABLE)
+    result = pa.table(ds.cast(TARGET_SCHEMA))
     assert result.column("id").to_pylist() == TABLE.column("id").to_pylist()
     assert result.column("label").to_pylist() == TABLE.column("label").to_pylist()
     assert result.column("score").to_pylist() == TABLE.column("score").to_pylist()
@@ -82,7 +83,8 @@ def test_dataset_cast_preserves_values(tmp_path):
 
 def test_dataset_cast_multi_batch(tmp_path):
     """CastingStreamCache works correctly when the stream spans multiple batches."""
-    casting = _ds(tmp_path, TABLE, batch_size=2).cast(TARGET_SCHEMA)
+    ds = _ds(tmp_path, TABLE, batch_size=2)
+    casting = ds.cast(TARGET_SCHEMA)
     result = pa.table(casting)
     assert result.num_rows == TABLE.num_rows
     assert result.schema.field("id").type == pa.int64()
@@ -90,13 +92,15 @@ def test_dataset_cast_multi_batch(tmp_path):
 
 def test_dataset_cast_noop_same_schema(tmp_path):
     """CastingStreamCache with the identical schema returns equivalent data."""
-    result = pa.table(_ds(tmp_path, TABLE).cast(TABLE.schema))
+    ds = _ds(tmp_path, TABLE)
+    result = pa.table(ds.cast(TABLE.schema))
     assert result.equals(TABLE)
 
 
 def test_dataset_cast_is_replayable_multiple_reads(tmp_path):
     """CastingStreamCache can be read multiple times; each read returns correct data."""
-    casting = _ds(tmp_path, TABLE).cast(TARGET_SCHEMA)
+    ds = _ds(tmp_path, TABLE)
+    casting = ds.cast(TARGET_SCHEMA)
     r1 = pa.RecordBatchReader.from_stream(casting).read_all()
     r2 = pa.RecordBatchReader.from_stream(casting).read_all()
     r3 = pa.RecordBatchReader.from_stream(casting).read_all()
@@ -114,7 +118,8 @@ def test_dataset_cast_is_replayable_repeated_cast(tmp_path):
 
 def test_dataset_cast_bare_reader_is_not_replayable(tmp_path):
     """Control: a bare pa.RecordBatchReader is one-shot and cannot be replayed."""
-    bare = pa.RecordBatchReader.from_stream(_ds(tmp_path, TABLE).cast(TARGET_SCHEMA))
+    ds = _ds(tmp_path, TABLE)
+    bare = pa.RecordBatchReader.from_stream(ds.cast(TARGET_SCHEMA))
     first = bare.read_all()
     assert first.num_rows == TABLE.num_rows
     second = bare.read_all()  # stream exhausted — returns empty table
@@ -398,14 +403,16 @@ def test_casting_dataset_asof_join_with_tolerance_replayable(tmp_path):
 
 def test_reader_cast_returns_record_batch_reader(tmp_path):
     """cast() on StreamCacheReader returns a pa.RecordBatchReader (one-shot)."""
-    reader = _ds(tmp_path, TABLE).reader()
+    ds = _ds(tmp_path, TABLE)
+    reader = ds.reader()
     result = reader.cast(TARGET_SCHEMA)
     assert isinstance(result, pa.RecordBatchReader)
 
 
 def test_reader_cast_applies_schema(tmp_path):
     """cast() on a reader produces batches with the target schema."""
-    result = _ds(tmp_path, TABLE).reader().cast(TARGET_SCHEMA).read_all()
+    ds = _ds(tmp_path, TABLE)
+    result = ds.reader().cast(TARGET_SCHEMA).read_all()
     assert result.schema.field("id").type == pa.int64()
     assert result.schema.field("label").type == pa.large_utf8()
     assert result.schema.field("score").type == pa.float64()
@@ -413,7 +420,8 @@ def test_reader_cast_applies_schema(tmp_path):
 
 def test_reader_cast_preserves_values(tmp_path):
     """cast() on a reader does not alter row values."""
-    result = _ds(tmp_path, TABLE).reader().cast(TARGET_SCHEMA).read_all()
+    ds = _ds(tmp_path, TABLE)
+    result = ds.reader().cast(TARGET_SCHEMA).read_all()
     assert result.column("id").to_pylist() == TABLE.column("id").to_pylist()
     assert result.column("label").to_pylist() == TABLE.column("label").to_pylist()
     assert result.column("score").to_pylist() == TABLE.column("score").to_pylist()
@@ -421,7 +429,8 @@ def test_reader_cast_preserves_values(tmp_path):
 
 def test_reader_cast_consumes_reader(tmp_path):
     """Calling cast() marks the reader as consumed."""
-    reader = _ds(tmp_path, TABLE).reader()
+    ds = _ds(tmp_path, TABLE)
+    reader = ds.reader()
     assert not reader.closed
     reader.cast(TARGET_SCHEMA).read_all()
     assert reader.closed
@@ -429,7 +438,8 @@ def test_reader_cast_consumes_reader(tmp_path):
 
 def test_reader_cast_raises_if_already_consumed(tmp_path):
     """cast() on an already-consumed reader raises ValueError."""
-    reader = _ds(tmp_path, TABLE).reader()
+    ds = _ds(tmp_path, TABLE)
+    reader = ds.reader()
     reader.cast(TARGET_SCHEMA).read_all()
     with pytest.raises(ValueError, match="already consumed"):
         reader.cast(TARGET_SCHEMA)
@@ -437,12 +447,14 @@ def test_reader_cast_raises_if_already_consumed(tmp_path):
 
 def test_reader_cast_multi_batch(tmp_path):
     """cast() on reader works correctly across multiple batches."""
-    result = _ds(tmp_path, TABLE, batch_size=2).reader().cast(TARGET_SCHEMA).read_all()
+    ds = _ds(tmp_path, TABLE, batch_size=2)
+    result = ds.reader().cast(TARGET_SCHEMA).read_all()
     assert result.num_rows == TABLE.num_rows
     assert result.schema.field("id").type == pa.int64()
 
 
 def test_reader_cast_noop_same_schema(tmp_path):
     """cast() with the same schema returns equivalent data."""
-    result = _ds(tmp_path, TABLE).reader().cast(TABLE.schema).read_all()
+    ds = _ds(tmp_path, TABLE)
+    result = ds.reader().cast(TABLE.schema).read_all()
     assert result.equals(TABLE)
