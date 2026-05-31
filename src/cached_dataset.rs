@@ -472,7 +472,10 @@ impl CacheTier {
     /// Release in-memory data (hot layer and, for memory tiers, all batches).
     fn clear(&self) {
         match self {
-            CacheTier::Memory(m) => m.batches.write().unwrap().clear(),
+            CacheTier::Memory(m) => {
+                m.batches.write().unwrap().clear();
+                m.used.store(0, Ordering::Relaxed);
+            }
             CacheTier::Disk(d) => {
                 d.index.write().unwrap().hot.clear();
             }
