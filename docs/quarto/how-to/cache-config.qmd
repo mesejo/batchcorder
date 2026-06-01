@@ -86,9 +86,15 @@ result1 = pa.RecordBatchReader.from_stream(r1).read_all()
 result2 = pa.RecordBatchReader.from_stream(r2).read_all()
 ```
 
-Once all `max_readers` readers have been created and consumed, no further
-readers can be obtained.  When `max_readers` is omitted (default), all
-batches are retained indefinitely and unlimited readers are allowed.
+**Important:** `max_readers` is a hard cap on the total number of readers
+ever created — dropping a reader does not free a slot for a new one.  Once
+all `max_readers` readers have been created, no further readers can be
+obtained.  Additionally, once batches have been evicted,
+`reader(from_start=True)` raises ``ValueError`` because batch 0 is no
+longer available.
+
+When `max_readers` is omitted (default), all batches are retained
+indefinitely and unlimited readers are allowed.
 
 ## Training-loop workloads
 

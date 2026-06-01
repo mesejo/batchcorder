@@ -519,16 +519,13 @@ impl CacheTier {
     }
 
     /// Evict all cache entries with index strictly below `lwm`.
-    fn evict_below(&self, lwm: u64) {
+    fn evict_below(&self, lwm: u64) -> Result<(), ArrowError> {
         if lwm == 0 {
-            return;
+            return Ok(());
         }
         match self {
             CacheTier::Memory(m) => {
-                let mut index = match m.batches.write() {
-                    Ok(g) => g,
-                    Err(_) => return,
-                };
+                let mut index = m.batches.write().map_err(poisoned_lock_err)?;
                 while index.head_batch_idx < lwm {
                     match index.entries.pop_front() {
                         None => break,
@@ -545,10 +542,7 @@ impl CacheTier {
                 }
             }
             CacheTier::Disk(d) => {
-                let mut idx = match d.index.write() {
-                    Ok(g) => g,
-                    Err(_) => return,
-                };
+                let mut idx = d.index.write().map_err(poisoned_lock_err)?;
                 while idx.hot.head_batch_idx < lwm {
                     match idx.hot.entries.pop_front() {
                         None => break,
@@ -560,11 +554,14 @@ impl CacheTier {
                         }
                     }
                 }
+                // Null out disk index slots; actual disk bytes in the
+                // append-only file are not reclaimable until cleanup.
                 for i in 0..(lwm as usize).min(idx.entries.len()) {
                     idx.entries[i] = None;
                 }
             }
         }
+        Ok(())
     }
 }
 
@@ -625,6 +622,7 @@ fn poisoned_lock_pyerr<T>(_: std::sync::PoisonError<T>) -> PyErr {
 
 /// Semantic error type for `without_gil` closures, so each kind maps to the
 /// right Python exception at the boundary rather than everything becoming OSError.
+#[derive(Debug)]
 enum BoundaryError {
     Value(String),
     Io(String),
@@ -763,6 +761,7 @@ impl DatasetInner {
         start_index: u64,
         from_start: bool,
     ) -> Result<Option<Arc<AtomicU64>>, BoundaryError> {
+        self.reader_positions.retain(|w| w.strong_count() > 0);
         if let Some(max) = self.max_readers
             && self.readers_created >= max
         {
@@ -788,8 +787,8 @@ impl DatasetInner {
     /// Compute the low-water mark: the minimum position across all live
     /// readers.  Prunes dead `Weak` references as a side effect.
     fn compute_lwm(&mut self) -> Option<u64> {
-        self.max_readers?;
-        if self.readers_created < self.max_readers.expect("checked above") {
+        let max = self.max_readers?;
+        if self.readers_created < max {
             self.reader_positions.retain(|w| w.strong_count() > 0);
             return Some(0);
         }
@@ -806,13 +805,14 @@ impl DatasetInner {
     }
 
     /// Evict cache entries below the low-water mark if it has advanced.
-    fn maybe_evict(&mut self) {
+    fn maybe_evict(&mut self) -> Result<(), ArrowError> {
         if let Some(lwm) = self.compute_lwm()
             && lwm > self.evicted_up_to
         {
-            self.cache.evict_below(lwm);
+            self.cache.evict_below(lwm)?;
             self.evicted_up_to = lwm;
         }
+        Ok(())
     }
 
     fn ingest_up_to(&mut self, target_index: u64) -> Result<bool, ArrowError> {
@@ -869,7 +869,11 @@ impl Iterator for StreamCacheReaderImpl {
                     "Dataset has been closed".into(),
                 )));
             }
-            inner.maybe_evict();
+            // Safe: this reader's position is `idx`, so compute_lwm() returns
+            // <= idx and evict_below() never removes the batch we need.
+            if let Err(e) = inner.maybe_evict() {
+                return Some(Err(e));
+            }
             match inner.ingest_up_to(idx) {
                 Err(e) => return Some(Err(e)),
                 Ok(false) => return None,
@@ -900,6 +904,15 @@ impl Iterator for StreamCacheReaderImpl {
                 }
                 Some(Ok((*arc).clone()))
             }
+        }
+    }
+}
+
+impl Drop for StreamCacheReaderImpl {
+    fn drop(&mut self) {
+        self.position.take();
+        if let Ok(mut inner) = self.inner.lock() {
+            let _ = inner.maybe_evict();
         }
     }
 }
@@ -1726,7 +1739,7 @@ mod tests {
         for i in 0..5 {
             tier.insert(make_batch(&[i])).expect("insert");
         }
-        tier.evict_below(3);
+        tier.evict_below(3).expect("evict");
         assert!(tier.get(0).expect("ok").is_none());
         assert!(tier.get(1).expect("ok").is_none());
         assert!(tier.get(2).expect("ok").is_none());
@@ -1745,7 +1758,7 @@ mod tests {
             panic!("expected memory tier");
         };
         let before = m.used.load(Ordering::Relaxed);
-        tier.evict_below(1);
+        tier.evict_below(1).expect("evict");
         let after = m.used.load(Ordering::Relaxed);
         assert_eq!(before - after, size);
     }
@@ -1754,7 +1767,7 @@ mod tests {
     fn memory_evict_below_zero_is_noop() {
         let tier = memory_tier(1 << 20);
         tier.insert(make_batch(&[1])).expect("insert");
-        tier.evict_below(0);
+        tier.evict_below(0).expect("evict");
         assert!(tier.get(0).expect("ok").is_some());
     }
 
@@ -1764,11 +1777,163 @@ mod tests {
         for i in 0..4 {
             tier.insert(make_batch(&[i])).expect("insert");
         }
-        tier.evict_below(2);
+        tier.evict_below(2).expect("evict");
         assert!(tier.get(0).expect("ok").is_none());
         assert!(tier.get(1).expect("ok").is_none());
         assert!(tier.get(2).expect("ok").is_some());
         assert!(tier.get(3).expect("ok").is_some());
         tier.cleanup_disk();
+    }
+
+    // ── DatasetInner LWM logic ──────────────────────────────────────────────────
+
+    fn make_dataset_inner(
+        max_readers: Option<u64>,
+        batch_count: u64,
+    ) -> (Arc<Mutex<DatasetInner>>, Arc<CacheTier>) {
+        let cache = Arc::new(memory_tier(1 << 20));
+        for i in 0..batch_count {
+            cache.insert(make_batch(&[i as i32])).expect("insert");
+        }
+        let inner = DatasetInner {
+            cache: cache.clone(),
+            upstream: None,
+            ingested_count: batch_count,
+            upstream_exhausted: true,
+            closed: false,
+            max_readers,
+            readers_created: 0,
+            reader_positions: Vec::new(),
+            evicted_up_to: 0,
+        };
+        (Arc::new(Mutex::new(inner)), cache)
+    }
+
+    #[test]
+    fn register_reader_tracks_position() {
+        let (inner_arc, _) = make_dataset_inner(Some(2), 4);
+        let mut inner = inner_arc.lock().unwrap();
+        let pos = inner.register_reader(0, true).expect("register");
+        assert!(pos.is_some());
+        assert_eq!(inner.readers_created, 1);
+        assert_eq!(inner.reader_positions.len(), 1);
+    }
+
+    #[test]
+    fn register_reader_none_max_returns_none_position() {
+        let (inner_arc, _) = make_dataset_inner(None, 4);
+        let mut inner = inner_arc.lock().unwrap();
+        let pos = inner.register_reader(0, true).expect("register");
+        assert!(pos.is_none());
+        assert_eq!(inner.readers_created, 0);
+    }
+
+    #[test]
+    fn register_reader_rejects_excess() {
+        let (inner_arc, _) = make_dataset_inner(Some(1), 4);
+        let mut inner = inner_arc.lock().unwrap();
+        let _pos = inner.register_reader(0, true).expect("first ok");
+        assert!(inner.register_reader(0, true).is_err());
+    }
+
+    #[test]
+    fn register_reader_rejects_from_start_after_eviction() {
+        let (inner_arc, _) = make_dataset_inner(Some(2), 4);
+        let mut inner = inner_arc.lock().unwrap();
+        inner.evicted_up_to = 1;
+        assert!(inner.register_reader(0, true).is_err());
+        assert!(inner.register_reader(1, false).is_ok());
+    }
+
+    #[test]
+    fn register_reader_prunes_dead_refs() {
+        let (inner_arc, _) = make_dataset_inner(Some(3), 4);
+        let mut inner = inner_arc.lock().unwrap();
+        let _pos1 = inner.register_reader(0, true).expect("r1");
+        let pos2 = inner.register_reader(0, true).expect("r2");
+        drop(pos2);
+        let _pos3 = inner.register_reader(0, true).expect("r3");
+        assert_eq!(inner.reader_positions.len(), 2);
+    }
+
+    #[test]
+    fn compute_lwm_returns_none_without_max_readers() {
+        let (inner_arc, _) = make_dataset_inner(None, 4);
+        let mut inner = inner_arc.lock().unwrap();
+        assert!(inner.compute_lwm().is_none());
+    }
+
+    #[test]
+    fn compute_lwm_returns_zero_before_all_readers_created() {
+        let (inner_arc, _) = make_dataset_inner(Some(2), 4);
+        let mut inner = inner_arc.lock().unwrap();
+        let _pos = inner.register_reader(0, true).expect("register");
+        assert_eq!(inner.compute_lwm(), Some(0));
+    }
+
+    #[test]
+    fn compute_lwm_returns_min_position() {
+        let (inner_arc, _) = make_dataset_inner(Some(2), 4);
+        let mut inner = inner_arc.lock().unwrap();
+        let pos1 = inner.register_reader(0, true).expect("r1").unwrap();
+        let pos2 = inner.register_reader(0, true).expect("r2").unwrap();
+        pos1.store(3, Ordering::Release);
+        pos2.store(1, Ordering::Release);
+        assert_eq!(inner.compute_lwm(), Some(1));
+    }
+
+    #[test]
+    fn compute_lwm_prunes_dead_readers() {
+        let (inner_arc, _) = make_dataset_inner(Some(2), 4);
+        let mut inner = inner_arc.lock().unwrap();
+        let pos1 = inner.register_reader(0, true).expect("r1").unwrap();
+        let pos2 = inner.register_reader(0, true).expect("r2").unwrap();
+        pos1.store(3, Ordering::Release);
+        drop(pos2);
+        assert_eq!(inner.compute_lwm(), Some(3));
+        assert_eq!(inner.reader_positions.len(), 1);
+    }
+
+    #[test]
+    fn maybe_evict_advances_evicted_up_to() {
+        let (inner_arc, cache) = make_dataset_inner(Some(1), 4);
+        let mut inner = inner_arc.lock().unwrap();
+        let pos = inner.register_reader(0, true).expect("register").unwrap();
+        pos.store(3, Ordering::Release);
+        inner.maybe_evict().expect("evict");
+        assert_eq!(inner.evicted_up_to, 3);
+        assert!(cache.get(0).expect("ok").is_none());
+        assert!(cache.get(2).expect("ok").is_none());
+        assert!(cache.get(3).expect("ok").is_some());
+    }
+
+    #[test]
+    fn maybe_evict_noop_without_max_readers() {
+        let (inner_arc, cache) = make_dataset_inner(None, 4);
+        let mut inner = inner_arc.lock().unwrap();
+        inner.maybe_evict().expect("evict");
+        assert_eq!(inner.evicted_up_to, 0);
+        assert!(cache.get(0).expect("ok").is_some());
+    }
+
+    #[test]
+    fn reader_drop_triggers_eviction() {
+        let (inner_arc, cache) = make_dataset_inner(Some(1), 4);
+        let pos = {
+            let mut inner = inner_arc.lock().unwrap();
+            inner.register_reader(0, true).expect("register").unwrap()
+        };
+        pos.store(4, Ordering::Release);
+        let reader = StreamCacheReaderImpl {
+            schema: Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)])),
+            inner: inner_arc.clone(),
+            current_index: 4,
+            position: Some(pos),
+        };
+        drop(reader);
+        let inner = inner_arc.lock().unwrap();
+        assert_eq!(inner.evicted_up_to, 4);
+        assert!(cache.get(0).expect("ok").is_none());
+        assert!(cache.get(3).expect("ok").is_none());
     }
 }

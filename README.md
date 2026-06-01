@@ -112,8 +112,10 @@ duckdb.table("ds")  # DuckDB
   from batch 0; `ds.reader(from_start=False)` starts from the current ingestion
   frontier (next batch not yet ingested).
 - **Bounded-memory streaming**: set `max_readers=N` to evict batches once all
-  `N` readers have advanced past them.  When unset, all batches are retained
-  indefinitely.
+  `N` readers have advanced past them.  `max_readers` is a hard cap on total
+  readers ever created (dropping a reader does not free a slot).  Once
+  eviction has started, `reader(from_start=True)` raises `ValueError`.
+  When unset, all batches are retained indefinitely.
 
 ## Development
 
