@@ -353,7 +353,7 @@ def test_casting_dataset_asof_join_with_tolerance_replayable(tmp_path):
     first scan and return wrong rows; a CastingStreamCache replays from cache and
     returns the correct result — matching the uncast StreamCache behaviour.
     """
-    _ASOF_TOLERANCE_SQL = """
+    asof_tolerance_sql = """
         WITH matched AS (
             SELECT s.site, s.event_time, e.event_type
             FROM sensors s
@@ -395,9 +395,9 @@ def test_casting_dataset_asof_join_with_tolerance_replayable(tmp_path):
     con = duckdb.connect()
     con.register("sensors", cast_sensors)
     con.register("events", cast_events)
-    rows = con.execute(_ASOF_TOLERANCE_SQL).fetchall()
+    rows = con.execute(asof_tolerance_sql).fetchall()
 
-    expected = _reference(_ASOF_TOLERANCE_SQL)
+    expected = _reference(asof_tolerance_sql)
     assert rows == expected
 
 
