@@ -352,11 +352,7 @@ def test_disk_read_failure_raises_oserror(tmp_path):
     cache_file = _find_cache_file(tmp_path, "read_fail")
     os.truncate(cache_file, 9)  # leave checksum header only, no payload
 
-    try:
+    # A short read must map to OSError at the boundary; any other exception
+    # type (e.g. ArrowException) fails the assertion with its own traceback.
+    with pytest.raises(OSError, match="Disk read failed"):
         pa.RecordBatchReader.from_stream(ds.reader(from_start=True)).read_all()
-    except OSError:
-        pass  # correct: short read maps to OSError
-    except Exception as e:
-        pytest.fail(f"Expected OSError, got {type(e).__name__}: {e}")
-    else:
-        pytest.fail("Expected OSError")

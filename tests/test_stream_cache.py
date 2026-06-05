@@ -7,6 +7,13 @@ import pytest
 from batchcorder import StreamCache
 
 
+# The full exception surface of the batchcorder boundary (`BoundaryError` in
+# src/cached_dataset.rs): worker threads collect these so `assert not errors`
+# reports cache failures.  Anything else escaping a worker is a test bug and
+# should crash the thread loudly instead of being collected.
+CACHE_ERRORS = (ValueError, OSError, MemoryError, RuntimeError, pa.ArrowException)
+
+
 def _make_table(n_batches: int = 4, rows_per_batch: int = 3) -> pa.Table:
     n = n_batches * rows_per_batch
     return pa.table(
@@ -372,7 +379,7 @@ def test_concurrent_readers(tmp_path):
     def read(i):
         try:
             results[i] = pa.RecordBatchReader.from_stream(ds.reader()).read_all()
-        except Exception as e:
+        except CACHE_ERRORS as e:
             errors.append(e)
 
     threads = [threading.Thread(target=read, args=(i,)) for i in range(4)]
@@ -398,7 +405,7 @@ def test_many_concurrent_readers_memory_only():
     def read(i):
         try:
             results[i] = pa.RecordBatchReader.from_stream(ds.reader()).read_all()
-        except Exception as e:
+        except CACHE_ERRORS as e:
             errors.append(e)
 
     threads = [threading.Thread(target=read, args=(i,)) for i in range(n_threads)]
@@ -427,7 +434,7 @@ def test_concurrent_readers_after_full_ingestion():
     def read(i):
         try:
             results[i] = pa.RecordBatchReader.from_stream(ds.reader()).read_all()
-        except Exception as e:
+        except CACHE_ERRORS as e:
             errors.append(e)
 
     threads = [threading.Thread(target=read, args=(i,)) for i in range(n_threads)]
@@ -452,7 +459,7 @@ def test_concurrent_ingest_all_is_idempotent():
     def ingest():
         try:
             counts.append(ds.ingest_all())
-        except Exception as e:
+        except CACHE_ERRORS as e:
             errors.append(e)
 
     t1 = threading.Thread(target=ingest)
@@ -484,7 +491,7 @@ def test_reader_batch_order_preserved_under_concurrency():
             for batch in ds.reader():
                 # The first value in each batch encodes its position.
                 batch_ids[i].append(int(batch.column("id")[0].as_py()))
-        except Exception as e:
+        except CACHE_ERRORS as e:
             errors.append(e)
 
     threads = [threading.Thread(target=read, args=(i,)) for i in range(n_threads)]

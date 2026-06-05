@@ -20,6 +20,13 @@ import pyarrow as pa
 from batchcorder import StreamCache
 
 
+# The full exception surface of the batchcorder boundary (`BoundaryError` in
+# src/cached_dataset.rs): worker threads collect these so `assert not errors`
+# reports cache failures.  Anything else escaping a worker is a test bug and
+# should crash the thread loudly instead of being collected.
+CACHE_ERRORS = (ValueError, OSError, MemoryError, RuntimeError, pa.ArrowException)
+
+
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 
@@ -110,7 +117,7 @@ def test_upstream_read_once_with_concurrent_readers():
     def read():
         try:
             pa.RecordBatchReader.from_stream(ds.reader()).read_all()
-        except Exception as e:
+        except CACHE_ERRORS as e:
             errors.append(e)
 
     threads = [threading.Thread(target=read) for _ in range(n_readers)]
@@ -259,7 +266,7 @@ def test_gil_released_while_readers_block_on_mutex():
     def reader():
         try:
             pa.RecordBatchReader.from_stream(ds.reader()).read_all()
-        except Exception as e:
+        except CACHE_ERRORS as e:
             errors.append(e)
 
     def python_heartbeat():
@@ -315,7 +322,7 @@ def test_many_readers_many_batches_memory_only():
     def read(i):
         try:
             results[i] = pa.RecordBatchReader.from_stream(ds.reader()).read_all()
-        except Exception as e:
+        except CACHE_ERRORS as e:
             errors.append(e)
 
     threads = [threading.Thread(target=read, args=(i,)) for i in range(n_readers)]

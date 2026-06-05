@@ -106,10 +106,7 @@ extend-select = [
 
 [tool.ruff.lint.per-file-ignores]
 # D/DOC: docstring section structure is not enforced in tests.
-# BLE001 (enabled by preview's behavioural side, which explicit-preview-rules
-# cannot gate): tests deliberately catch blind `Exception` to collect errors
-# raised across worker threads and assert on them afterwards.
-"tests/**" = ["D", "DOC", "BLE001"]
+"tests/**" = ["D", "DOC"]
 "conftest.py" = ["D", "DOC"]
 # DOC502: the wrappers in __init__.py document exceptions raised inside the
 # Rust delegate, which pydoclint cannot see across the FFI boundary.
