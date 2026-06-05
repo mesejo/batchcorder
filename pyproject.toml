@@ -84,6 +84,7 @@ extend-select = [
   "SIM",
   "PT",
   "D",
+  "DOC",
   "RUF",
   "PYI",
   "UP",

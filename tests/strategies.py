@@ -109,6 +109,115 @@ def table_and_chunksize(draw: st.DrawFn) -> tuple[pa.Table, int]:
     return table, chunksize
 
 
+# -- max_readers strategies ---------------------------------------------------
+
+# Reader-count cap (``max_readers``).  Small counts keep interleaving schedules
+# tractable while covering the single-reader and several-reader regimes; the
+# constructor accepts any value >= 1 (``register_reader`` in
+# src/cached_dataset.rs enforces the cap, not the magnitude).
+max_readers_counts = st.integers(min_value=1, max_value=5)
+
+# Every public operation that creates — and therefore counts against the cap —
+# a reader: direct handles (both start positions), iteration, raw C-stream
+# export, and reading a cast view (which registers a reader at stream-export
+# time like the others).
+reader_creating_ops = st.sampled_from(
+    ["reader", "reader_tail", "iter", "c_stream", "cast_stream"]
+)
+
+
+def _chunked(draw: st.DrawFn, table: pa.Table) -> tuple[int, int]:
+    """Draw a chunk size targeting <= 24 batches; return (chunksize, n_batches).
+
+    Interleaving schedules grow linearly with the batch count, so the target
+    keeps them short while still producing multi-batch streams that exercise
+    low-water-mark eviction.
+    """
+    target_batches = draw(st.integers(min_value=1, max_value=24))
+    chunksize = -(-table.num_rows // target_batches)
+    n_batches = -(-table.num_rows // chunksize)
+    return chunksize, n_batches
+
+
+@st.composite
+def interleaved_read_plan(draw: st.DrawFn) -> tuple[pa.Table, int, int, list[int]]:
+    """A (table, chunksize, n_readers, schedule) tuple for eviction tests.
+
+    ``schedule`` is a permutation of each reader index repeated once per
+    batch: following it consumes every reader exactly to exhaustion while the
+    readers' relative progress varies arbitrarily, so the low-water mark (and
+    therefore eviction) advances through arbitrary reachable orderings.
+    """
+    table = draw(arrow_table())
+    chunksize, n_batches = _chunked(draw, table)
+    n_readers = draw(max_readers_counts)
+    schedule = draw(
+        st.permutations([r for r in range(n_readers) for _ in range(n_batches)])
+    )
+    return table, chunksize, n_readers, schedule
+
+
+@st.composite
+def partial_drop_plan(draw: st.DrawFn) -> tuple[pa.Table, int, int, dict[int, int]]:
+    """A (table, chunksize, n_readers, drop_prefixes) tuple.
+
+    ``drop_prefixes`` maps a strict subset of reader indices to the number of
+    batches each consumes before its handle is dropped (0..n_batches).  At
+    least one reader survives: once the dropped readers stop pinning the
+    low-water mark, the survivors must still replay the full stream.
+    """
+    table = draw(arrow_table())
+    chunksize, n_batches = _chunked(draw, table)
+    n_readers = draw(st.integers(min_value=2, max_value=5))
+    n_dropped = draw(st.integers(min_value=1, max_value=n_readers - 1))
+    dropped = draw(
+        st.lists(
+            st.integers(min_value=0, max_value=n_readers - 1),
+            min_size=n_dropped,
+            max_size=n_dropped,
+            unique=True,
+        )
+    )
+    prefixes = draw(
+        st.lists(
+            st.integers(min_value=0, max_value=n_batches),
+            min_size=n_dropped,
+            max_size=n_dropped,
+        )
+    )
+    return table, chunksize, n_readers, dict(zip(dropped, prefixes, strict=True))
+
+
+@st.composite
+def cap_exhaustion_plan(draw: st.DrawFn) -> tuple[pa.Table, int, list[str], str]:
+    """A (table, n_readers, ops, extra_op) tuple for the hard-cap contract.
+
+    ``ops`` is a mix of ``n_readers`` reader-creating operations that must all
+    succeed; ``extra_op`` is the one-past-the-cap creation that must raise.
+    No batches are consumed, so eviction never interferes with the cap check.
+    """
+    table = draw(arrow_table())
+    n_readers = draw(max_readers_counts)
+    ops = draw(st.lists(reader_creating_ops, min_size=n_readers, max_size=n_readers))
+    extra_op = draw(reader_creating_ops)
+    return table, n_readers, ops, extra_op
+
+
+@st.composite
+def undersubscribed_plan(draw: st.DrawFn) -> tuple[pa.Table, int, int, int]:
+    """A (table, chunksize, max_readers, k) tuple with k < max_readers.
+
+    Models a cache where only ``k`` of the promised ``max_readers`` readers
+    have been created and fully consumed — the regime where eviction must NOT
+    have started, because future readers may still replay from batch 0.
+    """
+    table = draw(arrow_table())
+    chunksize, _ = _chunked(draw, table)
+    n_readers = draw(st.integers(min_value=2, max_value=5))
+    k = draw(st.integers(min_value=1, max_value=n_readers - 1))
+    return table, chunksize, n_readers, k
+
+
 @st.composite
 def construction_kwargs(draw: st.DrawFn) -> dict:
     """Valid keyword arguments for ``StreamCache.__init__`` (minus ``reader``).
