@@ -253,6 +253,15 @@ struct DiskCacheTier {
     policy: WritePolicy,
 }
 
+impl Drop for DiskCacheTier {
+    fn drop(&mut self) {
+        // The last owner (cache handle or reader) is gone: nothing can read
+        // the on-disk subdirectory any more, so remove it.  Idempotent with
+        // an earlier explicit `close()` — the error is ignored either way.
+        let _ = std::fs::remove_dir_all(&self.dir_path);
+    }
+}
+
 impl DiskCacheTier {
     /// Fail unless `8 + length` more bytes fit within `disk_capacity`.
     fn check_disk_capacity(&self, length: usize) -> Result<(), ArrowError> {
@@ -395,9 +404,11 @@ impl CacheTier {
             .iter()
             .map(|c| c.get_array_memory_size())
             .sum();
-        if batch_size > MAX_BATCH_BYTES {
+        // The 2 GiB cap is an IPC serialisation limit (int32 offsets), so it
+        // only applies to the disk tier; the memory tier stores batches as-is.
+        if matches!(self, CacheTier::Disk(_)) && batch_size > MAX_BATCH_BYTES {
             return Err(other_arrow_err(format!(
-                "Single batch ({batch_size} bytes) exceeds the {} byte Arrow limit",
+                "Single batch ({batch_size} bytes) exceeds the {} byte Arrow IPC limit",
                 MAX_BATCH_BYTES
             )));
         }
@@ -911,7 +922,12 @@ impl Iterator for StreamCacheReaderImpl {
 impl Drop for StreamCacheReaderImpl {
     fn drop(&mut self) {
         self.position.take();
-        if let Ok(mut inner) = self.inner.lock() {
+        // try_lock, never lock: Drop runs with the GIL held (Python dealloc),
+        // while another thread may hold `inner` inside `ingest_up_to` waiting
+        // to reacquire the GIL for `upstream.next()` — a blocking lock here
+        // would deadlock.  Eviction is opportunistic; if the lock is busy the
+        // next `next()` call on any surviving reader evicts instead.
+        if let Ok(mut inner) = self.inner.try_lock() {
             let _ = inner.maybe_evict();
         }
     }
@@ -1139,19 +1155,10 @@ pub struct PyStreamCache {
     inner: Arc<Mutex<DatasetInner>>,
 }
 
-impl Drop for PyStreamCache {
-    fn drop(&mut self) {
-        if let Ok(mut inner) = self.inner.lock()
-            && !inner.closed
-        {
-            inner.closed = true;
-            let cache = inner.cache.clone();
-            drop(inner);
-            cache.cleanup_disk();
-            cache.clear();
-        }
-    }
-}
+// No `Drop` impl: readers hold `Arc<Mutex<DatasetInner>>` and may outlive this
+// handle.  Cached batches stay available until the last owner (handle or
+// reader) drops, at which point `DiskCacheTier::drop` removes the on-disk
+// subdirectory.  Explicit teardown is still available via `close()`.
 
 #[gen_stub_pymethods]
 #[pymethods]

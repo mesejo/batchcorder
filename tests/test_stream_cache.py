@@ -1,3 +1,4 @@
+import gc
 import threading
 
 import pyarrow as pa
@@ -642,6 +643,41 @@ def test_drop_removes_disk_files(tmp_path):
     # Check that the directory no longer exists or is empty
     assert not tmp_path.exists() or list(tmp_path.rglob("*")) == [], (
         f"Expected disk_path to be removed or empty after drop(), found: {list(tmp_path.rglob('*')) if tmp_path.exists() else 'directory does not exist'}"
+    )
+
+
+def test_reader_survives_cache_drop(tmp_path):
+    """A reader stays usable after the StreamCache handle is garbage-collected."""
+    table = _make_table()
+    reader = _dataset(tmp_path, table).reader()
+    gc.collect()  # the StreamCache temporary above is already unreferenced
+    result = pa.RecordBatchReader.from_stream(reader).read_all()
+    assert result.equals(table)
+
+
+def test_reader_survives_memory_only_cache_drop():
+    """Same as above for the memory-only tier."""
+    table = _make_table()
+    reader = StreamCache(table.to_reader(max_chunksize=3)).reader()
+    gc.collect()
+    result = pa.RecordBatchReader.from_stream(reader).read_all()
+    assert result.equals(table)
+
+
+def test_disk_files_removed_after_last_reader(tmp_path):
+    """Disk files persist while a reader is alive and vanish when it drops."""
+    ds = _dataset(tmp_path)
+    reader = ds.reader()
+    next(reader)  # force ingestion so the disk file exists
+    del ds
+    gc.collect()
+    assert len(list(tmp_path.rglob("*"))) > 0, (
+        "Disk files must survive the cache handle while a reader is alive"
+    )
+    del reader
+    gc.collect()
+    assert not tmp_path.exists() or list(tmp_path.rglob("*")) == [], (
+        "Expected disk files to be removed once the last reader dropped"
     )
 
 
