@@ -40,6 +40,7 @@ dev = [
   "maturin>=1.7,<2.0",
   "pyarrow>=18",
   "pytest>=8",
+  "hypothesis>=6",
   "duckdb>=1.5",
   "ruff>=0.15.6",
   "pre-commit>=3.5.0",
@@ -69,6 +70,14 @@ skip = "uv.lock,docs/requirements.txt"
 extend-include = ["*.md"]
 
 [tool.ruff.lint]
+# Preview is required for the pydoclint (DOC) rules.  Scoped two ways: it is
+# lint-only (the formatter stays on stable style), and explicit-preview-rules
+# limits it to the exact preview codes listed in extend-select — prefix
+# selectors (RUF, B, UP, ...) keep selecting stable rules only, so a ruff
+# upgrade cannot silently enable new preview rules (ruff is pinned at the
+# matching rev in .pre-commit-config.yaml).
+preview = true
+explicit-preview-rules = true
 ignore = [
   "D203", # conflicts with D211 (no-blank-line-before-class); D211 wins
   "D212", # conflicts with D213 (multi-line-summary-second-line); D213 wins
@@ -83,14 +92,25 @@ extend-select = [
   "SIM",
   "PT",
   "D",
+  # pydoclint, selected by exact code (preview rules; see explicit-preview-rules)
+  "DOC201", # return value not documented in docstring
+  "DOC202", # docstring documents a return the body does not have
+  "DOC402", # yielded value not documented in docstring
+  "DOC403", # docstring documents yields the body does not have
+  "DOC501", # explicitly raised exception missing from docstring
+  "DOC502", # docstring documents an exception the body does not raise
   "RUF",
   "PYI",
   "UP",
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["D"]
-"conftest.py" = ["D"]
+# D/DOC: docstring section structure is not enforced in tests.
+"tests/**" = ["D", "DOC"]
+"conftest.py" = ["D", "DOC"]
+# DOC502: the wrappers in __init__.py document exceptions raised inside the
+# Rust delegate, which pydoclint cannot see across the FFI boundary.
+"python/batchcorder/__init__.py" = ["DOC502"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["batchcorder"]

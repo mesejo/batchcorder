@@ -18,6 +18,7 @@ import time
 import pyarrow as pa
 
 from batchcorder import StreamCache
+from tests.helpers import CACHE_ERRORS
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -106,11 +107,13 @@ def test_upstream_read_once_with_concurrent_readers():
     source = CountingReader(batches)
     ds = StreamCache(source)
     errors: list[Exception] = []
+    completed: list[bool] = []
 
     def read():
         try:
             pa.RecordBatchReader.from_stream(ds.reader()).read_all()
-        except Exception as e:
+            completed.append(True)  # skipped if any exception escapes
+        except CACHE_ERRORS as e:
             errors.append(e)
 
     threads = [threading.Thread(target=read) for _ in range(n_readers)]
@@ -120,6 +123,9 @@ def test_upstream_read_once_with_concurrent_readers():
         t.join()
 
     assert not errors, errors
+    # No per-reader results to assert on, so verify completion explicitly: a
+    # worker killed by an out-of-surface exception would be missing here.
+    assert len(completed) == n_readers
     assert source.batches_read == len(batches), (
         f"Expected upstream called {len(batches)} times, got {source.batches_read}"
     )
@@ -255,11 +261,13 @@ def test_gil_released_while_readers_block_on_mutex():
 
     gil_confirmed = threading.Event()
     errors: list[Exception] = []
+    completed: list[bool] = []
 
     def reader():
         try:
             pa.RecordBatchReader.from_stream(ds.reader()).read_all()
-        except Exception as e:
+            completed.append(True)  # skipped if any exception escapes
+        except CACHE_ERRORS as e:
             errors.append(e)
 
     def python_heartbeat():
@@ -295,6 +303,9 @@ def test_gil_released_while_readers_block_on_mutex():
     t2.join(timeout=delay_s * n_batches * 3)
     t3.join()
     assert not errors, errors
+    # No per-reader results to assert on, so verify completion explicitly: a
+    # reader killed by an out-of-surface exception would be missing here.
+    assert len(completed) == 2
 
 
 # ── large-scale stress ────────────────────────────────────────────────────────
@@ -315,7 +326,7 @@ def test_many_readers_many_batches_memory_only():
     def read(i):
         try:
             results[i] = pa.RecordBatchReader.from_stream(ds.reader()).read_all()
-        except Exception as e:
+        except CACHE_ERRORS as e:
             errors.append(e)
 
     threads = [threading.Thread(target=read, args=(i,)) for i in range(n_readers)]

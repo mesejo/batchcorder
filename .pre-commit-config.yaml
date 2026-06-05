@@ -12,6 +12,9 @@ repos:
         args: ["--maxkb=500"]
       - id: name-tests-test
         args: ["--pytest-test-first"]
+        # strategies.py (shared Hypothesis strategies) and helpers.py (shared
+        # test constants) are support modules, not test files.
+        exclude: ^tests/(strategies|helpers)\.py$
 
   - repo: https://github.com/abravalheri/validate-pyproject
     rev: v0.25

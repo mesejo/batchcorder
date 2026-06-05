@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from typing import Any
 
+    import pyarrow as pa
+
 from ._batchcorder import (
     CastingStreamCache as _PyCastingStreamCache,
 )
@@ -62,6 +64,25 @@ class StreamCache:
     disk_capacity : int, optional
         On-disk storage budget in bytes.
         Must be provided together with ``disk_path``.
+    write_policy : str, optional
+        When batches are flushed to disk (disk mode only; ignored in
+        memory-only mode).  ``"on_insertion"`` (default) writes every batch to
+        disk immediately.  ``"on_eviction"`` keeps batches in the hot layer and
+        only writes them to disk when evicted, so a hot layer large enough to
+        hold the whole stream never touches disk.
+    max_readers : int, optional
+        Hard cap on the total number of readers ever created from this cache.
+        When set, batches are evicted once all readers have advanced past them,
+        enabling bounded-memory streaming.  Eviction only begins once all
+        ``max_readers`` readers have actually been created — with fewer live
+        readers every batch is retained so future readers can still replay
+        from the start.  Dropping a reader does **not** free a slot — once
+        ``max_readers`` readers have been created, no more can be obtained.
+        ``reader(from_start=True)`` raises ``ValueError`` if batch 0 has
+        already been evicted.  For disk-backed caches, eviction frees memory
+        (hot layer and index) but not bytes in the append-only cache file —
+        disk space is reclaimed only when the cache is closed or dropped.
+        When ``None`` (default), all batches are retained indefinitely.
 
     Examples
     --------
@@ -86,18 +107,24 @@ class StreamCache:
 
     """
 
+    _impl: _PyStreamCache
+
     def __init__(
         self,
         reader: Any,
         memory_capacity: int | None = None,
         disk_path: str | None = None,
         disk_capacity: int | None = None,
-    ):
+        write_policy: str = "on_insertion",
+        max_readers: int | None = None,
+    ) -> None:
         """See class docstring for parameter documentation."""
-        self._impl = _PyStreamCache(reader, memory_capacity, disk_path, disk_capacity)
+        self._impl = _PyStreamCache(
+            reader, memory_capacity, disk_path, disk_capacity, write_policy, max_readers
+        )
 
     @property
-    def schema(self) -> Any:
+    def schema(self) -> pa.Schema:
         """
         Arrow schema of this dataset.
 
@@ -232,6 +259,11 @@ class StreamCache:
         requested_schema : object, optional
             Schema capsule to cast the stream to, or ``None``.
 
+        Returns
+        -------
+        PyCapsule
+            An Arrow C stream capsule wrapping a fresh reader.
+
         """
         return self._impl.__arrow_c_stream__(requested_schema)
 
@@ -245,6 +277,11 @@ class StreamCache:
         This allows Arrow consumers to inspect the data type of this
         :class:`StreamCache`.  Then the consumer can ask the producer (in
         ``__arrow_c_stream__``) to cast the exported data to a supported data type.
+
+        Returns
+        -------
+        PyCapsule
+            An Arrow C schema capsule for the stream's schema.
 
         """
         return self._impl.__arrow_c_schema__()
@@ -341,12 +378,14 @@ class StreamCacheReader:
 
     """
 
-    def __init__(self, impl: _PyStreamCacheReader):
+    _impl: _PyStreamCacheReader
+
+    def __init__(self, impl: _PyStreamCacheReader) -> None:
         """Obtain via :meth:`StreamCache.reader`."""
         self._impl = impl
 
     @property
-    def schema(self) -> Any:
+    def schema(self) -> pa.Schema:
         """
         Arrow schema of batches produced by this reader.
 
@@ -388,6 +427,11 @@ class StreamCacheReader:
         requested_schema : object, optional
             Schema capsule to cast the stream to, or ``None``.
 
+        Returns
+        -------
+        PyCapsule
+            An Arrow C stream capsule wrapping this reader.
+
         Raises
         ------
         ValueError
@@ -407,6 +451,11 @@ class StreamCacheReader:
         :class:`StreamCacheReader`.  Then the consumer can ask the producer (in
         ``__arrow_c_stream__``) to cast the exported data to a supported data type.
 
+        Returns
+        -------
+        PyCapsule
+            An Arrow C schema capsule for the reader's schema.
+
         Raises
         ------
         ValueError
@@ -416,10 +465,17 @@ class StreamCacheReader:
         return self._impl.__arrow_c_schema__()
 
     def __iter__(self) -> StreamCacheReader:
-        """Return self as the iterator."""
+        """
+        Return self as the iterator.
+
+        Returns
+        -------
+        StreamCacheReader
+
+        """
         return self
 
-    def cast(self, target_schema: Any) -> Any:
+    def cast(self, target_schema: Any) -> pa.RecordBatchReader:
         """
         Cast the reader to produce batches with the given schema.
 
@@ -445,8 +501,15 @@ class StreamCacheReader:
         """
         return self._impl.cast(target_schema)
 
-    def __next__(self) -> Any:
-        """Get the next batch from the reader."""
+    def __next__(self) -> pa.RecordBatch:
+        """
+        Get the next batch from the reader.
+
+        Returns
+        -------
+        pyarrow.RecordBatch
+
+        """
         return next(iter(self._impl))
 
 
@@ -465,12 +528,14 @@ class CastingStreamCache:
 
     """
 
-    def __init__(self, impl: _PyCastingStreamCache):
+    _impl: _PyCastingStreamCache
+
+    def __init__(self, impl: _PyCastingStreamCache) -> None:
         """Obtain via :meth:`StreamCache.cast`."""
         self._impl = impl
 
     @property
-    def schema(self) -> Any:
+    def schema(self) -> pa.Schema:
         """
         Arrow schema produced by this dataset after casting.
 
@@ -494,6 +559,11 @@ class CastingStreamCache:
             Schema capsule to further cast the stream to, or ``None`` (uses
             :attr:`schema`).
 
+        Returns
+        -------
+        PyCapsule
+            An Arrow C stream capsule wrapping a fresh casting reader.
+
         """
         return self._impl.__arrow_c_stream__(requested_schema)
 
@@ -502,6 +572,11 @@ class CastingStreamCache:
         Enable Arrow schema export via the `PyCapsule Interface <https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html>`_.
 
         Returns the target schema so consumers can inspect the post-cast type.
+
+        Returns
+        -------
+        PyCapsule
+            An Arrow C schema capsule for the post-cast schema.
 
         """
         return self._impl.__arrow_c_schema__()

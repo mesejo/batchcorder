@@ -1,9 +1,11 @@
+import gc
 import threading
 
 import pyarrow as pa
 import pytest
 
 from batchcorder import StreamCache
+from tests.helpers import CACHE_ERRORS
 
 
 def _make_table(n_batches: int = 4, rows_per_batch: int = 3) -> pa.Table:
@@ -60,53 +62,55 @@ def test_upstream_not_exhausted_initially(tmp_path):
 
 def test_schema_via_c_schema_capsule(tmp_path):
     table = _make_table()
-    schema = _schema_from_capsule(_dataset(tmp_path, table).__arrow_c_schema__())
+    ds = _dataset(tmp_path, table)
+    schema = _schema_from_capsule(ds.__arrow_c_schema__())
     assert schema == table.schema
 
 
 def test_schema_property_matches_source(tmp_path):
     table = _make_table()
-    assert pa.schema(_dataset(tmp_path, table).schema) == table.schema
+    ds = _dataset(tmp_path, table)
+    assert pa.schema(ds.schema) == table.schema
 
 
 def test_reader_schema_matches_dataset(tmp_path):
     table = _make_table()
-    assert pa.schema(_dataset(tmp_path, table).reader().schema) == table.schema
+    ds = _dataset(tmp_path, table)
+    assert pa.schema(ds.reader().schema) == table.schema
 
 
 def test_reader_returns_correct_data(tmp_path):
     table = _make_table(n_batches=4, rows_per_batch=3)
-    result = pa.RecordBatchReader.from_stream(
-        _dataset(tmp_path, table).reader()
-    ).read_all()
+    ds = _dataset(tmp_path, table)
+    result = pa.RecordBatchReader.from_stream(ds.reader()).read_all()
     assert result.equals(table)
 
 
 def test_dataset_c_stream_returns_correct_data(tmp_path):
     table = _make_table(n_batches=4, rows_per_batch=3)
-    result = pa.RecordBatchReader.from_stream(_dataset(tmp_path, table)).read_all()
+    ds = _dataset(tmp_path, table)
+    result = pa.RecordBatchReader.from_stream(ds).read_all()
     assert result.equals(table)
 
 
 def test_single_batch(tmp_path):
     table = pa.table({"x": [1, 2, 3]})
-    result = pa.RecordBatchReader.from_stream(
-        _dataset(tmp_path, table, batch_size=100)
-    ).read_all()
+    ds = _dataset(tmp_path, table, batch_size=100)
+    result = pa.RecordBatchReader.from_stream(ds).read_all()
     assert result.equals(table)
 
 
 def test_many_small_batches(tmp_path):
     table = _make_table(n_batches=20, rows_per_batch=1)
-    result = pa.RecordBatchReader.from_stream(
-        _dataset(tmp_path, table, batch_size=1)
-    ).read_all()
+    ds = _dataset(tmp_path, table, batch_size=1)
+    result = pa.RecordBatchReader.from_stream(ds).read_all()
     assert result.equals(table)
 
 
 def test_empty_table(tmp_path):
     table = pa.table({"x": pa.array([], type=pa.int32())})
-    result = pa.RecordBatchReader.from_stream(_dataset(tmp_path, table)).read_all()
+    ds = _dataset(tmp_path, table)
+    result = pa.RecordBatchReader.from_stream(ds).read_all()
     assert result.num_rows == 0
     assert result.schema.equals(table.schema)
 
@@ -121,7 +125,8 @@ def test_various_dtypes(tmp_path):
             "bin": pa.array([b"x", b"y", b"z"], type=pa.binary()),
         }
     )
-    result = pa.RecordBatchReader.from_stream(_dataset(tmp_path, table)).read_all()
+    ds = _dataset(tmp_path, table)
+    result = pa.RecordBatchReader.from_stream(ds).read_all()
     assert result.equals(table)
 
 
@@ -132,9 +137,8 @@ def test_nullable_columns(tmp_path):
             "y": pa.array(["a", None, "c"], type=pa.string()),
         }
     )
-    result = pa.RecordBatchReader.from_stream(
-        _dataset(tmp_path, table, batch_size=2)
-    ).read_all()
+    ds = _dataset(tmp_path, table, batch_size=2)
+    result = pa.RecordBatchReader.from_stream(ds).read_all()
     assert result.equals(table)
 
 
@@ -369,7 +373,7 @@ def test_concurrent_readers(tmp_path):
     def read(i):
         try:
             results[i] = pa.RecordBatchReader.from_stream(ds.reader()).read_all()
-        except Exception as e:
+        except CACHE_ERRORS as e:
             errors.append(e)
 
     threads = [threading.Thread(target=read, args=(i,)) for i in range(4)]
@@ -395,7 +399,7 @@ def test_many_concurrent_readers_memory_only():
     def read(i):
         try:
             results[i] = pa.RecordBatchReader.from_stream(ds.reader()).read_all()
-        except Exception as e:
+        except CACHE_ERRORS as e:
             errors.append(e)
 
     threads = [threading.Thread(target=read, args=(i,)) for i in range(n_threads)]
@@ -424,7 +428,7 @@ def test_concurrent_readers_after_full_ingestion():
     def read(i):
         try:
             results[i] = pa.RecordBatchReader.from_stream(ds.reader()).read_all()
-        except Exception as e:
+        except CACHE_ERRORS as e:
             errors.append(e)
 
     threads = [threading.Thread(target=read, args=(i,)) for i in range(n_threads)]
@@ -449,7 +453,7 @@ def test_concurrent_ingest_all_is_idempotent():
     def ingest():
         try:
             counts.append(ds.ingest_all())
-        except Exception as e:
+        except CACHE_ERRORS as e:
             errors.append(e)
 
     t1 = threading.Thread(target=ingest)
@@ -481,7 +485,7 @@ def test_reader_batch_order_preserved_under_concurrency():
             for batch in ds.reader():
                 # The first value in each batch encodes its position.
                 batch_ids[i].append(int(batch.column("id")[0].as_py()))
-        except Exception as e:
+        except CACHE_ERRORS as e:
             errors.append(e)
 
     threads = [threading.Thread(target=read, args=(i,)) for i in range(n_threads)]
@@ -643,6 +647,41 @@ def test_drop_removes_disk_files(tmp_path):
     )
 
 
+def test_reader_survives_cache_drop(tmp_path):
+    """A reader stays usable after the StreamCache handle is garbage-collected."""
+    table = _make_table()
+    reader = _dataset(tmp_path, table).reader()
+    gc.collect()  # the StreamCache temporary above is already unreferenced
+    result = pa.RecordBatchReader.from_stream(reader).read_all()
+    assert result.equals(table)
+
+
+def test_reader_survives_memory_only_cache_drop():
+    """Same as above for the memory-only tier."""
+    table = _make_table()
+    reader = StreamCache(table.to_reader(max_chunksize=3)).reader()
+    gc.collect()
+    result = pa.RecordBatchReader.from_stream(reader).read_all()
+    assert result.equals(table)
+
+
+def test_disk_files_removed_after_last_reader(tmp_path):
+    """Disk files persist while a reader is alive and vanish when it drops."""
+    ds = _dataset(tmp_path)
+    reader = ds.reader()
+    next(reader)  # force ingestion so the disk file exists
+    del ds
+    gc.collect()
+    assert len(list(tmp_path.rglob("*"))) > 0, (
+        "Disk files must survive the cache handle while a reader is alive"
+    )
+    del reader
+    gc.collect()
+    assert not tmp_path.exists() or list(tmp_path.rglob("*")) == [], (
+        "Expected disk files to be removed once the last reader dropped"
+    )
+
+
 # ── memory-only mode ──────────────────────────────────────────────────────────
 
 
@@ -669,7 +708,8 @@ def test_memory_only_construction():
 
 def test_memory_only_returns_correct_data():
     table = _make_table(n_batches=4, rows_per_batch=3)
-    result = pa.RecordBatchReader.from_stream(_memory_only_dataset(table)).read_all()
+    ds = _memory_only_dataset(table)
+    result = pa.RecordBatchReader.from_stream(ds).read_all()
     assert result.equals(table)
 
 
@@ -712,3 +752,65 @@ def test_disk_params_must_both_be_provided_or_omitted():
         StreamCache(table, memory_capacity=16 << 20, disk_path="/tmp")
     with pytest.raises(ValueError, match="disk_path and disk_capacity"):
         StreamCache(table, memory_capacity=16 << 20, disk_capacity=64 << 20)
+
+
+# ── Gap 2: hot layer FIFO eviction ───────────────────────────────────────────
+
+
+def _spill_cache(
+    tmp_path, n_batches: int, rows_per_batch: int, hot_bytes: int
+) -> tuple:
+    source = pa.table({"id": pa.array(list(range(n_batches * rows_per_batch)))})
+    ds = StreamCache(
+        source.to_reader(max_chunksize=rows_per_batch),
+        memory_capacity=hot_bytes,
+        disk_path=str(tmp_path),
+        disk_capacity=64 * 1024 * 1024,
+    )
+    return ds, source
+
+
+def test_hot_eviction_old_batches_readable_from_disk(tmp_path):
+    """After hot eviction, earlier batches still return correct data via disk pread."""
+    ds, source = _spill_cache(tmp_path, n_batches=5, rows_per_batch=100, hot_bytes=1)
+    ds.ingest_all()
+    result = pa.RecordBatchReader.from_stream(ds).read_all()
+    assert result.sort_by("id").equals(source.sort_by("id"))
+
+
+def test_hot_eviction_later_batches_land_in_hot(tmp_path):
+    """Eviction makes room for new batches; all data readable after eviction."""
+    ds, source = _spill_cache(tmp_path, n_batches=10, rows_per_batch=50, hot_bytes=1)
+    ds.ingest_all()
+    pass1 = pa.RecordBatchReader.from_stream(ds).read_all()
+    pass2 = pa.RecordBatchReader.from_stream(ds).read_all()
+    assert pass1.equals(pass2)
+    assert pass1.sort_by("id").equals(source.sort_by("id"))
+
+
+def test_hot_eviction_multiple_readers_independent(tmp_path):
+    """Two readers starting at batch 0 both see correct data when hot layer has evicted."""
+    ds, source = _spill_cache(tmp_path, n_batches=6, rows_per_batch=50, hot_bytes=1)
+    ds.ingest_all()
+    r1 = ds.reader(from_start=True)
+    r2 = ds.reader(from_start=True)
+    rows1 = pa.RecordBatchReader.from_stream(r1).read_all()
+    rows2 = pa.RecordBatchReader.from_stream(r2).read_all()
+    assert rows1.equals(rows2)
+    assert rows1.sort_by("id").equals(source.sort_by("id"))
+
+
+def test_hot_eviction_single_batch_larger_than_budget(tmp_path):
+    """Batch exceeding entire hot budget still written to disk and readable."""
+    ds, source = _spill_cache(tmp_path, n_batches=3, rows_per_batch=100, hot_bytes=1)
+    ds.ingest_all()
+    result = pa.RecordBatchReader.from_stream(ds).read_all()
+    assert result.sort_by("id").equals(source.sort_by("id"))
+
+
+def test_hot_eviction_zero_capacity_all_from_disk(tmp_path):
+    """hot budget of 0 forces all reads from disk; data still correct."""
+    ds, source = _spill_cache(tmp_path, n_batches=4, rows_per_batch=80, hot_bytes=0)
+    ds.ingest_all()
+    result = pa.RecordBatchReader.from_stream(ds).read_all()
+    assert result.sort_by("id").equals(source.sort_by("id"))
