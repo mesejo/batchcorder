@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from typing import Any
 
+    import pyarrow as pa
+
 from ._batchcorder import (
     CastingStreamCache as _PyCastingStreamCache,
 )
@@ -105,6 +107,8 @@ class StreamCache:
 
     """
 
+    _impl: _PyStreamCache
+
     def __init__(
         self,
         reader: Any,
@@ -113,14 +117,14 @@ class StreamCache:
         disk_capacity: int | None = None,
         write_policy: str = "on_insertion",
         max_readers: int | None = None,
-    ):
+    ) -> None:
         """See class docstring for parameter documentation."""
         self._impl = _PyStreamCache(
             reader, memory_capacity, disk_path, disk_capacity, write_policy, max_readers
         )
 
     @property
-    def schema(self) -> Any:
+    def schema(self) -> pa.Schema:
         """
         Arrow schema of this dataset.
 
@@ -364,12 +368,14 @@ class StreamCacheReader:
 
     """
 
-    def __init__(self, impl: _PyStreamCacheReader):
+    _impl: _PyStreamCacheReader
+
+    def __init__(self, impl: _PyStreamCacheReader) -> None:
         """Obtain via :meth:`StreamCache.reader`."""
         self._impl = impl
 
     @property
-    def schema(self) -> Any:
+    def schema(self) -> pa.Schema:
         """
         Arrow schema of batches produced by this reader.
 
@@ -442,7 +448,7 @@ class StreamCacheReader:
         """Return self as the iterator."""
         return self
 
-    def cast(self, target_schema: Any) -> Any:
+    def cast(self, target_schema: Any) -> pa.RecordBatchReader:
         """
         Cast the reader to produce batches with the given schema.
 
@@ -468,7 +474,7 @@ class StreamCacheReader:
         """
         return self._impl.cast(target_schema)
 
-    def __next__(self) -> Any:
+    def __next__(self) -> pa.RecordBatch:
         """Get the next batch from the reader."""
         return next(iter(self._impl))
 
@@ -488,12 +494,14 @@ class CastingStreamCache:
 
     """
 
-    def __init__(self, impl: _PyCastingStreamCache):
+    _impl: _PyCastingStreamCache
+
+    def __init__(self, impl: _PyCastingStreamCache) -> None:
         """Obtain via :meth:`StreamCache.cast`."""
         self._impl = impl
 
     @property
-    def schema(self) -> Any:
+    def schema(self) -> pa.Schema:
         """
         Arrow schema produced by this dataset after casting.
 
