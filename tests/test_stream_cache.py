@@ -5,13 +5,7 @@ import pyarrow as pa
 import pytest
 
 from batchcorder import StreamCache
-
-
-# The full exception surface of the batchcorder boundary (`BoundaryError` in
-# src/cached_dataset.rs): worker threads collect these so `assert not errors`
-# reports cache failures.  Anything else escaping a worker is a test bug and
-# should crash the thread loudly instead of being collected.
-CACHE_ERRORS = (ValueError, OSError, MemoryError, RuntimeError, pa.ArrowException)
+from tests.helpers import CACHE_ERRORS
 
 
 def _make_table(n_batches: int = 4, rows_per_batch: int = 3) -> pa.Table:

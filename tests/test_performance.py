@@ -18,13 +18,7 @@ import time
 import pyarrow as pa
 
 from batchcorder import StreamCache
-
-
-# The full exception surface of the batchcorder boundary (`BoundaryError` in
-# src/cached_dataset.rs): worker threads collect these so `assert not errors`
-# reports cache failures.  Anything else escaping a worker is a test bug and
-# should crash the thread loudly instead of being collected.
-CACHE_ERRORS = (ValueError, OSError, MemoryError, RuntimeError, pa.ArrowException)
+from tests.helpers import CACHE_ERRORS
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -113,10 +107,12 @@ def test_upstream_read_once_with_concurrent_readers():
     source = CountingReader(batches)
     ds = StreamCache(source)
     errors: list[Exception] = []
+    completed: list[bool] = []
 
     def read():
         try:
             pa.RecordBatchReader.from_stream(ds.reader()).read_all()
+            completed.append(True)  # skipped if any exception escapes
         except CACHE_ERRORS as e:
             errors.append(e)
 
@@ -127,6 +123,9 @@ def test_upstream_read_once_with_concurrent_readers():
         t.join()
 
     assert not errors, errors
+    # No per-reader results to assert on, so verify completion explicitly: a
+    # worker killed by an out-of-surface exception would be missing here.
+    assert len(completed) == n_readers
     assert source.batches_read == len(batches), (
         f"Expected upstream called {len(batches)} times, got {source.batches_read}"
     )
@@ -262,10 +261,12 @@ def test_gil_released_while_readers_block_on_mutex():
 
     gil_confirmed = threading.Event()
     errors: list[Exception] = []
+    completed: list[bool] = []
 
     def reader():
         try:
             pa.RecordBatchReader.from_stream(ds.reader()).read_all()
+            completed.append(True)  # skipped if any exception escapes
         except CACHE_ERRORS as e:
             errors.append(e)
 
@@ -302,6 +303,9 @@ def test_gil_released_while_readers_block_on_mutex():
     t2.join(timeout=delay_s * n_batches * 3)
     t3.join()
     assert not errors, errors
+    # No per-reader results to assert on, so verify completion explicitly: a
+    # reader killed by an out-of-surface exception would be missing here.
+    assert len(completed) == 2
 
 
 # ── large-scale stress ────────────────────────────────────────────────────────
