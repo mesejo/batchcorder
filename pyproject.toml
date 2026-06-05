@@ -70,9 +70,14 @@ skip = "uv.lock,docs/requirements.txt"
 extend-include = ["*.md"]
 
 [tool.ruff.lint]
-# Lint-only preview so the DOC (pydoclint) rules take effect; the formatter
-# stays on stable style (ruff-format preview is configured separately).
+# Preview is required for the pydoclint (DOC) rules.  Scoped two ways: it is
+# lint-only (the formatter stays on stable style), and explicit-preview-rules
+# limits it to the exact preview codes listed in extend-select — prefix
+# selectors (RUF, B, UP, ...) keep selecting stable rules only, so a ruff
+# upgrade cannot silently enable new preview rules (ruff is pinned at the
+# matching rev in .pre-commit-config.yaml).
 preview = true
+explicit-preview-rules = true
 ignore = [
   "D203", # conflicts with D211 (no-blank-line-before-class); D211 wins
   "D212", # conflicts with D213 (multi-line-summary-second-line); D213 wins
@@ -87,7 +92,13 @@ extend-select = [
   "SIM",
   "PT",
   "D",
-  "DOC",
+  # pydoclint, selected by exact code (preview rules; see explicit-preview-rules)
+  "DOC201", # return value not documented in docstring
+  "DOC202", # docstring documents a return the body does not have
+  "DOC402", # yielded value not documented in docstring
+  "DOC403", # docstring documents yields the body does not have
+  "DOC501", # explicitly raised exception missing from docstring
+  "DOC502", # docstring documents an exception the body does not raise
   "RUF",
   "PYI",
   "UP",
@@ -95,14 +106,14 @@ extend-select = [
 
 [tool.ruff.lint.per-file-ignores]
 # D/DOC: docstring section structure is not enforced in tests.
-# BLE001: tests deliberately catch blind `Exception` to collect errors raised
-# across worker threads and assert on them afterwards.
+# BLE001 (enabled by preview's behavioural side, which explicit-preview-rules
+# cannot gate): tests deliberately catch blind `Exception` to collect errors
+# raised across worker threads and assert on them afterwards.
 "tests/**" = ["D", "DOC", "BLE001"]
 "conftest.py" = ["D", "DOC"]
-# RUF067: the package API intentionally lives in __init__.py (thin wrappers
-# over the Rust extension).  DOC502: those wrappers document exceptions raised
-# inside the Rust delegate, which pydoclint cannot see across the FFI boundary.
-"python/batchcorder/__init__.py" = ["RUF067", "DOC502"]
+# DOC502: the wrappers in __init__.py document exceptions raised inside the
+# Rust delegate, which pydoclint cannot see across the FFI boundary.
+"python/batchcorder/__init__.py" = ["DOC502"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["batchcorder"]
