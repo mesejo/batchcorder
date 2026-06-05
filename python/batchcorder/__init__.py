@@ -71,11 +71,16 @@ class StreamCache:
     max_readers : int, optional
         Hard cap on the total number of readers ever created from this cache.
         When set, batches are evicted once all readers have advanced past them,
-        enabling bounded-memory streaming.  Dropping a reader does **not** free
-        a slot — once ``max_readers`` readers have been created, no more can be
-        obtained.  ``reader(from_start=True)`` raises ``ValueError`` if batch 0
-        has already been evicted.  When ``None`` (default), all batches are
-        retained indefinitely.
+        enabling bounded-memory streaming.  Eviction only begins once all
+        ``max_readers`` readers have actually been created — with fewer live
+        readers every batch is retained so future readers can still replay
+        from the start.  Dropping a reader does **not** free a slot — once
+        ``max_readers`` readers have been created, no more can be obtained.
+        ``reader(from_start=True)`` raises ``ValueError`` if batch 0 has
+        already been evicted.  For disk-backed caches, eviction frees memory
+        (hot layer and index) but not bytes in the append-only cache file —
+        disk space is reclaimed only when the cache is closed or dropped.
+        When ``None`` (default), all batches are retained indefinitely.
 
     Examples
     --------
