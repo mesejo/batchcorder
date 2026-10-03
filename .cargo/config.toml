@@ -1,0 +1,17 @@
+# Keep bare `cargo build/check/clippy/test` and `maturin develop` on the same
+# build cache.
+#
+# maturin exports these three variables when it invokes cargo. pyo3-build-config
+# emits `rerun-if-env-changed=PYO3_ENVIRONMENT_SIGNATURE`, so when a bare cargo
+# command runs without them, pyo3-build-config is marked dirty and pyo3-ffi,
+# pyo3, pyo3-stub-gen, arrow-pyarrow and this crate are all recompiled. The next
+# `maturin develop` then flips everything back. Pinning the same values here
+# makes both paths produce identical fingerprints.
+#
+# The signature only has to match what maturin derives from `.venv/bin/python`.
+# If the venv moves to another Python minor version, update it; a stale value
+# costs a rebuild per switch (the previous status quo), never a broken build.
+[env]
+PYO3_PYTHON = { value = ".venv/bin/python", relative = true }
+PYO3_ENVIRONMENT_SIGNATURE = "cpython-3.13-64bit"
+PYO3_BUILD_EXTENSION_MODULE = "1"

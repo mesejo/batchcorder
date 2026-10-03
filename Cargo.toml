@@ -32,6 +32,13 @@ sysinfo = { version = "0.33", default-features = false, features = ["system"] }
 # Fast non-cryptographic hash for cache entry integrity checks
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
+# Full DWARF is not needed for the Python test loop and triples the size of the
+# debug `.so` (71 MB vs 30 MB), which slows every link. Line tables keep file and
+# line numbers in panics and backtraces. Override per invocation when stepping
+# through Rust in a debugger: `CARGO_PROFILE_DEV_DEBUG=true maturin develop`.
+[profile.dev]
+debug = "line-tables-only"
+
 [lints.rust]
 # Py_GIL_DISABLED is a cfg set by pyo3's build script to indicate free-threaded Python.
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(Py_GIL_DISABLED)'] }
