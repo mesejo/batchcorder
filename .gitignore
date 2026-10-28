@@ -95,3 +95,6 @@ drafts
 coverage.lcov
 
 .claude
+
+# Personal scratch notes and plans
+.scratch/
