@@ -19,43 +19,62 @@
 # with a different dev profile, so only steady-state numbers are reported.
 #
 # Scenarios:
-#   alternate   maturin develop -> cargo build --lib -> cargo clippy (the
-#               pre-commit hook command) -> maturin develop, with no source
-#               change. Every step should be a no-op; on main each step
-#               recompiles pyo3 and everything above it.
+#   alternate   maturin develop -> cargo build --lib -> cargo clippy (via the
+#               pre-commit hook) -> maturin develop, with no source change.
+#               Every step should be a no-op; on main each step recompiles
+#               pyo3 and everything above it.
 #   edit        append a one-line function to src/cached_dataset.rs, run
 #               `maturin develop`, remove it, run `maturin develop` again.
-#   sizes       size of the debug .so and of target/debug.
+#   sizes       size of the debug .so and of the debug target directory.
 set -euo pipefail
 
 rounds=3
 clean=0
 while [ $# -gt 0 ]; do
     case "$1" in
-        --rounds) rounds="$2"; shift 2 ;;
+        --rounds) rounds="${2:-}"; shift 2 || shift ;;
         --clean) clean=1; shift ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
+case "$rounds" in
+    '' | *[!0-9]*) echo "--rounds needs a positive integer, got '$rounds'" >&2; exit 2 ;;
+esac
+
+# Keep `uv run` from syncing (and rebuilding the project) inside timed steps.
+export UV_NO_SYNC=1
 
 cd "$(git rev-parse --show-toplevel)"
 src=src/cached_dataset.rs
 backup=$(mktemp)
+log=$(mktemp)
 cp "$src" "$backup"
-trap 'cp "$backup" "$src"; rm -f "$backup"' EXIT
+# Copy back only if the file differs, so a clean exit does not bump the
+# mtime and force a rebuild on the next cargo invocation.
+trap 'cmp -s "$backup" "$src" || cp "$backup" "$src"; rm -f "$backup" "$log"' EXIT
 
-clippy_cmd=(cargo clippy --all-targets --all-features -- -Dclippy::all -D warnings -Aclippy::redundant_closure)
+# Run the hook itself so the benchmark follows any change to its flags.
+clippy_cmd=(uv run pre-commit run rust-clippy --all-files)
 
-now_ms() { date +%s%N | cut -c1-13; }
+# fail <command...>: report a failed step with its output, then exit.
+fail() {
+    echo "  FAILED: $*" >&2
+    tail -n 40 "$log" >&2
+    exit 1
+}
 
-# timed <label> <command...>: run quietly, print wall seconds.
+# quiet <command...>: run with output captured to the log.
+quiet() {
+    "$@" >"$log" 2>&1 || fail "$@"
+}
+
+# timed <label> <command...>: run quietly, print wall seconds. Uses the
+# `time` keyword so it works with the bash 3.2 that ships with macOS.
 timed() {
     local label="$1"; shift
-    local start end
-    start=$(now_ms)
-    "$@" >/dev/null 2>&1
-    end=$(now_ms)
-    printf '  %-34s %6.2f s\n' "$label" "$(awk "BEGIN{print ($end-$start)/1000}")"
+    local secs TIMEFORMAT=%R
+    secs=$( { time "$@" >"$log" 2>&1; } 2>&1 ) || fail "$@"
+    printf '  %-34s %6.2f s\n' "$label" "$secs"
 }
 
 echo "branch: $(git branch --show-current)  commit: $(git rev-parse --short HEAD)"
@@ -63,10 +82,10 @@ echo "rustc: $(rustc --version)"
 echo
 
 echo "warm-up (not measured)"
-uv run maturin develop --uv >/dev/null 2>&1
-cargo build --lib >/dev/null 2>&1
-"${clippy_cmd[@]}" >/dev/null 2>&1
-uv run maturin develop --uv >/dev/null 2>&1
+quiet uv run maturin develop --uv
+quiet cargo build --lib
+quiet "${clippy_cmd[@]}"
+quiet uv run maturin develop --uv
 echo
 
 echo "alternate: no source change, maturin <-> bare cargo"
@@ -90,14 +109,23 @@ done
 echo
 
 echo "sizes"
+debug_dir="${CARGO_TARGET_DIR:-target}/debug"
 so=$(find python/batchcorder -maxdepth 1 -name '_batchcorder*.so' | head -n 1)
-printf '  %-34s %6.1f MB\n' "installed .so" "$(awk "BEGIN{print $(stat -c %s "$so")/1048576}")"
-printf '  %-34s %s\n' "target/debug" "$(du -sh target/debug | cut -f1)"
+if [ -n "$so" ]; then
+    printf '  %-34s %6.1f MB\n' "installed .so" "$(awk "BEGIN{print $(wc -c <"$so")/1048576}")"
+else
+    printf '  %-34s %s\n' "installed .so" "not found"
+fi
+if [ -d "$debug_dir" ]; then
+    printf '  %-34s %s\n' "$debug_dir" "$(du -sh "$debug_dir" | cut -f1)"
+else
+    printf '  %-34s %s\n' "$debug_dir" "not found"
+fi
 echo
 
 if [ "$clean" -eq 1 ]; then
     echo "clean build (cargo clean first)"
-    cargo clean
+    quiet cargo clean
     timed "cargo build --lib (cold)" cargo build --lib
-    uv run maturin develop --uv >/dev/null 2>&1
+    quiet uv run maturin develop --uv
 fi

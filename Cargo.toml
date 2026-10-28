@@ -36,7 +36,10 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 # line numbers for this crate in panics and backtraces; dependencies carry no
 # debuginfo at all, which cuts a clean `target/` from ~830 MB to ~560 MB and
 # the debug `.so` from 71 MB to 15 MB. Override per invocation when stepping
-# through Rust in a debugger: `CARGO_PROFILE_DEV_DEBUG=true maturin develop`.
+# through Rust in a debugger. Both keys are needed, since the per-package
+# override below wins over the profile-level setting for dependencies:
+#   maturin develop --config 'profile.dev.debug=true' \
+#       --config 'profile.dev.package."*".debug=true'
 [profile.dev]
 debug = "line-tables-only"
 
