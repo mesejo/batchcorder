@@ -54,7 +54,8 @@ jobs:
           path: dist
 
   macos:
-    runs-on: macos-latest
+    # Pinned like ci-test: macos-latest jobs sat queued without a runner.
+    runs-on: macos-14
     strategy:
       matrix:
         target: [x86_64, aarch64]
