@@ -22,7 +22,6 @@
 //! evicting fails with a clear error.  Register a fresh provider per query,
 //! or use [`Bounding::Unbounded`] when the table must be re-read.
 
-use std::any::Any;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -117,10 +116,6 @@ fn reader_error(e: ArrowError, during: &str) -> DataFusionError {
 
 #[async_trait]
 impl TableProvider for TeeTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.cache.schema()
     }

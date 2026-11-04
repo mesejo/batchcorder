@@ -12,7 +12,6 @@
 //! blocking calls, mapping errors to Python exceptions, and Arrow PyCapsule
 //! export.
 
-use std::ffi::CString;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -62,8 +61,7 @@ fn arrow_to_py_err(e: ArrowError) -> PyErr {
 fn to_schema_pycapsule<'py>(py: Python<'py>, schema: &Schema) -> PyResult<Bound<'py, PyCapsule>> {
     let ffi_schema =
         FFI_ArrowSchema::try_from(schema).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let name = CString::new("arrow_schema").map_err(|e| PyValueError::new_err(e.to_string()))?;
-    PyCapsule::new(py, ffi_schema, Some(name))
+    PyCapsule::new_with_value(py, ffi_schema, c"arrow_schema")
 }
 
 // ── GIL management ───────────────────────────────────────────────────────────
@@ -174,9 +172,7 @@ impl PyStreamCacheReader {
             None => {
                 // Fast path: export directly via Arrow C Stream FFI, no Python allocation.
                 let ffi_stream = FFI_ArrowArrayStream::new(boxed);
-                let name = CString::new("arrow_array_stream")
-                    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-                PyCapsule::new(py, ffi_stream, Some(name))
+                PyCapsule::new_with_value(py, ffi_stream, c"arrow_array_stream")
             }
             Some(schema) => {
                 // Schema-casting path: let pyarrow handle the requested_schema negotiation.
