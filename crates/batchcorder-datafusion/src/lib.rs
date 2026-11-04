@@ -21,10 +21,23 @@
 //! the same provider into a second query after the first one has started
 //! evicting fails with a clear error.  Register a fresh provider per query,
 //! or use [`Bounding::Unbounded`] when the table must be re-read.
+//!
+//! # Recursive queries
+//!
+//! A recursive CTE re-executes its recursive term on every iteration, so a
+//! scan inside it re-reads the stream after a sealed cache has evicted it.
+//! Hosts that link this crate directly can add [`TeeFanoutRule`] to the
+//! session's physical optimizer: it switches the cache of every tee scan
+//! inside a recursive term to [`Bounding::Unbounded`] before execution.
+//! Without it, such a query fails with a clear error instead.
+
+mod fanout;
+
+pub use fanout::TeeFanoutRule;
 
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use async_trait::async_trait;
 use batchcorder_core::{Bounding, StreamCache, StreamCacheReader};
@@ -152,13 +165,15 @@ impl TableProvider for TeeTableProvider {
             .map_err(|e| reader_error(e, "while planning"))?;
         self.stats.scans_planned.fetch_add(1, Ordering::Relaxed);
         let schema = self.cache.schema();
-        let partition: Arc<dyn PartitionStream> = Arc::new(TeePartition {
+        let partition = Arc::new(TeePartition {
             schema: schema.clone(),
             cache: self.cache.clone(),
             reader: Mutex::new(Some(reader)),
             stats: self.stats.clone(),
             runtime: self.runtime.clone(),
         });
+        register_partition(&partition);
+        let partition: Arc<dyn PartitionStream> = partition;
         let exec = StreamingTableExec::try_new(
             schema,
             vec![partition],
@@ -169,6 +184,33 @@ impl TableProvider for TeeTableProvider {
         )?;
         Ok(Arc::new(exec))
     }
+}
+
+/// Every live [`TeePartition`], so that [`TeeFanoutRule`] can recognise tee
+/// scans in a physical plan: DataFusion's [`PartitionStream`] cannot be
+/// downcast.  Holding a `Weak` keeps the allocation (and so its address)
+/// reserved, so a match by address is never a different, newer partition.
+/// Only touched at planning time.
+static PARTITIONS: Mutex<Vec<Weak<TeePartition>>> = Mutex::new(Vec::new());
+
+fn register_partition(partition: &Arc<TeePartition>) {
+    if let Ok(mut live) = PARTITIONS.lock() {
+        live.retain(|w| w.strong_count() > 0);
+        live.push(Arc::downgrade(partition));
+    }
+}
+
+/// The cache behind `partition` if it is a [`TeePartition`].
+fn tee_cache_of(partition: &Arc<dyn PartitionStream>) -> Result<Option<StreamCache>> {
+    let addr = Arc::as_ptr(partition).cast::<()>();
+    let live = PARTITIONS
+        .lock()
+        .map_err(|e| DataFusionError::Internal(format!("tee partition registry poisoned: {e}")))?;
+    Ok(live
+        .iter()
+        .filter(|w| Weak::as_ptr(w).cast::<()>() == addr)
+        .find_map(Weak::upgrade)
+        .map(|p| p.cache.clone()))
 }
 
 /// One scan's replay of the cache.  Holds the reader reserved at planning
