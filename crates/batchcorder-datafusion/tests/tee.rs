@@ -5,12 +5,13 @@
 use std::sync::Arc;
 
 use batchcorder_core::{Bounding, CacheConfig, StreamCache};
-use batchcorder_datafusion::{TeeStats, TeeTableProvider, sealed_provider};
+use batchcorder_datafusion::{TeeFanoutRule, TeeStats, TeeTableProvider, sealed_provider};
 use datafusion::arrow::array::{Int64Array, RecordBatch};
 use datafusion::arrow::compute::concat_batches;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::error::ArrowError;
 use datafusion::datasource::MemTable;
+use datafusion::execution::SessionStateBuilder;
 use datafusion::prelude::SessionContext;
 
 const N_BATCHES: i64 = 50;
@@ -264,4 +265,84 @@ async fn disk_tier_self_join() {
     assert_eq!(run(&ctx, sql).await.expect("query"), reference(sql).await);
     assert_eq!(stats.scans_planned(), 2);
     cache.close().expect("close");
+}
+
+// ── recursive queries and TeeFanoutRule ──────────────────────────────────────
+
+/// The tee scan sits in the recursive term, so it re-executes per iteration.
+const RECURSIVE_SCAN_SQL: &str = "with recursive r(n) as (select 0 as n union all \
+     select r.n + 1 from r join (select max(k) as m from t) s on r.n < s.m) \
+     select n from r order by n";
+
+/// Like [`tee_ctx`], with [`TeeFanoutRule`] in the physical optimizer.
+fn tee_ctx_with_rule() -> (SessionContext, StreamCache, Arc<TeeStats>) {
+    let provider = sealed_provider(upstream(), schema(), CacheConfig::default()).expect("provider");
+    let cache = provider.cache().clone();
+    let stats = provider.stats();
+    let state = SessionStateBuilder::new()
+        .with_default_features()
+        .with_physical_optimizer_rule(Arc::new(TeeFanoutRule))
+        .build();
+    let ctx = SessionContext::new_with_state(state);
+    ctx.register_table("t", Arc::new(provider))
+        .expect("register");
+    (ctx, cache, stats)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recursive_scan_without_rule_fails_clearly() {
+    let (ctx, _cache, _stats) = tee_ctx(CacheConfig::default());
+    let err = run(&ctx, RECURSIVE_SCAN_SQL)
+        .await
+        .expect_err("second iteration re-reads an evicted cache");
+    assert!(
+        err.to_string().contains("Bounding::Unbounded"),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rule_makes_recursive_scan_rereadable() {
+    let (ctx, cache, stats) = tee_ctx_with_rule();
+    let got = run(&ctx, RECURSIVE_SCAN_SQL).await.expect("tee query");
+    assert_eq!(got, reference(RECURSIVE_SCAN_SQL).await);
+    assert_eq!(got.num_rows(), 7, "max(k) = 6, so n runs 0..=6");
+    assert_eq!(cache.bounding().expect("ok"), Bounding::Unbounded);
+    assert_eq!(cache.evicted_count().expect("ok"), 0);
+    // One planned scan, re-executed once per iteration that reaches it.
+    assert_eq!(stats.scans_planned(), 1);
+    assert!(stats.scans_executed() > 1, "{}", stats.scans_executed());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rule_leaves_scan_in_static_term_sealed() {
+    let sql = "with recursive r(n) as (select min(x) as n from t union all \
+               select n + 1 from r where n < 5) select n from r order by n";
+    let (ctx, cache, stats) = tee_ctx_with_rule();
+    assert_eq!(
+        run(&ctx, sql).await.expect("tee query"),
+        reference(sql).await
+    );
+    assert_eq!(cache.bounding().expect("ok"), Bounding::Sealed);
+    assert_eq!(stats.scans_executed(), 1);
+    assert_eq!(
+        cache.evicted_count().expect("ok"),
+        cache.ingested_count().expect("ok")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rule_leaves_non_recursive_query_sealed() {
+    let sql = "select a.k, count(*) as c from t a join t b on a.k = b.k group by a.k order by a.k";
+    let (ctx, cache, stats) = tee_ctx_with_rule();
+    assert_eq!(
+        run(&ctx, sql).await.expect("tee query"),
+        reference(sql).await
+    );
+    assert_eq!(cache.bounding().expect("ok"), Bounding::Sealed);
+    assert_eq!(stats.scans_planned(), 2);
+    assert_eq!(
+        cache.evicted_count().expect("ok"),
+        cache.ingested_count().expect("ok")
+    );
 }
