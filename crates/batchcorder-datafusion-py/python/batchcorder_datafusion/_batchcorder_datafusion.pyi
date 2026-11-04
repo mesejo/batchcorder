@@ -2,9 +2,12 @@ import typing
 
 import pyarrow as pa
 
+__all__ = ["TeeTableProvider"]
+
+@typing.final
 class TeeTableProvider:
-    def __init__(
-        self,
+    def __new__(
+        cls,
         reader: typing.Any,
         *,
         memory_capacity: int | None = None,
@@ -12,7 +15,7 @@ class TeeTableProvider:
         disk_capacity: int | None = None,
         write_policy: str = "on_insertion",
         bounding: str = "sealed",
-    ) -> None: ...
+    ) -> TeeTableProvider: ...
     def __datafusion_table_provider__(self, session: typing.Any) -> typing.Any: ...
     @property
     def schema(self) -> pa.Schema: ...
