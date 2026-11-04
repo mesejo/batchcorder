@@ -33,6 +33,36 @@ use arrow_schema::{ArrowError, SchemaRef};
 use crate::tier::{CacheTier, ReleasedBatches, WritePolicy, other_arrow_err, poisoned_lock_err};
 use crate::{Upstream, WaitHook};
 
+// ── bounding ─────────────────────────────────────────────────────────────────
+
+/// How a cache decides when cached batches can be evicted.
+///
+/// A batch can be evicted once every reader that will ever need it has read
+/// past it.  The variants differ in how the cache learns the set of readers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Bounding {
+    /// Never evict.  Any number of readers, created at any time, can replay
+    /// from the start.  Memory grows with the stream.
+    #[default]
+    Unbounded,
+    /// Exactly `max` readers are expected.  Nothing is evicted until all of
+    /// them exist; creating more is an error.
+    Counted { max: u64 },
+    /// Readers register freely until the cache is *sealed*, either by
+    /// [`StreamCache::seal`] or automatically by the first poll of any
+    /// reader.  After that, eviction follows the slowest live reader, and a
+    /// from-start reader can still be added only while nothing has been
+    /// evicted.
+    ///
+    /// Made for query engines: every scan in a physical plan creates its
+    /// reader during planning, before execution polls any of them, so the
+    /// fan-out is exact.  A reader dropped without being polled (a pruned
+    /// scan, an `EXPLAIN`) stops counting.  A reader that stays alive but is
+    /// never polled holds eviction back — a memory cost, never a wrong
+    /// result.
+    Sealed,
+}
+
 // ── shared ingestion state ───────────────────────────────────────────────────
 
 struct DatasetInner {
@@ -49,18 +79,17 @@ struct DatasetInner {
     /// waiting readers can tell that something changed.
     ingest_epoch: u64,
     closed: bool,
-    max_readers: Option<u64>,
+    bounding: Bounding,
+    /// `Bounding::Sealed` only: set once the reader registration window has
+    /// closed (explicitly, or by the first poll of any reader).
+    sealed: bool,
     readers_created: u64,
     reader_positions: Vec<Weak<AtomicU64>>,
     evicted_up_to: u64,
 }
 
 impl DatasetInner {
-    fn new(
-        cache: Arc<CacheTier>,
-        upstream: Option<Box<dyn Upstream>>,
-        max_readers: Option<u64>,
-    ) -> Self {
+    fn new(cache: Arc<CacheTier>, upstream: Option<Box<dyn Upstream>>, bounding: Bounding) -> Self {
         Self {
             cache,
             upstream,
@@ -69,7 +98,8 @@ impl DatasetInner {
             upstream_panicked: false,
             ingest_epoch: 0,
             closed: false,
-            max_readers,
+            bounding,
+            sealed: false,
             readers_created: 0,
             reader_positions: Vec::new(),
             evicted_up_to: 0,
@@ -77,14 +107,14 @@ impl DatasetInner {
     }
 
     /// Register a new reader at `start_index`.  Returns the shared position
-    /// tracker, or `None` when `max_readers` is unset.
+    /// tracker, or `None` under `Bounding::Unbounded` (no tracking needed).
     fn register_reader(
         &mut self,
         start_index: u64,
         from_start: bool,
     ) -> Result<Option<Arc<AtomicU64>>, ArrowError> {
         self.reader_positions.retain(|w| w.strong_count() > 0);
-        if let Some(max) = self.max_readers
+        if let Bounding::Counted { max } = self.bounding
             && self.readers_created >= max
         {
             return Err(ArrowError::InvalidArgumentError(format!(
@@ -96,7 +126,7 @@ impl DatasetInner {
                 "Cannot create a from-start reader: earliest cached batch has been evicted".into(),
             ));
         }
-        if self.max_readers.is_some() {
+        if self.bounding != Bounding::Unbounded {
             let pos = Arc::new(AtomicU64::new(start_index));
             self.reader_positions.push(Arc::downgrade(&pos));
             self.readers_created += 1;
@@ -108,9 +138,17 @@ impl DatasetInner {
 
     /// Compute the low-water mark: the minimum position across all live
     /// readers.  Prunes dead `Weak` references as a side effect.
+    ///
+    /// Returns `Some(0)` (evict nothing) while more readers may still
+    /// register from the start: until `max` readers exist under `Counted`,
+    /// and until the cache is sealed under `Sealed`.
     fn compute_lwm(&mut self) -> Option<u64> {
-        let max = self.max_readers?;
-        if self.readers_created < max {
+        let registration_open = match self.bounding {
+            Bounding::Unbounded => return None,
+            Bounding::Counted { max } => self.readers_created < max,
+            Bounding::Sealed => !self.sealed,
+        };
+        if registration_open {
             self.reader_positions.retain(|w| w.strong_count() > 0);
             return Some(0);
         }
@@ -296,9 +334,8 @@ pub struct CacheConfig {
     pub disk: Option<DiskConfig>,
     /// When batches reach the disk tier.  Ignored for memory-only caches.
     pub write_policy: WritePolicy,
-    /// Expected number of readers.  When set, batches every reader has moved
-    /// past are evicted, and creating more readers than this is an error.
-    pub max_readers: Option<u64>,
+    /// When cached batches may be evicted; see [`Bounding`].
+    pub bounding: Bounding,
     /// Wraps every wait for another reader's ingest; see [`WaitHook`].
     pub wait_hook: Option<WaitHook>,
 }
@@ -324,9 +361,9 @@ impl StreamCache {
         schema: SchemaRef,
         config: CacheConfig,
     ) -> Result<Self, ArrowError> {
-        if config.max_readers == Some(0) {
+        if config.bounding == (Bounding::Counted { max: 0 }) {
             return Err(ArrowError::InvalidArgumentError(
-                "max_readers must be at least 1".into(),
+                "Bounding::Counted requires max >= 1".into(),
             ));
         }
         let cache = match config.disk {
@@ -338,7 +375,7 @@ impl StreamCache {
             )?,
             None => CacheTier::memory(config.memory_capacity),
         };
-        let inner = DatasetInner::new(Arc::new(cache), Some(upstream), config.max_readers);
+        let inner = DatasetInner::new(Arc::new(cache), Some(upstream), config.bounding);
         Ok(Self {
             schema,
             shared: Arc::new(Shared::new(inner, config.wait_hook)),
@@ -352,8 +389,13 @@ impl StreamCache {
     /// Create a reader.  `from_start` replays from the first batch; otherwise
     /// the reader starts at the next batch not yet ingested.
     ///
-    /// Fails when the cache is closed, when `max_readers` readers already
-    /// exist, or when `from_start` is requested after eviction has begun.
+    /// Fails when the cache is closed, when `Bounding::Counted` already has
+    /// `max` readers, or when `from_start` is requested after eviction has
+    /// begun.
+    ///
+    /// Creating a reader does not poll it.  Under [`Bounding::Sealed`] an
+    /// unpolled reader is a *reservation*: it holds eviction back until it is
+    /// polled past a batch or dropped.
     pub fn reader(&self, from_start: bool) -> Result<StreamCacheReader, ArrowError> {
         let mut inner = self.shared.lock()?;
         if inner.closed {
@@ -367,6 +409,25 @@ impl StreamCache {
             current_index: start_index,
             position,
         })
+    }
+
+    /// Close the reader registration window of a [`Bounding::Sealed`] cache,
+    /// so eviction can start.  Called automatically by the first poll of any
+    /// reader; call it explicitly when every reader has been created but
+    /// polling starts later.  Readers can still be added afterwards while
+    /// nothing has been evicted.  A no-op for other boundings.  Idempotent.
+    pub fn seal(&self) -> Result<(), ArrowError> {
+        let mut inner = self.shared.lock()?;
+        if inner.bounding == Bounding::Sealed {
+            inner.sealed = true;
+        }
+        Ok(())
+    }
+
+    /// Whether a [`Bounding::Sealed`] cache has been sealed.  Always `false`
+    /// for other boundings.
+    pub fn is_sealed(&self) -> Result<bool, ArrowError> {
+        Ok(self.shared.lock()?.sealed)
     }
 
     /// Pull every remaining upstream batch into the cache.  Returns the total
@@ -415,7 +476,7 @@ pub struct StreamCacheReader {
     shared: Arc<Shared>,
     current_index: u64,
     /// Shared position visible to `DatasetInner` for LWM computation.
-    /// `None` when `max_readers` is not set (no tracking needed).
+    /// `None` under `Bounding::Unbounded` (no tracking needed).
     position: Option<Arc<AtomicU64>>,
 }
 
@@ -435,6 +496,11 @@ impl Iterator for StreamCacheReader {
             };
             if inner.closed {
                 return Some(Err(closed_err()));
+            }
+            // First poll of any reader closes registration: by now a query
+            // engine has finished planning, so every scan has its reader.
+            if inner.bounding == Bounding::Sealed {
+                inner.sealed = true;
             }
             match inner.maybe_evict() {
                 Ok(released) => released,
@@ -511,15 +577,12 @@ mod tests {
 
     // ── DatasetInner LWM logic ──────────────────────────────────────────────────
 
-    fn make_dataset_inner(
-        max_readers: Option<u64>,
-        batch_count: u64,
-    ) -> (Arc<Shared>, Arc<CacheTier>) {
+    fn make_dataset_inner(bounding: Bounding, batch_count: u64) -> (Arc<Shared>, Arc<CacheTier>) {
         let cache = Arc::new(memory_tier(1 << 20));
         for i in 0..batch_count {
             cache.insert(make_batch(&[i as i32])).expect("insert");
         }
-        let mut inner = DatasetInner::new(cache.clone(), None, max_readers);
+        let mut inner = DatasetInner::new(cache.clone(), None, bounding);
         inner.ingested_count = batch_count;
         inner.upstream_exhausted = true;
         (Arc::new(Shared::new(inner, None)), cache)
@@ -527,7 +590,7 @@ mod tests {
 
     #[test]
     fn register_reader_tracks_position() {
-        let (inner_arc, _) = make_dataset_inner(Some(2), 4);
+        let (inner_arc, _) = make_dataset_inner(Bounding::Counted { max: 2 }, 4);
         let mut inner = inner_arc.state.lock().unwrap();
         let pos = inner.register_reader(0, true).expect("register");
         assert!(pos.is_some());
@@ -537,7 +600,7 @@ mod tests {
 
     #[test]
     fn register_reader_none_max_returns_none_position() {
-        let (inner_arc, _) = make_dataset_inner(None, 4);
+        let (inner_arc, _) = make_dataset_inner(Bounding::Unbounded, 4);
         let mut inner = inner_arc.state.lock().unwrap();
         let pos = inner.register_reader(0, true).expect("register");
         assert!(pos.is_none());
@@ -546,7 +609,7 @@ mod tests {
 
     #[test]
     fn register_reader_rejects_excess() {
-        let (inner_arc, _) = make_dataset_inner(Some(1), 4);
+        let (inner_arc, _) = make_dataset_inner(Bounding::Counted { max: 1 }, 4);
         let mut inner = inner_arc.state.lock().unwrap();
         let _pos = inner.register_reader(0, true).expect("first ok");
         assert!(inner.register_reader(0, true).is_err());
@@ -554,7 +617,7 @@ mod tests {
 
     #[test]
     fn register_reader_rejects_from_start_after_eviction() {
-        let (inner_arc, _) = make_dataset_inner(Some(2), 4);
+        let (inner_arc, _) = make_dataset_inner(Bounding::Counted { max: 2 }, 4);
         let mut inner = inner_arc.state.lock().unwrap();
         inner.evicted_up_to = 1;
         assert!(inner.register_reader(0, true).is_err());
@@ -563,7 +626,7 @@ mod tests {
 
     #[test]
     fn register_reader_prunes_dead_refs() {
-        let (inner_arc, _) = make_dataset_inner(Some(3), 4);
+        let (inner_arc, _) = make_dataset_inner(Bounding::Counted { max: 3 }, 4);
         let mut inner = inner_arc.state.lock().unwrap();
         let _pos1 = inner.register_reader(0, true).expect("r1");
         let pos2 = inner.register_reader(0, true).expect("r2");
@@ -574,14 +637,14 @@ mod tests {
 
     #[test]
     fn compute_lwm_returns_none_without_max_readers() {
-        let (inner_arc, _) = make_dataset_inner(None, 4);
+        let (inner_arc, _) = make_dataset_inner(Bounding::Unbounded, 4);
         let mut inner = inner_arc.state.lock().unwrap();
         assert!(inner.compute_lwm().is_none());
     }
 
     #[test]
     fn compute_lwm_returns_zero_before_all_readers_created() {
-        let (inner_arc, _) = make_dataset_inner(Some(2), 4);
+        let (inner_arc, _) = make_dataset_inner(Bounding::Counted { max: 2 }, 4);
         let mut inner = inner_arc.state.lock().unwrap();
         let _pos = inner.register_reader(0, true).expect("register");
         assert_eq!(inner.compute_lwm(), Some(0));
@@ -589,7 +652,7 @@ mod tests {
 
     #[test]
     fn compute_lwm_returns_min_position() {
-        let (inner_arc, _) = make_dataset_inner(Some(2), 4);
+        let (inner_arc, _) = make_dataset_inner(Bounding::Counted { max: 2 }, 4);
         let mut inner = inner_arc.state.lock().unwrap();
         let pos1 = inner.register_reader(0, true).expect("r1").unwrap();
         let pos2 = inner.register_reader(0, true).expect("r2").unwrap();
@@ -600,7 +663,7 @@ mod tests {
 
     #[test]
     fn compute_lwm_prunes_dead_readers() {
-        let (inner_arc, _) = make_dataset_inner(Some(2), 4);
+        let (inner_arc, _) = make_dataset_inner(Bounding::Counted { max: 2 }, 4);
         let mut inner = inner_arc.state.lock().unwrap();
         let pos1 = inner.register_reader(0, true).expect("r1").unwrap();
         let pos2 = inner.register_reader(0, true).expect("r2").unwrap();
@@ -612,7 +675,7 @@ mod tests {
 
     #[test]
     fn maybe_evict_advances_evicted_up_to() {
-        let (inner_arc, cache) = make_dataset_inner(Some(1), 4);
+        let (inner_arc, cache) = make_dataset_inner(Bounding::Counted { max: 1 }, 4);
         let mut inner = inner_arc.state.lock().unwrap();
         let pos = inner.register_reader(0, true).expect("register").unwrap();
         pos.store(3, Ordering::Release);
@@ -625,7 +688,7 @@ mod tests {
 
     #[test]
     fn maybe_evict_noop_without_max_readers() {
-        let (inner_arc, cache) = make_dataset_inner(None, 4);
+        let (inner_arc, cache) = make_dataset_inner(Bounding::Unbounded, 4);
         let mut inner = inner_arc.state.lock().unwrap();
         let _ = inner.maybe_evict().expect("evict");
         assert_eq!(inner.evicted_up_to, 0);
@@ -634,7 +697,7 @@ mod tests {
 
     #[test]
     fn reader_drop_triggers_eviction() {
-        let (inner_arc, cache) = make_dataset_inner(Some(1), 4);
+        let (inner_arc, cache) = make_dataset_inner(Bounding::Counted { max: 1 }, 4);
         let pos = {
             let mut inner = inner_arc.state.lock().unwrap();
             inner.register_reader(0, true).expect("register").unwrap()
@@ -719,7 +782,7 @@ mod tests {
     #[test]
     fn stream_cache_max_readers_evicts_and_caps() {
         let config = CacheConfig {
-            max_readers: Some(2),
+            bounding: Bounding::Counted { max: 2 },
             ..CacheConfig::default()
         };
         let cache = native_cache(4, config);
@@ -746,7 +809,7 @@ mod tests {
     #[test]
     fn stream_cache_rejects_zero_max_readers() {
         let config = CacheConfig {
-            max_readers: Some(0),
+            bounding: Bounding::Counted { max: 0 },
             ..CacheConfig::default()
         };
         let upstream: Vec<Result<RecordBatch, ArrowError>> = Vec::new();
@@ -1062,7 +1125,7 @@ mod tests {
             pulls: pulls.clone(),
         };
         let config = CacheConfig {
-            max_readers: Some(READERS),
+            bounding: Bounding::Counted { max: READERS },
             ..CacheConfig::default()
         };
         let cache = StreamCache::try_new(Box::new(upstream), schema(), config).expect("cache");
@@ -1080,5 +1143,169 @@ mod tests {
         assert_eq!(cache.ingested_count().expect("ok"), N as u64);
         // Every reader finished, so everything was evicted.
         assert_eq!(cache.shared.lock().expect("lock").evicted_up_to, N as u64);
+    }
+
+    // ── Bounding::Sealed ────────────────────────────────────────────────────────
+
+    fn sealed_cache(n: i32) -> StreamCache {
+        native_cache(
+            n,
+            CacheConfig {
+                bounding: Bounding::Sealed,
+                ..CacheConfig::default()
+            },
+        )
+    }
+
+    fn evicted_up_to(cache: &StreamCache) -> u64 {
+        cache.shared.lock().expect("lock").evicted_up_to
+    }
+
+    #[test]
+    fn sealed_holds_eviction_until_first_poll() {
+        let cache = sealed_cache(4);
+        let mut a = cache.reader(true).expect("a");
+        let b = cache.reader(true).expect("b");
+        cache.ingest_all().expect("ingest");
+        assert!(!cache.is_sealed().expect("ok"));
+        assert_eq!(evicted_up_to(&cache), 0);
+
+        assert_eq!(a.next().expect("some").expect("ok"), make_batch(&[0]));
+        assert!(cache.is_sealed().expect("ok"), "first poll seals");
+        assert_eq!(collect(a), expected(4)[1..].to_vec());
+        assert_eq!(collect(b), expected(4));
+    }
+
+    #[test]
+    fn sealed_eviction_follows_slowest_reader() {
+        let cache = sealed_cache(4);
+        let a = cache.reader(true).expect("a");
+        let mut b = cache.reader(true).expect("b");
+        assert_eq!(collect(a), expected(4));
+        // `b` still sits at 0, so nothing can go yet.
+        assert_eq!(evicted_up_to(&cache), 0);
+
+        let mut got = Vec::new();
+        for _ in 0..3 {
+            got.push(b.next().expect("some").expect("ok"));
+        }
+        // The third poll evicted everything `b` had already read.
+        assert_eq!(evicted_up_to(&cache), 2);
+        got.extend(collect(b));
+        assert_eq!(got, expected(4));
+        assert_eq!(
+            evicted_up_to(&cache),
+            4,
+            "dropping the last reader evicts all"
+        );
+    }
+
+    #[test]
+    fn sealed_dropped_unpolled_reader_does_not_pin() {
+        // A scan pruned from the plan (or an EXPLAIN) drops its reader
+        // without ever polling it; it must stop holding eviction back.
+        let cache = sealed_cache(4);
+        let a = cache.reader(true).expect("a");
+        let b = cache.reader(true).expect("b");
+        let pruned = cache.reader(true).expect("pruned");
+        drop(pruned);
+        let a_rx = spawn(move || collect(a));
+        let b_rx = spawn(move || collect(b));
+        assert_eq!(a_rx.recv_timeout(TIMEOUT).expect("a"), expected(4));
+        assert_eq!(b_rx.recv_timeout(TIMEOUT).expect("b"), expected(4));
+        assert_eq!(evicted_up_to(&cache), 4);
+    }
+
+    #[test]
+    fn sealed_live_unpolled_reader_pins_memory_not_results() {
+        let cache = sealed_cache(4);
+        let a = cache.reader(true).expect("a");
+        let idle = cache.reader(true).expect("idle");
+        assert_eq!(collect(a), expected(4));
+        assert_eq!(evicted_up_to(&cache), 0, "idle reader keeps every batch");
+        assert_eq!(collect(idle), expected(4));
+        assert_eq!(evicted_up_to(&cache), 4);
+    }
+
+    #[test]
+    fn sealed_allows_late_from_start_reader_until_eviction() {
+        let cache = sealed_cache(4);
+        cache.seal().expect("seal");
+        assert!(cache.is_sealed().expect("ok"));
+        let mut a = cache.reader(true).expect("a");
+        let mut b = cache.reader(true).expect("b");
+        assert_eq!(a.next().expect("some").expect("ok"), make_batch(&[0]));
+
+        // Sealed, but nothing evicted yet: a re-executed scan can still join.
+        let late = cache.reader(true).expect("late reader before eviction");
+        assert_eq!(collect(late), expected(4));
+
+        // Both remaining readers move past batch 0; the next poll evicts it.
+        assert_eq!(b.next().expect("some").expect("ok"), make_batch(&[0]));
+        assert_eq!(a.next().expect("some").expect("ok"), make_batch(&[1]));
+        assert_eq!(evicted_up_to(&cache), 1);
+
+        let err = cache.reader(true).err().expect("from-start after eviction");
+        assert!(matches!(err, ArrowError::InvalidArgumentError(_)));
+        // A tail reader needs nothing evicted, so it is still allowed.
+        assert!(cache.reader(false).is_ok());
+    }
+
+    #[test]
+    fn sealed_has_no_reader_cap() {
+        let cache = sealed_cache(2);
+        let readers: Vec<_> = (0..64)
+            .map(|_| cache.reader(true).expect("reader"))
+            .collect();
+        for r in readers {
+            assert_eq!(collect(r), expected(2));
+        }
+    }
+
+    #[test]
+    fn seal_is_noop_for_other_boundings() {
+        for bounding in [Bounding::Unbounded, Bounding::Counted { max: 1 }] {
+            let cache = native_cache(
+                2,
+                CacheConfig {
+                    bounding,
+                    ..CacheConfig::default()
+                },
+            );
+            cache.seal().expect("seal");
+            assert!(!cache.is_sealed().expect("ok"));
+            let mut r = cache.reader(true).expect("reader");
+            assert!(r.next().is_some());
+            assert!(!cache.is_sealed().expect("ok"));
+        }
+    }
+
+    #[test]
+    fn sealed_concurrent_readers_get_full_stream_and_evict_all() {
+        const N: i32 = 100;
+        let pulls = Arc::new(AtomicUsize::new(0));
+        let upstream = SlowUpstream {
+            next: 0,
+            total: N,
+            pulls: pulls.clone(),
+        };
+        let config = CacheConfig {
+            bounding: Bounding::Sealed,
+            ..CacheConfig::default()
+        };
+        let cache = StreamCache::try_new(Box::new(upstream), schema(), config).expect("cache");
+        // All readers are created ("planned") before any is polled.
+        let readers: Vec<_> = (0..6)
+            .map(|_| cache.reader(true).expect("reader"))
+            .collect();
+        let receivers: Vec<_> = readers
+            .into_iter()
+            .map(|r| spawn(move || collect(r)))
+            .collect();
+        for rx in receivers {
+            assert_eq!(rx.recv_timeout(TIMEOUT * 3).expect("reader"), expected(N));
+        }
+        assert_eq!(pulls.load(Ordering::SeqCst), N as usize + 1);
+        assert_eq!(evicted_up_to(&cache), N as u64);
     }
 }

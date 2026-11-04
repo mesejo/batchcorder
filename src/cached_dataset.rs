@@ -23,7 +23,7 @@ use arrow_array::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use arrow_pyarrow::{IntoPyArrow, PyArrowType};
 use arrow_schema::{ArrowError, Schema, SchemaRef};
 use batchcorder_core::{
-    CacheConfig, DiskConfig, StreamCache, StreamCacheReader, Upstream, WritePolicy,
+    Bounding, CacheConfig, DiskConfig, StreamCache, StreamCacheReader, Upstream, WritePolicy,
 };
 use pyo3::exceptions::{PyIOError, PyMemoryError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
@@ -401,7 +401,10 @@ impl PyStreamCache {
             memory_capacity,
             disk,
             write_policy,
-            max_readers,
+            bounding: match max_readers {
+                Some(max) => Bounding::Counted { max },
+                None => Bounding::Unbounded,
+            },
             wait_hook: Some(wait_without_gil),
         };
         let cache = if config.disk.is_some() {
