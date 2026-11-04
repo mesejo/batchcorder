@@ -134,11 +134,20 @@ name = "batchcorder"
 version = "0.1.3"
 dependencies = [
  "arrow-array",
- "arrow-ipc",
  "arrow-pyarrow",
  "arrow-schema",
+ "batchcorder-core",
  "pyo3",
  "pyo3-stub-gen",
+]
+
+[[package]]
+name = "batchcorder-core"
+version = "0.1.0"
+dependencies = [
+ "arrow-array",
+ "arrow-ipc",
+ "arrow-schema",
  "sysinfo",
  "xxhash-rust",
 ]

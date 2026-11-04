@@ -20,17 +20,25 @@ pyo3 = { version = "0.28", features = [
 ] }
 pyo3-stub-gen = { version = "0.19", default-features = false }
 
-# Arrow types and IPC serialization
-arrow-array = { version = "58", features = ["ffi"] }
+# Cache, readers and eviction (no PyO3)
+batchcorder-core = { path = "crates/batchcorder-core" }
+
+# Arrow types and the C Data / C Stream FFI used at the Python boundary
+arrow-array = { workspace = true, features = ["ffi"] }
 arrow-pyarrow = "58"
+arrow-schema = { workspace = true }
+
+# The root package is the PyO3 extension that maturin builds; the pure-Rust
+# cache lives in crates/batchcorder-core.  Both are default members, so a bare
+# `cargo test` / `cargo clippy` at the root covers the core crate too.
+[workspace]
+members = [".", "crates/batchcorder-core"]
+default-members = [".", "crates/batchcorder-core"]
+
+[workspace.dependencies]
+arrow-array = "58"
 arrow-schema = "58"
 arrow-ipc = "58"
-
-# System information for detecting total physical RAM (used as default hot-cache budget)
-sysinfo = { version = "0.33", default-features = false, features = ["system"] }
-
-# Fast non-cryptographic hash for cache entry integrity checks
-xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 # Full DWARF is not needed for the Python test loop. Line tables keep file and
 # line numbers for this crate in panics and backtraces; dependencies carry no
