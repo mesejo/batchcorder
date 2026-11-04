@@ -148,7 +148,8 @@ jobs:
           files: coverage.xml,coverage.lcov
 
   macos:
-    runs-on: macos-latest
+    # Pinned: macos-latest jobs sat queued without a runner (Nov 2026).
+    runs-on: macos-14
     env:
       UV_NO_SYNC: "1"
     strategy:
