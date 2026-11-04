@@ -68,6 +68,16 @@ jobs:
           sccache: 'true'
           manylinux: 'off'
 
+      # pyright resolves imports in tests/test_datafusion_provider.py, and
+      # stubtest checks the second wheel's stub, so build it too.
+      - name: Build batchcorder-datafusion extension
+        uses: PyO3/maturin-action@v1
+        with:
+          command: develop
+          args: --uv -m crates/batchcorder-datafusion-py/Cargo.toml
+          sccache: 'true'
+          manylinux: 'off'
+
       - name: Cache pre-commit environments
         uses: actions/cache@v4
         with:

@@ -126,18 +126,18 @@ impl PyTeeTableProvider {
 #[pymethods]
 impl PyTeeTableProvider {
     #[new]
-    #[pyo3(signature = (reader, *, memory_capacity = None, disk_path = None, disk_capacity = None, write_policy = "on_insertion".to_string(), bounding = "sealed".to_string()))]
+    #[pyo3(signature = (reader, *, memory_capacity = None, disk_path = None, disk_capacity = None, write_policy = "on_insertion", bounding = "sealed"))]
     fn new(
         py: Python<'_>,
         reader: PyArrowType<ArrowArrayStreamReader>,
         memory_capacity: Option<usize>,
         disk_path: Option<String>,
         disk_capacity: Option<u64>,
-        write_policy: String,
-        bounding: String,
+        write_policy: &str,
+        bounding: &str,
     ) -> PyResult<Self> {
-        let bounding = parse_bounding(&bounding)?;
-        let write_policy = parse_write_policy(&write_policy)?;
+        let bounding = parse_bounding(bounding)?;
+        let write_policy = parse_write_policy(write_policy)?;
         let disk = parse_disk_config(disk_path, disk_capacity)?;
         let schema = reader.0.schema();
         let upstream: Box<dyn Upstream> = Box::new(PyUpstream::new(reader.0));
