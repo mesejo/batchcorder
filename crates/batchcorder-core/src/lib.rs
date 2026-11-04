@@ -4,7 +4,7 @@
 //! any number of independent [`StreamCacheReader`]s replay it.  Batches are
 //! pulled lazily, stored in memory or spilled to an Arrow IPC file on disk
 //! (see [`CacheConfig`]), and evicted once every reader has moved past them
-//! when `max_readers` is set.
+//! as dictated by the cache's [`Bounding`].
 //!
 //! This crate has no Python dependency.  The `batchcorder` Python extension
 //! is a thin PyO3 layer over it.
@@ -15,7 +15,7 @@ mod tier;
 use arrow_array::RecordBatch;
 use arrow_schema::ArrowError;
 
-pub use dataset::{CacheConfig, DiskConfig, StreamCache, StreamCacheReader};
+pub use dataset::{Bounding, CacheConfig, DiskConfig, StreamCache, StreamCacheReader};
 pub use tier::WritePolicy;
 
 /// A source of record batches that can be read only once.
