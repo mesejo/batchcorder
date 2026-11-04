@@ -1,5 +1,8 @@
 import gc
+import subprocess
+import sys
 import threading
+import time
 
 import pyarrow as pa
 import pytest
@@ -498,6 +501,119 @@ def test_reader_batch_order_preserved_under_concurrency():
     expected_first_ids = [i * rows_per_batch for i in range(n_batches)]
     for ids in batch_ids:
         assert ids == expected_first_ids, f"batch order violated: {ids}"
+
+
+# A host that reads the Arrow C stream while holding the GIL (ctypes
+# PYFUNCTYPE never releases it), racing a thread that is pulling the next
+# batch from a Python generator.  Before the ingest token, the puller held the
+# cache mutex while it waited for the GIL, and the GIL holder waited for the
+# mutex: a deadlock.  Run in a subprocess so a regression fails on timeout
+# instead of hanging the suite.
+_GIL_HOLDING_CONSUMER_SCRIPT = """
+import ctypes
+import threading
+import time
+
+import pyarrow as pa
+
+from batchcorder import StreamCache
+
+
+class ArrowArrayStream(ctypes.Structure):
+    _fields_ = [
+        ("get_schema", ctypes.c_void_p),
+        # PYFUNCTYPE: the call keeps holding the GIL, like a careless host.
+        ("get_next", ctypes.PYFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)),
+        ("get_last_error", ctypes.c_void_p),
+        ("release", ctypes.c_void_p),
+        ("private_data", ctypes.c_void_p),
+    ]
+
+
+get_pointer = ctypes.pythonapi.PyCapsule_GetPointer
+get_pointer.restype = ctypes.c_void_p
+get_pointer.argtypes = [ctypes.py_object, ctypes.c_char_p]
+
+schema = pa.schema([("x", pa.int64())])
+pulling = threading.Event()
+
+
+def gen():
+    for i in range(3):
+        if i == 1:
+            pulling.set()
+            time.sleep(0.5)  # GIL released mid-pull
+        yield pa.record_batch({"x": [i]}, schema=schema)
+
+
+cache = StreamCache(pa.RecordBatchReader.from_batches(schema, gen()))
+ahead = cache.reader()
+# Export the second reader up front: from here on it is driven only through
+# the raw C stream, with the GIL held.
+capsule = cache.reader().__arrow_c_stream__()
+stream = ArrowArrayStream.from_address(get_pointer(capsule, b"arrow_array_stream"))
+
+puller = threading.Thread(target=lambda: list(ahead))
+puller.start()
+assert pulling.wait(5)  # `ahead` is now mid-pull on batch 1
+values = []
+while True:
+    out = ctypes.create_string_buffer(80)  # sizeof(struct ArrowArray)
+    assert stream.get_next(get_pointer(capsule, b"arrow_array_stream"), ctypes.addressof(out)) == 0
+    if ctypes.c_void_p.from_buffer(out, 64).value is None:  # release == NULL: end
+        break
+    batch = pa.RecordBatch._import_from_c(ctypes.addressof(out), schema)
+    values.extend(batch.column(0).to_pylist())
+
+puller.join(5)
+assert not puller.is_alive()
+assert values == [0, 1, 2], values
+print("ok")
+"""
+
+
+def test_gil_holding_consumer_does_not_deadlock_with_python_upstream():
+    """A GIL-holding C-stream consumer and a concurrent Python-upstream pull both finish."""
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", _GIL_HOLDING_CONSUMER_SCRIPT],
+            timeout=20,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail("deadlock: GIL-holding consumer and ingesting reader hung")
+    else:
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout.strip() == "ok"
+
+
+def test_cached_batch_readable_while_other_reader_pulls():
+    """A reader of an already-cached batch does not wait for another reader's slow pull."""
+    schema = pa.schema([("x", pa.int64())])
+    pulling = threading.Event()
+
+    def gen():
+        yield pa.record_batch({"x": [0]}, schema=schema)
+        pulling.set()
+        time.sleep(2.0)  # slow upstream; the GIL is released while sleeping
+        yield pa.record_batch({"x": [1]}, schema=schema)
+
+    ds = StreamCache(pa.RecordBatchReader.from_batches(schema, gen()))
+    ahead = ds.reader()
+    behind = ds.reader()
+    assert next(ahead).column(0).to_pylist() == [0]
+    puller = threading.Thread(target=lambda: next(ahead))
+    puller.start()
+    assert pulling.wait(5)
+
+    start = time.monotonic()
+    assert next(behind).column(0).to_pylist() == [0]
+    assert ds.ingested_count == 1
+    elapsed = time.monotonic() - start
+    puller.join()
+    assert elapsed < 1.0, f"cached read waited {elapsed:.2f}s for the in-flight pull"
 
 
 def test_close_removes_disk_files(tmp_path):
