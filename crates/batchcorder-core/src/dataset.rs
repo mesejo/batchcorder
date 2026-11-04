@@ -445,6 +445,13 @@ impl StreamCache {
         Ok(self.shared.lock()?.upstream_exhausted)
     }
 
+    /// Number of leading batches evicted so far.  They can no longer be
+    /// replayed, so `ingested_count() - evicted_count()` is the number of
+    /// batches the cache still holds.
+    pub fn evicted_count(&self) -> Result<u64, ArrowError> {
+        Ok(self.shared.lock()?.evicted_up_to)
+    }
+
     /// Release cached data and delete the disk tier.  Existing readers fail
     /// on their next call, and readers waiting for an ingest wake up and
     /// fail.  Idempotent.
