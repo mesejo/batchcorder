@@ -14,6 +14,7 @@ batchcorder-core = { path = "../batchcorder-core" }
 # plan APIs, not SQL, Parquet or the expression function libraries.
 datafusion = { version = "55", default-features = false }
 async-trait = "0.1"
+tokio = { version = "1", features = ["rt"] }
 
 [dev-dependencies]
 # SQL is only needed to drive the provider from tests.

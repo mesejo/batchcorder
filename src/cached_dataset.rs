@@ -12,7 +12,6 @@
 //! blocking calls, mapping errors to Python exceptions, and Arrow PyCapsule
 //! export.
 
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use arrow_array::RecordBatch;
@@ -20,11 +19,13 @@ use arrow_array::RecordBatchReader;
 use arrow_array::ffi::FFI_ArrowSchema;
 use arrow_array::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use arrow_pyarrow::{IntoPyArrow, PyArrowType};
-use arrow_schema::{ArrowError, Schema, SchemaRef};
-use batchcorder_core::{
-    Bounding, CacheConfig, DiskConfig, StreamCache, StreamCacheReader, Upstream, WritePolicy,
+use arrow_schema::{Schema, SchemaRef};
+use batchcorder_core::{Bounding, CacheConfig, StreamCache, StreamCacheReader, Upstream};
+use batchcorder_pyo3::{
+    PyUpstream, arrow_to_boundary, arrow_to_py_err, parse_disk_config, parse_write_policy,
+    wait_without_gil, without_gil,
 };
-use pyo3::exceptions::{PyIOError, PyMemoryError, PyRuntimeError, PyTypeError, PyValueError};
+use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyCapsule;
 use pyo3_stub_gen::derive::*;
@@ -35,120 +36,12 @@ fn poisoned_lock_pyerr<T>(_: std::sync::PoisonError<T>) -> PyErr {
     PyRuntimeError::new_err("Internal lock poisoned by a prior panic")
 }
 
-/// Map an [`ArrowError`] from a cache-level operation (construction, reader
-/// creation, ingestion) to the matching Python exception.
-fn arrow_to_boundary(e: ArrowError) -> PyErr {
-    match e {
-        ArrowError::MemoryError(msg) => PyMemoryError::new_err(msg),
-        ArrowError::InvalidArgumentError(msg) => PyValueError::new_err(msg),
-        ArrowError::IoError(msg, _) => PyIOError::new_err(msg),
-        _ => arrow_pyarrow::PyArrowException::new_err(e.to_string()),
-    }
-}
-
-/// Map an [`ArrowError`] raised while iterating a reader.  Unlike
-/// [`arrow_to_boundary`], I/O errors surface as `ArrowException`.
-fn arrow_to_py_err(e: ArrowError) -> PyErr {
-    match e {
-        ArrowError::MemoryError(msg) => PyMemoryError::new_err(msg),
-        ArrowError::InvalidArgumentError(msg) => PyValueError::new_err(msg),
-        _ => arrow_pyarrow::PyArrowException::new_err(e.to_string()),
-    }
-}
-
 /// Export `schema` as an `"arrow_schema"` [`PyCapsule`] via Arrow FFI —
 /// no pyarrow Python object is allocated.
 fn to_schema_pycapsule<'py>(py: Python<'py>, schema: &Schema) -> PyResult<Bound<'py, PyCapsule>> {
     let ffi_schema =
         FFI_ArrowSchema::try_from(schema).map_err(|e| PyValueError::new_err(e.to_string()))?;
     PyCapsule::new_with_value(py, ffi_schema, c"arrow_schema")
-}
-
-// ── GIL management ───────────────────────────────────────────────────────────
-//
-// We use raw CPython FFI instead of PyO3's safe wrappers because:
-//  - `py.allow_threads(f)` requires `F: Ungil`, which forbids reacquiring the
-//    GIL inside `f`.  `PyUpstream::next_batch` needs to reacquire it.
-//  - `Python::with_gil()` was removed in PyO3 0.28.
-//
-// Safety contract: `without_gil` saves the thread state and restores it on
-// drop; `with_gil_acquired` ensures/releases via `PyGILState_Ensure/Release`.
-// Both are no-ops under the free-threaded build (`Py_GIL_DISABLED`).
-
-fn without_gil<T, F: FnOnce() -> T>(_py: Python<'_>, f: F) -> T {
-    struct RestoreGuard(*mut pyo3::ffi::PyThreadState);
-    impl Drop for RestoreGuard {
-        fn drop(&mut self) {
-            unsafe { pyo3::ffi::PyEval_RestoreThread(self.0) };
-        }
-    }
-    #[cfg(not(Py_GIL_DISABLED))]
-    let _guard = RestoreGuard(unsafe { pyo3::ffi::PyEval_SaveThread() });
-    f()
-}
-
-fn with_gil_acquired<T, F: FnOnce() -> T>(f: F) -> T {
-    #[cfg(not(Py_GIL_DISABLED))]
-    {
-        struct ReleaseGuard(pyo3::ffi::PyGILState_STATE);
-        impl Drop for ReleaseGuard {
-            fn drop(&mut self) {
-                unsafe { pyo3::ffi::PyGILState_Release(self.0) };
-            }
-        }
-        let _guard = ReleaseGuard(unsafe { pyo3::ffi::PyGILState_Ensure() });
-        f()
-    }
-    #[cfg(Py_GIL_DISABLED)]
-    f()
-}
-
-/// [`batchcorder_core::WaitHook`] that releases the GIL while a reader waits
-/// for another reader's ingest.
-///
-/// The waiting thread may hold the GIL (a host that calls the Arrow C stream
-/// without releasing it), and the ingesting thread may need the GIL to pull
-/// from a Python upstream; without this the two would deadlock.  The abi3 API
-/// cannot ask "do I hold the GIL?", so take it with `PyGILState_Ensure`
-/// (a no-op re-entry if already held) and then release it fully with
-/// `PyEval_SaveThread`.  The core calls this with no cache lock held, so
-/// blocking in `PyGILState_Ensure` here cannot deadlock.
-fn wait_without_gil(wait: &mut dyn FnMut()) {
-    #[cfg(not(Py_GIL_DISABLED))]
-    {
-        struct ReleaseGuard(pyo3::ffi::PyGILState_STATE);
-        impl Drop for ReleaseGuard {
-            fn drop(&mut self) {
-                unsafe { pyo3::ffi::PyGILState_Release(self.0) };
-            }
-        }
-        struct RestoreGuard(*mut pyo3::ffi::PyThreadState);
-        impl Drop for RestoreGuard {
-            fn drop(&mut self) {
-                unsafe { pyo3::ffi::PyEval_RestoreThread(self.0) };
-            }
-        }
-        // Declared in this order so the restore runs before the release.
-        let _ensured = ReleaseGuard(unsafe { pyo3::ffi::PyGILState_Ensure() });
-        let _saved = RestoreGuard(unsafe { pyo3::ffi::PyEval_SaveThread() });
-        wait();
-    }
-    #[cfg(Py_GIL_DISABLED)]
-    wait();
-}
-
-// ── PyUpstream ───────────────────────────────────────────────────────────────
-
-/// An Arrow C stream imported from Python.  The producer may be implemented
-/// in Python (e.g. a pyarrow reader over a generator), so every pull holds
-/// the GIL.  Readers call `next_batch` with the GIL released, so this
-/// reacquires it rather than assuming it is held.
-struct PyUpstream(ArrowArrayStreamReader);
-
-impl Upstream for PyUpstream {
-    fn next_batch(&mut self) -> Option<Result<RecordBatch, ArrowError>> {
-        with_gil_acquired(|| self.0.next())
-    }
 }
 
 // ── PyStreamCacheReader ────────────────────────────────────────────────────
@@ -366,32 +259,12 @@ impl PyStreamCache {
             return Err(PyValueError::new_err("max_readers must be at least 1"));
         }
         let schema = reader.0.schema();
-        let upstream: Box<dyn Upstream> = Box::new(PyUpstream(reader.0));
+        let upstream: Box<dyn Upstream> = Box::new(PyUpstream::new(reader.0));
 
         // Parse the write policy up front (applies to the disk tier only; ignored
         // for memory-only caches).
-        let write_policy = match write_policy.as_str() {
-            "on_insertion" => WritePolicy::OnInsertion,
-            "on_eviction" => WritePolicy::OnEviction,
-            other => {
-                return Err(PyValueError::new_err(format!(
-                    "write_policy must be 'on_insertion' or 'on_eviction', got {other:?}"
-                )));
-            }
-        };
-
-        let disk = match (disk_path, disk_capacity) {
-            (Some(path), Some(capacity)) => Some(DiskConfig {
-                path: PathBuf::from(path),
-                capacity,
-            }),
-            (None, None) => None,
-            _ => {
-                return Err(PyValueError::new_err(
-                    "disk_path and disk_capacity must both be provided, or both omitted",
-                ));
-            }
-        };
+        let write_policy = parse_write_policy(&write_policy)?;
+        let disk = parse_disk_config(disk_path, disk_capacity)?;
 
         let config = CacheConfig {
             memory_capacity,
