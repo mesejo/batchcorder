@@ -424,33 +424,6 @@ impl StreamCache {
         Ok(())
     }
 
-    /// Switch the cache to [`Bounding::Unbounded`]: stop evicting, so every
-    /// batch stays replayable and from-start readers can be added at any
-    /// time.  For consumers that turn out to re-read the stream, such as a
-    /// recursive query that re-executes its scan on every iteration.
-    ///
-    /// Fails once anything has been evicted, because those batches can no
-    /// longer be replayed.  Existing readers keep working.  Idempotent.
-    pub fn make_unbounded(&self) -> Result<(), ArrowError> {
-        let mut inner = self.shared.lock()?;
-        if inner.evicted_up_to > 0 {
-            return Err(ArrowError::InvalidArgumentError(format!(
-                "Cannot make the cache unbounded: {} batches have already been evicted",
-                inner.evicted_up_to
-            )));
-        }
-        inner.bounding = Bounding::Unbounded;
-        // Positions of existing readers are no longer needed for eviction.
-        inner.reader_positions.clear();
-        Ok(())
-    }
-
-    /// The cache's current bounding.  Starts as [`CacheConfig::bounding`]
-    /// and changes only through [`StreamCache::make_unbounded`].
-    pub fn bounding(&self) -> Result<Bounding, ArrowError> {
-        Ok(self.shared.lock()?.bounding)
-    }
-
     /// Whether a [`Bounding::Sealed`] cache has been sealed.  Always `false`
     /// for other boundings.
     pub fn is_sealed(&self) -> Result<bool, ArrowError> {
@@ -1283,35 +1256,6 @@ mod tests {
         assert!(matches!(err, ArrowError::InvalidArgumentError(_)));
         // A tail reader needs nothing evicted, so it is still allowed.
         assert!(cache.reader(false).is_ok());
-    }
-
-    #[test]
-    fn make_unbounded_keeps_every_batch_for_rereads() {
-        let cache = sealed_cache(4);
-        let a = cache.reader(true).expect("a");
-        cache.make_unbounded().expect("nothing evicted yet");
-        assert_eq!(cache.bounding().expect("ok"), Bounding::Unbounded);
-        // The reader reserved while sealed still reads everything, and its
-        // position no longer drives eviction.
-        assert_eq!(collect(a), expected(4));
-        assert_eq!(evicted_up_to(&cache), 0);
-        // Re-reads from the start keep working, like a recursive query
-        // re-executing its scan.
-        for _ in 0..3 {
-            assert_eq!(collect(cache.reader(true).expect("re-read")), expected(4));
-        }
-        assert_eq!(evicted_up_to(&cache), 0);
-        cache.make_unbounded().expect("idempotent");
-    }
-
-    #[test]
-    fn make_unbounded_fails_after_eviction() {
-        let cache = sealed_cache(4);
-        assert_eq!(collect(cache.reader(true).expect("a")), expected(4));
-        assert_eq!(evicted_up_to(&cache), 4);
-        let err = cache.make_unbounded().expect_err("already evicted");
-        assert!(matches!(err, ArrowError::InvalidArgumentError(_)));
-        assert_eq!(cache.bounding().expect("ok"), Bounding::Sealed);
     }
 
     #[test]
