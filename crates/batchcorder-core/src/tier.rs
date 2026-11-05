@@ -28,6 +28,19 @@ static TOTAL_SYSTEM_MEMORY: LazyLock<usize> = LazyLock::new(|| {
     sys.total_memory() as usize
 });
 
+// ── lock discipline ──────────────────────────────────────────────────────────
+
+/// Batches removed from the cache, to be dropped only after every lock is
+/// released.
+///
+/// Dropping the last reference to an imported batch runs the producer's
+/// release callback.  For pyarrow batches that wrap Python memory (NumPy
+/// arrays, for example) that callback acquires the GIL.  A thread that drops
+/// a batch while holding a cache lock could then wait for the GIL while a
+/// GIL-holding thread waits for the same lock.  Handing evicted batches back
+/// to the caller keeps every lock free of GIL waits.
+pub(crate) type ReleasedBatches = Vec<Arc<RecordBatch>>;
+
 // ── dataset counter ───────────────────────────────────────────────────────────
 
 /// Makes each disk cache's subdirectory name unique within the process.
@@ -87,6 +100,9 @@ struct HotLayer {
     used: usize,
     /// Byte budget.
     capacity: usize,
+    /// Batches evicted from the hot layer, kept until the caller has released
+    /// the index lock and can drop them (see [`ReleasedBatches`]).
+    released: ReleasedBatches,
 }
 
 impl HotLayer {
@@ -96,7 +112,14 @@ impl HotLayer {
             head_batch_idx: 0,
             used: 0,
             capacity,
+            released: Vec::new(),
         }
+    }
+
+    /// Hand over the batches evicted since the last call, to be dropped once
+    /// the index lock is released.
+    fn take_released(&mut self) -> ReleasedBatches {
+        std::mem::take(&mut self.released)
     }
 
     /// Insert `batch` at `batch_idx`, evicting from the front until there is room.
@@ -116,8 +139,9 @@ impl HotLayer {
                     return false;
                 }
                 Some(evicted) => {
-                    if let Some((_, len)) = evicted {
+                    if let Some((arc, len)) = evicted {
                         self.used -= len;
+                        self.released.push(arc);
                     }
                     self.head_batch_idx += 1;
                 }
@@ -173,8 +197,9 @@ impl HotLayer {
             match self.entries.pop_front() {
                 None => break,
                 Some(evicted) => {
-                    if let Some((_, len)) = evicted {
+                    if let Some((arc, len)) = evicted {
                         self.used -= len;
+                        self.released.push(arc);
                     }
                     self.head_batch_idx += 1;
                 }
@@ -191,7 +216,8 @@ impl HotLayer {
     }
 
     fn clear(&mut self) {
-        self.entries.clear();
+        let drained = self.entries.drain(..).flatten().map(|(arc, _)| arc);
+        self.released.extend(drained);
         self.used = 0;
     }
 }
@@ -313,6 +339,9 @@ impl DiskCacheTier {
             ipc_len: length,
             checksum,
         }));
+        let released = idx.hot.take_released();
+        drop(idx);
+        drop(released);
         Ok(())
     }
 
@@ -371,6 +400,9 @@ impl DiskCacheTier {
         for (evicted_idx, disk_entry) in disk_entries {
             idx.entries[evicted_idx as usize] = Some(disk_entry);
         }
+        let released = idx.hot.take_released();
+        drop(idx);
+        drop(released);
         Ok(())
     }
 }
@@ -557,20 +589,27 @@ impl CacheTier {
     /// Release in-memory data (hot layer and, for memory tiers, all batches).
     /// Silently ignores poisoned locks since this runs during teardown.
     pub(crate) fn clear(&self) {
-        match self {
+        // Collected under the lock, dropped after it (see `ReleasedBatches`).
+        let _released: ReleasedBatches = match self {
             CacheTier::Memory(m) => {
-                if let Ok(mut index) = m.batches.write() {
-                    index.entries.clear();
-                    index.head_batch_idx = 0;
-                }
+                let released = match m.batches.write() {
+                    Ok(mut index) => {
+                        index.head_batch_idx = 0;
+                        index.entries.drain(..).collect()
+                    }
+                    Err(_) => Vec::new(),
+                };
                 m.used.store(0, Ordering::Relaxed);
+                released
             }
-            CacheTier::Disk(d) => {
-                if let Ok(mut index) = d.index.write() {
+            CacheTier::Disk(d) => match d.index.write() {
+                Ok(mut index) => {
                     index.hot.clear();
+                    index.hot.take_released()
                 }
-            }
-        }
+                Err(_) => Vec::new(),
+            },
+        };
     }
 
     /// Delete the on-disk subdirectory (no-op for memory tiers).
@@ -581,9 +620,14 @@ impl CacheTier {
     }
 
     /// Evict all cache entries with index strictly below `lwm`.
-    pub(crate) fn evict_below(&self, lwm: u64) -> Result<(), ArrowError> {
+    ///
+    /// Returns the evicted batches instead of dropping them: the caller drops
+    /// them once it holds no lock (see [`ReleasedBatches`]).
+    #[must_use = "drop the evicted batches after releasing any lock"]
+    pub(crate) fn evict_below(&self, lwm: u64) -> Result<ReleasedBatches, ArrowError> {
+        let mut released = Vec::new();
         if lwm == 0 {
-            return Ok(());
+            return Ok(released);
         }
         match self {
             CacheTier::Memory(m) => {
@@ -599,6 +643,7 @@ impl CacheTier {
                                 .sum();
                             m.used.fetch_sub(size, Ordering::Relaxed);
                             index.head_batch_idx += 1;
+                            released.push(batch);
                         }
                     }
                 }
@@ -609,8 +654,9 @@ impl CacheTier {
                     match idx.hot.entries.pop_front() {
                         None => break,
                         Some(evicted) => {
-                            if let Some((_, len)) = evicted {
+                            if let Some((arc, len)) = evicted {
                                 idx.hot.used -= len;
+                                released.push(arc);
                             }
                             idx.hot.head_batch_idx += 1;
                         }
@@ -623,7 +669,7 @@ impl CacheTier {
                 }
             }
         }
-        Ok(())
+        Ok(released)
     }
 }
 

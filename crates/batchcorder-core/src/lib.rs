@@ -33,6 +33,15 @@ pub trait Upstream: Send {
     fn next_batch(&mut self) -> Option<Result<RecordBatch, ArrowError>>;
 }
 
+/// Wraps every blocking wait a reader makes for another reader's ingest.
+///
+/// The hook must call `wait` exactly once.  It runs with no cache lock held,
+/// so it may release and reacquire a runtime lock around `wait`.  Python
+/// bindings use it to release the GIL: a GIL-holding reader waiting on a
+/// batch that a second thread is pulling from a Python upstream would
+/// otherwise keep that thread from ever getting the GIL.
+pub type WaitHook = fn(wait: &mut dyn FnMut());
+
 impl<I> Upstream for I
 where
     I: Iterator<Item = Result<RecordBatch, ArrowError>> + Send,

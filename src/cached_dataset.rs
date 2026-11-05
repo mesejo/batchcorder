@@ -105,6 +105,40 @@ fn with_gil_acquired<T, F: FnOnce() -> T>(f: F) -> T {
     f()
 }
 
+/// [`batchcorder_core::WaitHook`] that releases the GIL while a reader waits
+/// for another reader's ingest.
+///
+/// The waiting thread may hold the GIL (a host that calls the Arrow C stream
+/// without releasing it), and the ingesting thread may need the GIL to pull
+/// from a Python upstream; without this the two would deadlock.  The abi3 API
+/// cannot ask "do I hold the GIL?", so take it with `PyGILState_Ensure`
+/// (a no-op re-entry if already held) and then release it fully with
+/// `PyEval_SaveThread`.  The core calls this with no cache lock held, so
+/// blocking in `PyGILState_Ensure` here cannot deadlock.
+fn wait_without_gil(wait: &mut dyn FnMut()) {
+    #[cfg(not(Py_GIL_DISABLED))]
+    {
+        struct ReleaseGuard(pyo3::ffi::PyGILState_STATE);
+        impl Drop for ReleaseGuard {
+            fn drop(&mut self) {
+                unsafe { pyo3::ffi::PyGILState_Release(self.0) };
+            }
+        }
+        struct RestoreGuard(*mut pyo3::ffi::PyThreadState);
+        impl Drop for RestoreGuard {
+            fn drop(&mut self) {
+                unsafe { pyo3::ffi::PyEval_RestoreThread(self.0) };
+            }
+        }
+        // Declared in this order so the restore runs before the release.
+        let _ensured = ReleaseGuard(unsafe { pyo3::ffi::PyGILState_Ensure() });
+        let _saved = RestoreGuard(unsafe { pyo3::ffi::PyEval_SaveThread() });
+        wait();
+    }
+    #[cfg(Py_GIL_DISABLED)]
+    wait();
+}
+
 // ── PyUpstream ───────────────────────────────────────────────────────────────
 
 /// An Arrow C stream imported from Python.  The producer may be implemented
@@ -368,6 +402,7 @@ impl PyStreamCache {
             disk,
             write_policy,
             max_readers,
+            wait_hook: Some(wait_without_gil),
         };
         let cache = if config.disk.is_some() {
             // Creating the disk tier is pure OS I/O — release the GIL.
