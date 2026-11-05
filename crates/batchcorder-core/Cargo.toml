@@ -1,0 +1,18 @@
+[package]
+name = "batchcorder-core"
+version = "0.1.0"
+edition = "2024"
+description = "Replayable memory/disk cache for read-once Arrow record-batch streams"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+arrow-ipc = { workspace = true }
+
+# System information for detecting total physical RAM (used as default hot-cache budget)
+sysinfo = { version = "0.33", default-features = false, features = ["system"] }
+
+# Fast non-cryptographic hash for cache entry integrity checks
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
