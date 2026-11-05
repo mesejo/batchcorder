@@ -21,8 +21,8 @@ arrow-schema = { workspace = true }
 arrow-pyarrow = { workspace = true }
 
 # The FFI structs are only compatible within one DataFusion major.  The
-# package's major version, the host extras in pyproject.toml and
-# SUPPORTED_HOSTS in python/batchcorder_datafusion/_hosts.py must all match it.
+# package's major version and SUPPORTED_HOSTS / DATAFUSION_MAJOR in
+# python/batchcorder_datafusion/_hosts.py must all match it.
 datafusion = { version = "55", default-features = false }
 datafusion-ffi = "55"
 # Only for the `LogicalExtensionCodec` trait (already a datafusion-ffi dependency).

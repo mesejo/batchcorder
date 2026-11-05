@@ -264,38 +264,69 @@ def _fake_versions(installed: dict[str, str]):
     return get_version
 
 
+def _session_from(module: str) -> object:
+    # An instance of a class defined in `module`, standing in for a host's
+    # SessionContext.
+    return type("SessionContext", (), {"__module__": module})()
+
+
 @pytest.mark.parametrize(
-    ("installed", "expected"),
+    ("module", "installed"),
     [
-        ({}, []),
-        ({"datafusion": "55.0.0", "xorq-datafusion": "0.3.0"}, []),
-        ({"datafusion": "55.9.1", "xorq-datafusion": "0.3.12rc1"}, []),
-        ({"datafusion": "56.0.0"}, [("datafusion", "56.0.0", ">=55,<56")]),
-        ({"datafusion": "54.1.0"}, [("datafusion", "54.1.0", ">=55,<56")]),
+        ("datafusion", {"datafusion": "55.0.0"}),
+        ("datafusion.context", {"datafusion": "55.9.1"}),
+        ("xorq_datafusion", {"xorq-datafusion": "0.3.0"}),
+        ("xorq_datafusion._internal", {"xorq-datafusion": "0.3.12rc1"}),
+        # Host identified but not installed as a distribution: nothing to check.
+        ("datafusion", {}),
+        # Unknown host: left to the datafusion-ffi version check.
+        ("some_other_host", {"datafusion": "56.0.0"}),
+    ],
+)
+def test_check_host_accepts(module, installed):
+    _hosts.check_host(_session_from(module), _fake_versions(installed))
+
+
+@pytest.mark.parametrize(
+    ("module", "installed", "match"),
+    [
+        (
+            "datafusion",
+            {"datafusion": "56.0.0"},
+            r"datafusion 56\.0\.0.*datafusion>=55,<56",
+        ),
+        (
+            "datafusion",
+            {"datafusion": "54.1.0"},
+            r"datafusion 54\.1\.0.*datafusion>=55,<56",
+        ),
         # 0.2.x is the DataFusion 53 line.
         (
+            "xorq_datafusion",
             {"xorq-datafusion": "0.2.11"},
-            [("xorq-datafusion", "0.2.11", ">=0.3,<0.4")],
+            r"xorq-datafusion 0\.2\.11.*xorq-datafusion>=0\.3,<0\.4",
         ),
     ],
 )
-def test_mismatched_hosts(installed, expected):
-    assert _hosts.mismatched_hosts(_fake_versions(installed)) == expected
+def test_check_host_rejects(module, installed, match):
+    with pytest.raises(RuntimeError, match=match):
+        _hosts.check_host(_session_from(module), _fake_versions(installed))
 
 
-def test_installed_host_does_not_warn_on_import():
-    proc = subprocess.run(
-        [sys.executable, "-W", "error", "-c", "import batchcorder_datafusion"],
-        timeout=60,
-        check=False,
-        capture_output=True,
-        text=True,
+def test_check_host_ignores_codec_capsule():
+    # A codec capsule does not say which host it came from.
+    capsule = SessionContext().__datafusion_logical_extension_codec__()
+    _hosts.check_host(capsule, _fake_versions({"datafusion": "56.0.0"}))
+
+
+def test_register_with_mismatched_host_raises(monkeypatch):
+    # The installed datafusion (55.x) against a table that expects 56: the
+    # real registration path must fail with the guard's error.
+    monkeypatch.setattr(
+        _hosts,
+        "SUPPORTED_HOSTS",
+        {**_hosts.SUPPORTED_HOSTS, "datafusion": ((56,), (57,))},
     )
-    assert proc.returncode == 0, proc.stderr
-
-
-def test_mismatched_host_warns(monkeypatch):
-    # The installed datafusion (55.x) against a table that expects 56.
-    monkeypatch.setattr(_hosts, "SUPPORTED_HOSTS", {"datafusion": ((56,), (57,))})
-    with pytest.warns(RuntimeWarning, match=r"needs datafusion>=56,<57"):
-        _hosts.warn_on_mismatched_hosts()
+    ctx = SessionContext()
+    with pytest.raises(RuntimeError, match=r"needs datafusion>=56,<57"):
+        ctx.register_table("t", _provider())

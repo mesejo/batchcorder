@@ -11,16 +11,14 @@ time, and each batch is evicted as soon as every scan has read past it.
 
 ## Install
 
-The provider plugs into a DataFusion host through `datafusion-ffi`. Pick the
-extra for the host you use:
+The provider plugs into a DataFusion host through `datafusion-ffi`. It does
+not install a host: install the one you use, in a version from the
+compatibility table below.
 
 ```bash
-pip install "batchcorder-datafusion[datafusion]"   # datafusion-python
-pip install "batchcorder-datafusion[xorq]"         # xorq-datafusion
+pip install batchcorder-datafusion "datafusion>=55,<56"        # datafusion-python
+pip install batchcorder-datafusion "xorq-datafusion>=0.3,<0.4" # xorq-datafusion
 ```
-
-Without an extra, no host is installed; bring your own, within the ranges
-below.
 
 ## Usage
 
@@ -63,9 +61,9 @@ the provider and the host must be built on the same one. The major version of
 |------------------------|------------|--------------------------------|-----------------|
 | 55.x                   | 55         | `>=55,<56`                     | `>=0.3,<0.4`    |
 
-Importing `batchcorder_datafusion` emits a `RuntimeWarning` for each installed
-host outside these ranges. Registering the provider with such a host can fail
-or crash the process.
+Registering a `TeeTableProvider` with a host outside these ranges raises
+`RuntimeError`, naming the host version found and the range needed, before any
+data crosses the FFI boundary.
 
 `batchcorder-datafusion` does not depend on the `batchcorder` package. The
 cache is compiled into its extension, and data enters through the Arrow C

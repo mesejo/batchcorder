@@ -20,8 +20,8 @@ Example::
 A sealed provider serves one query.  Register a new provider per query, or
 pass ``bounding="unbounded"`` for a table that is queried repeatedly.
 
-The host must be built on the same DataFusion major as this wheel.  Importing
-the package warns about any installed host that is not.
+The host must be built on the same DataFusion major as this wheel.
+Registering the provider with any other host raises :class:`RuntimeError`.
 """
 
 from __future__ import annotations
@@ -29,11 +29,8 @@ from __future__ import annotations
 from importlib.metadata import version
 
 from ._batchcorder_datafusion import TeeTableProvider
-from ._hosts import warn_on_mismatched_hosts
 
 
 __all__ = ["TeeTableProvider"]
 
 __version__: str = version("batchcorder-datafusion")
-
-warn_on_mismatched_hosts()

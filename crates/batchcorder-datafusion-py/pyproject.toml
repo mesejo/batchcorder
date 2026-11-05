@@ -21,17 +21,11 @@ classifiers = [
   "Topic :: Scientific/Engineering",
 ]
 dynamic = ["version"]
-# No hard dependency on a host: users have one, and each host embeds its own
-# copy of DataFusion.  The extras name the hosts built on the same DataFusion
-# major as datafusion-ffi in Cargo.toml (the FFI structs are only compatible
-# within one major).  Keep them in sync with SUPPORTED_HOSTS in
-# python/batchcorder_datafusion/_hosts.py.
+# No dependency on a DataFusion host: users bring their own, and each host
+# embeds its own copy of DataFusion.  The supported host versions are in
+# SUPPORTED_HOSTS (python/batchcorder_datafusion/_hosts.py) and the README;
+# registering the provider with any other host raises RuntimeError.
 dependencies = ["pyarrow>=18"]
-
-[project.optional-dependencies]
-datafusion = ["datafusion>=55,<56"]
-# xorq-datafusion 0.3.x is the DataFusion 55 line.
-xorq = ["xorq-datafusion>=0.3,<0.4"]
 
 [project.urls]
 Homepage = "https://github.com/mesejo/batchcorder"
