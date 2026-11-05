@@ -9,15 +9,13 @@
 
 use std::sync::{Arc, LazyLock};
 
-use arrow_array::RecordBatchReader;
 use arrow_array::ffi_stream::ArrowArrayStreamReader;
 use arrow_pyarrow::PyArrowType;
 use arrow_schema::Schema;
-use batchcorder_core::{Bounding, CacheConfig, StreamCache, Upstream};
+use batchcorder_core::{Bounding, StreamCache};
 use batchcorder_datafusion::TeeTableProvider;
 use batchcorder_pyo3::{
-    PyUpstream, arrow_to_boundary, parse_disk_config, parse_write_policy, wait_without_gil,
-    without_gil,
+    arrow_to_boundary, build_cache, parse_disk_config, parse_write_policy, without_gil,
 };
 use datafusion::catalog::TableProvider;
 use datafusion::execution::{TaskContext, TaskContextProvider};
@@ -66,7 +64,11 @@ struct OwnTaskContextProvider;
 
 impl TaskContextProvider for OwnTaskContextProvider {
     fn task_ctx(&self) -> Arc<TaskContext> {
-        Arc::new(TaskContext::default())
+        // Built once: the FFI scan wrapper asks for it on every scan, and a
+        // default task context carries a whole runtime environment.
+        static TASK_CTX: LazyLock<Arc<TaskContext>> =
+            LazyLock::new(|| Arc::new(TaskContext::default()));
+        TASK_CTX.clone()
     }
 }
 
@@ -162,22 +164,7 @@ impl PyTeeTableProvider {
         let bounding = parse_bounding(bounding)?;
         let write_policy = parse_write_policy(write_policy)?;
         let disk = parse_disk_config(disk_path, disk_capacity)?;
-        let schema = reader.0.schema();
-        let upstream: Box<dyn Upstream> = Box::new(PyUpstream::new(reader.0));
-        let config = CacheConfig {
-            memory_capacity,
-            disk,
-            write_policy,
-            bounding,
-            wait_hook: Some(wait_without_gil),
-        };
-        let cache = if config.disk.is_some() {
-            // Creating the disk tier is pure OS I/O — release the GIL.
-            without_gil(py, || StreamCache::try_new(upstream, schema, config))
-        } else {
-            StreamCache::try_new(upstream, schema, config)
-        }
-        .map_err(arrow_to_boundary)?;
+        let cache = build_cache(py, reader.0, memory_capacity, disk, write_policy, bounding)?;
         let provider = TeeTableProvider::new(cache).with_runtime(runtime_handle()?);
         Ok(Self {
             provider: Arc::new(provider),

@@ -18,9 +18,12 @@
 use std::path::PathBuf;
 
 use arrow_array::RecordBatch;
+use arrow_array::RecordBatchReader;
 use arrow_array::ffi_stream::ArrowArrayStreamReader;
 use arrow_schema::ArrowError;
-use batchcorder_core::{DiskConfig, Upstream, WritePolicy};
+use batchcorder_core::{
+    Bounding, CacheConfig, DiskConfig, StreamCache, Upstream, WaitHook, WritePolicy,
+};
 use pyo3::exceptions::{PyIOError, PyMemoryError, PyValueError};
 use pyo3::prelude::*;
 
@@ -116,14 +119,25 @@ pub fn with_gil_acquired<T, F: FnOnce() -> T>(f: F) -> T {
 ///
 /// The waiting thread may hold the GIL (a host that calls the Arrow C stream
 /// without releasing it), and the ingesting thread may need the GIL to pull
-/// from a Python upstream; without this the two would deadlock.  The abi3 API
-/// cannot ask "do I hold the GIL?", so take it with `PyGILState_Ensure`
-/// (a no-op re-entry if already held) and then release it fully with
-/// `PyEval_SaveThread`.  The core calls this with no cache lock held, so
-/// blocking in `PyGILState_Ensure` here cannot deadlock.
+/// from a Python upstream; without this the two would deadlock.
+///
+/// A thread with no Python thread state (a query engine's worker thread)
+/// cannot hold the GIL, so it just waits: taking the GIL only to release it
+/// would make every such wait queue behind Python threads.  Otherwise the
+/// abi3 API cannot ask "do I hold the GIL?", so take it with
+/// `PyGILState_Ensure` (a no-op re-entry if already held) and then release
+/// it fully with `PyEval_SaveThread`.  The core calls this with no cache lock
+/// held, so blocking in `PyGILState_Ensure` here cannot deadlock.
 pub fn wait_without_gil(wait: &mut dyn FnMut()) {
     #[cfg(not(Py_GIL_DISABLED))]
     {
+        // SAFETY: only reads this thread's GIL-state slot; valid on any
+        // thread once the interpreter is initialised, which it is whenever
+        // this extension's code runs.
+        if unsafe { pyo3::ffi::PyGILState_GetThisThreadState() }.is_null() {
+            wait();
+            return;
+        }
         struct ReleaseGuard(pyo3::ffi::PyGILState_STATE);
         impl Drop for ReleaseGuard {
             fn drop(&mut self) {
@@ -154,6 +168,8 @@ pub fn wait_without_gil(wait: &mut dyn FnMut()) {
 pub struct PyUpstream(ArrowArrayStreamReader);
 
 impl PyUpstream {
+    /// Wrap a stream imported from Python, e.g. the `reader` argument of a
+    /// constructor taking `PyArrowType<ArrowArrayStreamReader>`.
     pub fn new(reader: ArrowArrayStreamReader) -> Self {
         Self(reader)
     }
@@ -163,4 +179,38 @@ impl Upstream for PyUpstream {
     fn next_batch(&mut self) -> Option<Result<RecordBatch, ArrowError>> {
         with_gil_acquired(|| self.0.next())
     }
+}
+
+// ── cache construction ───────────────────────────────────────────────────────
+
+/// Build a [`StreamCache`] over a stream imported from Python, the way both
+/// extensions' constructors do: a GIL-reacquiring [`PyUpstream`], the
+/// GIL-releasing wait hook, and the GIL released while the disk tier is
+/// created.  Callers parse and validate their arguments first, so argument
+/// errors keep each constructor's own precedence.
+pub fn build_cache(
+    py: Python<'_>,
+    reader: ArrowArrayStreamReader,
+    memory_capacity: Option<usize>,
+    disk: Option<DiskConfig>,
+    write_policy: WritePolicy,
+    bounding: Bounding,
+) -> PyResult<StreamCache> {
+    let schema = reader.schema();
+    let upstream: Box<dyn Upstream> = Box::new(PyUpstream::new(reader));
+    let wait_hook: WaitHook = wait_without_gil;
+    let config = CacheConfig {
+        memory_capacity,
+        disk,
+        write_policy,
+        bounding,
+        wait_hook: Some(wait_hook),
+    };
+    if config.disk.is_some() {
+        // Creating the disk tier is pure OS I/O: release the GIL.
+        without_gil(py, || StreamCache::try_new(upstream, schema, config))
+    } else {
+        StreamCache::try_new(upstream, schema, config)
+    }
+    .map_err(arrow_to_boundary)
 }

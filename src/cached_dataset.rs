@@ -20,10 +20,10 @@ use arrow_array::ffi::FFI_ArrowSchema;
 use arrow_array::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use arrow_pyarrow::{IntoPyArrow, PyArrowType};
 use arrow_schema::{Schema, SchemaRef};
-use batchcorder_core::{Bounding, CacheConfig, StreamCache, StreamCacheReader, Upstream};
+use batchcorder_core::{Bounding, StreamCache, StreamCacheReader};
 use batchcorder_pyo3::{
-    PyUpstream, arrow_to_boundary, arrow_to_py_err, parse_disk_config, parse_write_policy,
-    wait_without_gil, without_gil,
+    arrow_to_boundary, arrow_to_py_err, build_cache, parse_disk_config, parse_write_policy,
+    without_gil,
 };
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
@@ -258,32 +258,15 @@ impl PyStreamCache {
         if max_readers == Some(0) {
             return Err(PyValueError::new_err("max_readers must be at least 1"));
         }
-        let schema = reader.0.schema();
-        let upstream: Box<dyn Upstream> = Box::new(PyUpstream::new(reader.0));
-
         // Parse the write policy up front (applies to the disk tier only; ignored
         // for memory-only caches).
         let write_policy = parse_write_policy(&write_policy)?;
         let disk = parse_disk_config(disk_path, disk_capacity)?;
-
-        let config = CacheConfig {
-            memory_capacity,
-            disk,
-            write_policy,
-            bounding: match max_readers {
-                Some(max) => Bounding::Counted { max },
-                None => Bounding::Unbounded,
-            },
-            wait_hook: Some(wait_without_gil),
+        let bounding = match max_readers {
+            Some(max) => Bounding::Counted { max },
+            None => Bounding::Unbounded,
         };
-        let cache = if config.disk.is_some() {
-            // Creating the disk tier is pure OS I/O — release the GIL.
-            without_gil(py, || StreamCache::try_new(upstream, schema, config))
-        } else {
-            StreamCache::try_new(upstream, schema, config)
-        }
-        .map_err(arrow_to_boundary)?;
-
+        let cache = build_cache(py, reader.0, memory_capacity, disk, write_policy, bounding)?;
         Ok(Self { cache })
     }
 
