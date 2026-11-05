@@ -8,12 +8,13 @@ dependency group (``uv sync --group datafusion``).
 import gc
 import subprocess
 import sys
+from importlib.metadata import PackageNotFoundError
 
 import pyarrow as pa
 import pytest
 from datafusion import SessionContext
 
-from batchcorder_datafusion import TeeTableProvider
+from batchcorder_datafusion import TeeTableProvider, _hosts
 
 
 N_ROWS = 1000
@@ -249,3 +250,52 @@ def test_python_upstream_concurrent_scans_do_not_deadlock():
     else:
         assert proc.returncode == 0, proc.stderr
         assert proc.stdout.strip() == "ok"
+
+
+# Host version guard (batchcorder_datafusion._hosts).
+
+
+def _fake_versions(installed: dict[str, str]):
+    def get_version(dist: str) -> str:
+        if dist not in installed:
+            raise PackageNotFoundError(dist)
+        return installed[dist]
+
+    return get_version
+
+
+@pytest.mark.parametrize(
+    ("installed", "expected"),
+    [
+        ({}, []),
+        ({"datafusion": "55.0.0", "xorq-datafusion": "0.3.0"}, []),
+        ({"datafusion": "55.9.1", "xorq-datafusion": "0.3.12rc1"}, []),
+        ({"datafusion": "56.0.0"}, [("datafusion", "56.0.0", ">=55,<56")]),
+        ({"datafusion": "54.1.0"}, [("datafusion", "54.1.0", ">=55,<56")]),
+        # 0.2.x is the DataFusion 53 line.
+        (
+            {"xorq-datafusion": "0.2.11"},
+            [("xorq-datafusion", "0.2.11", ">=0.3,<0.4")],
+        ),
+    ],
+)
+def test_mismatched_hosts(installed, expected):
+    assert _hosts.mismatched_hosts(_fake_versions(installed)) == expected
+
+
+def test_installed_host_does_not_warn_on_import():
+    proc = subprocess.run(
+        [sys.executable, "-W", "error", "-c", "import batchcorder_datafusion"],
+        timeout=60,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_mismatched_host_warns(monkeypatch):
+    # The installed datafusion (55.x) against a table that expects 56.
+    monkeypatch.setattr(_hosts, "SUPPORTED_HOSTS", {"datafusion": ((56,), (57,))})
+    with pytest.warns(RuntimeWarning, match=r"needs datafusion>=56,<57"):
+        _hosts.warn_on_mismatched_hosts()
