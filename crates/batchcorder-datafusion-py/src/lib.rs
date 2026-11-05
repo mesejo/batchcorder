@@ -99,7 +99,33 @@ fn ffi_logical_codec(session: &Bound<'_, PyAny>) -> PyResult<FFI_LogicalExtensio
     // It is cloned (bumping the codec's own reference count) while the
     // capsule is alive, so the borrow does not outlive its owner.
     let codec = unsafe { ptr.cast::<FFI_LogicalExtensionCodec>().as_ref() };
+    check_ffi_version(codec)?;
     Ok(codec.clone())
+}
+
+/// Raise unless the host's codec comes from the same datafusion-ffi major as
+/// this extension; calling any other function of a mismatched struct is
+/// undefined behaviour.
+///
+/// Best effort: the `version` field itself sits at a layout-dependent offset,
+/// so a host whose struct layout differs may not get this far.  That is why
+/// `_hosts.check_host` runs first, on the Python side, for the hosts it can
+/// identify.  This check covers the rest, such as a codec capsule passed in
+/// place of the session.
+fn check_ffi_version(codec: &FFI_LogicalExtensionCodec) -> PyResult<()> {
+    // SAFETY: `version` is a plain `extern "C" fn() -> u64` with no arguments.
+    let host = unsafe { (codec.version)() };
+    let ours = datafusion_ffi::version();
+    if host == ours {
+        return Ok(());
+    }
+    Err(PyRuntimeError::new_err(format!(
+        "TeeTableProvider cannot be registered with this DataFusion host: the \
+         host is built on DataFusion {host} (datafusion-ffi {host}), but \
+         batchcorder-datafusion {} is built on DataFusion {ours}.  Install \
+         batchcorder-datafusion {host}.x, or a host built on DataFusion {ours}.",
+        env!("CARGO_PKG_VERSION"),
+    )))
 }
 
 fn parse_bounding(bounding: &str) -> PyResult<Bounding> {
@@ -177,6 +203,10 @@ impl PyTeeTableProvider {
         py: Python<'py>,
         session: Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyCapsule>> {
+        // Fail with a clear error, before touching any FFI struct of a host
+        // built on another DataFusion major.
+        py.import("batchcorder_datafusion._hosts")?
+            .call_method1("check_host", (&session,))?;
         let runtime = runtime_handle()?;
         // Keep the host's encode/decode, but swap in a task context provider
         // that cannot go out of scope (see `OwnTaskContextProvider`).

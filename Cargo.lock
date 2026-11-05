@@ -373,7 +373,7 @@ dependencies = [
 
 [[package]]
 name = "batchcorder-datafusion-py"
-version = "0.1.0"
+version = "55.0.0"
 dependencies = [
  "arrow-array",
  "arrow-pyarrow",

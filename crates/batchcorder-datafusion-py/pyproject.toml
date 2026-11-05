@@ -6,19 +6,26 @@ build-backend = "maturin"
 name = "batchcorder-datafusion"
 requires-python = ">=3.10"
 description = "DataFusion table provider that tees one read-once Arrow stream to every scan in a query"
+readme = "README.md"
 license = { text = "Apache-2.0" }
 authors = [{ name = "Daniel Mesejo" }]
 classifiers = [
   "Programming Language :: Rust",
   "Programming Language :: Python :: Implementation :: CPython",
   "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
   "License :: OSI Approved :: Apache Software License",
   "Topic :: Scientific/Engineering",
 ]
 dynamic = ["version"]
-# datafusion-ffi structs are only compatible within one DataFusion major, so
-# the host must be datafusion-python 55.x (matches datafusion-ffi in Cargo.toml).
-dependencies = ["pyarrow>=18", "datafusion>=55,<56"]
+# No dependency on a DataFusion host: users bring their own, and each host
+# embeds its own copy of DataFusion.  The supported host versions are in
+# SUPPORTED_HOSTS (python/batchcorder_datafusion/_hosts.py) and the README;
+# registering the provider with any other host raises RuntimeError.
+dependencies = ["pyarrow>=18"]
 
 [project.urls]
 Homepage = "https://github.com/mesejo/batchcorder"
