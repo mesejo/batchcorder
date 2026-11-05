@@ -4,6 +4,7 @@ Skipped unless both datafusion-python and the batchcorder_datafusion extension
 are installed (``maturin develop -m crates/batchcorder-datafusion-py/Cargo.toml``).
 """
 
+import gc
 import subprocess
 import sys
 
@@ -85,15 +86,59 @@ QUERIES = [
 @pytest.mark.parametrize(("sql", "scans"), QUERIES)
 def test_query_matches_reference_with_exact_fanout(sql, scans):
     provider = _provider()
-    # Keep the context alive until the query finishes: over FFI the provider
-    # only holds a weak reference to the host session.
     ctx = _tee_ctx(provider)
     result = ctx.sql(sql).to_arrow_table()
     assert result.equals(_reference_result(sql))
+    _assert_fanout(provider, scans)
+
+
+def _assert_fanout(provider: TeeTableProvider, scans: int) -> None:
     assert provider.scans_planned == scans
     assert provider.scans_executed == scans
     assert provider.is_sealed
     assert provider.evicted_count == provider.ingested_count == N_ROWS // CHUNK
+
+
+# A query must keep working once the host SessionContext is gone, as long as
+# its DataFrame is alive -- as it does for in-memory tables.  The provider's
+# FFI codec used to reach the host session through a weak reference that is
+# resolved on every scan.
+_SINGLE_SCAN = "select count(*) as c, sum(x) as s from t"
+_SELF_JOIN = (
+    "select a.k, count(*) as c from t a join t b on a.k = b.k group by a.k order by a.k"
+)
+
+
+def test_query_runs_after_context_is_deleted():
+    provider = _provider()
+    ctx = _tee_ctx(provider)
+    df = ctx.sql(_SINGLE_SCAN)
+    del ctx
+    gc.collect()
+    assert df.to_arrow_table().equals(_reference_result(_SINGLE_SCAN))
+    _assert_fanout(provider, 1)
+
+
+@pytest.mark.parametrize(
+    ("sql", "scans"), [(_SINGLE_SCAN, 1), (_SELF_JOIN, 2)], ids=["single", "join"]
+)
+def test_query_on_temporary_context(sql, scans):
+    provider = _provider()
+    df = _tee_ctx(provider).sql(sql)
+    gc.collect()
+    assert df.to_arrow_table().equals(_reference_result(sql))
+    _assert_fanout(provider, scans)
+
+
+def test_stream_drains_after_context_is_deleted():
+    provider = _provider()
+    ctx = _tee_ctx(provider)
+    stream = ctx.sql(_SELF_JOIN).execute_stream()
+    del ctx
+    gc.collect()
+    rows = sum(batch.to_pyarrow().num_rows for batch in stream)
+    assert rows == _reference_result(_SELF_JOIN).num_rows
+    _assert_fanout(provider, 2)
 
 
 def test_explain_then_execute():

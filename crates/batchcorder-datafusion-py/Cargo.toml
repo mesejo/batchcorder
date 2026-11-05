@@ -24,6 +24,8 @@ arrow-pyarrow = { workspace = true }
 # match the datafusion-python version pinned in pyproject.toml.
 datafusion = { version = "55", default-features = false }
 datafusion-ffi = "55"
+# Only for the `LogicalExtensionCodec` trait (already a datafusion-ffi dependency).
+datafusion-proto = { version = "55", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread"] }
 
 [lints.rust]

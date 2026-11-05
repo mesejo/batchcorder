@@ -383,6 +383,7 @@ dependencies = [
  "batchcorder-pyo3",
  "datafusion",
  "datafusion-ffi",
+ "datafusion-proto",
  "pyo3",
  "tokio",
 ]

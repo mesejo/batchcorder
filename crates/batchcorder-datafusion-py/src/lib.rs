@@ -20,8 +20,10 @@ use batchcorder_pyo3::{
     without_gil,
 };
 use datafusion::catalog::TableProvider;
+use datafusion::execution::{TaskContext, TaskContextProvider};
 use datafusion_ffi::proto::logical_extension_codec::FFI_LogicalExtensionCodec;
 use datafusion_ffi::table_provider::FFI_TableProvider;
+use datafusion_proto::logical_plan::LogicalExtensionCodec;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyCapsule;
@@ -52,6 +54,27 @@ fn runtime_handle() -> PyResult<Handle> {
 }
 
 // ── FFI helpers ──────────────────────────────────────────────────────────────
+
+/// Task context provider owned by this library for the life of the process.
+///
+/// The host's codec reaches the host session only through a `Weak`, and the
+/// FFI scan wrapper resolves it on every scan, so a query would fail once the
+/// host `SessionContext` is gone even though its DataFrame is still alive.
+/// The task context is only used to decode pushed-down filters, and pushdown
+/// is off (see `__datafusion_table_provider__`).
+struct OwnTaskContextProvider;
+
+impl TaskContextProvider for OwnTaskContextProvider {
+    fn task_ctx(&self) -> Arc<TaskContext> {
+        Arc::new(TaskContext::default())
+    }
+}
+
+/// Holds the concrete type: `Arc<dyn TaskContextProvider>` is neither `Send`
+/// nor `Sync`, so it cannot live in a static.  The FFI side downgrades the
+/// coerced `Arc` to a `Weak`, which this static keeps upgradable.
+static TASK_CTX_PROVIDER: LazyLock<Arc<OwnTaskContextProvider>> =
+    LazyLock::new(|| Arc::new(OwnTaskContextProvider));
 
 /// Extract the host's logical extension codec from the `session` argument of
 /// `__datafusion_table_provider__`.  datafusion-python passes either an
@@ -167,12 +190,20 @@ impl PyTeeTableProvider {
         py: Python<'py>,
         session: Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyCapsule>> {
-        let codec = ffi_logical_codec(&session)?;
+        let runtime = runtime_handle()?;
+        // Keep the host's encode/decode, but swap in a task context provider
+        // that cannot go out of scope (see `OwnTaskContextProvider`).
+        let host_codec: Arc<dyn LogicalExtensionCodec> = (&ffi_logical_codec(&session)?).into();
+        let task_ctx_provider: Arc<dyn TaskContextProvider> = TASK_CTX_PROVIDER.clone();
+        let codec =
+            FFI_LogicalExtensionCodec::new(host_codec, Some(runtime.clone()), &task_ctx_provider);
         let provider: Arc<dyn TableProvider> = self.provider.clone();
         // Filter pushdown off: the provider does not use filters yet, and
-        // turning it off avoids serialising them over the codec.
-        let ffi =
-            FFI_TableProvider::new_with_ffi_codec(provider, false, Some(runtime_handle()?), codec);
+        // turning it off avoids serialising them over the codec.  Turning it
+        // on needs a real task context: `OwnTaskContextProvider` hands out an
+        // empty one, with no function registry, so filters that call
+        // functions would fail to decode.
+        let ffi = FFI_TableProvider::new_with_ffi_codec(provider, false, Some(runtime), codec);
         PyCapsule::new_with_value(py, ffi, c"datafusion_table_provider")
     }
 
