@@ -69,7 +69,7 @@ repos:
     rev: v0.11.0.1
     hooks:
       - id: shellcheck
-        args: ["scripts/build-docs.sh", "scripts/build-release.sh", "scripts/bench-build.sh"]
+        args: ["scripts/build-docs.sh", "scripts/build-release.sh", "scripts/bench-build.sh", "scripts/release-package.sh"]
 
   - repo: local
     hooks:

@@ -172,18 +172,37 @@ cargo install cargo-edit
 
 ### Release Process
 
-Use the release script, passing the bump type as an argument:
+`batchcorder` and `batchcorder-datafusion` are released independently. Use
+the release script, passing the package and the bump type (or an explicit
+version):
 
 ```bash
-bash scripts/build-release.sh <major|minor|patch>
+bash scripts/build-release.sh batchcorder <major|minor|patch>
+bash scripts/build-release.sh batchcorder-datafusion <major|minor|patch|X.Y.Z>
 ```
 
 This will:
 1. Switch to upstream `main` and pull the latest changes
-2. Bump the version in `Cargo.toml` using `cargo set-version --bump`
-3. Create a `release-<version>` branch
+2. Bump the version of the package's crate (`crates/batchcorder-py` or
+   `crates/batchcorder-datafusion-py`) using `cargo set-version`
+3. Create a `release-<package>-<version>` branch
 4. Commit the version change
 5. Push the branch to upstream
+
+After the release PR merges, publish the package's draft GitHub release
+with the tag `<package>-v<version>` (for example `batchcorder-v0.2.0` or
+`batchcorder-datafusion-v55.0.1`). The tag selects the package that
+`ci-release.yaml` builds and uploads, and must match the crate version.
+
+Versioning rules:
+- The major version of `batchcorder-datafusion` is the DataFusion major it is
+  built on. Moving to a new DataFusion major sets it explicitly
+  (`bash scripts/build-release.sh batchcorder-datafusion 56.0.0`), together
+  with `SUPPORTED_HOSTS` and `DATAFUSION_MAJOR` in
+  `batchcorder_datafusion/_hosts.py` and the README compatibility table.
+- A user-visible change in `crates/batchcorder-core` or
+  `crates/batchcorder-pyo3` is compiled into both wheels, so release both
+  packages. Such a change shows up in both release drafts.
 
 ## 🛑 Boundaries
 

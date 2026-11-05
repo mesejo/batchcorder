@@ -2,15 +2,30 @@ exclude-labels:
   - ignore
   - release
   - dependencies
+# Release notes for the batchcorder package.  batchcorder-datafusion has its
+# own drafter, release-drafter-datafusion.yml; PRs that touch the shared core
+# crates appear in both drafts, the cue to release both packages.
 name-template: 'batchcorder unreleased'
 version-template: unreleased
+# Drafts and previous releases are matched by tag prefix.  The draft's tag is
+# the bare prefix: complete it (batchcorder-vX.Y.Z) when publishing.
+tag-prefix: 'batchcorder-v'
+tag-template: 'batchcorder-v'
+include-paths:
+  - crates/batchcorder-py
+  - crates/batchcorder-core
+  - crates/batchcorder-pyo3
+  - python
+  - docs
+  - README.md
+  - pyproject.toml
 
 change-template: '- $TITLE (#$NUMBER)'
 
 autolabeler:
   - label: 'release'
     title:
-      - '/^release:/i'
+      - '/^release(\(.*\))?:/i'
   - label: 'dependencies'
     title:
       - '/^chore\(deps\):/i'
