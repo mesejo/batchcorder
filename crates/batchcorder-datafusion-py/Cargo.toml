@@ -1,0 +1,33 @@
+[package]
+name = "batchcorder-datafusion-py"
+version = "0.1.0"
+edition = "2024"
+description = "Python bindings for batchcorder-datafusion (the batchcorder-datafusion wheel)"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+name = "_batchcorder_datafusion"
+crate-type = ["cdylib"]
+
+[dependencies]
+batchcorder-core = { path = "../batchcorder-core" }
+batchcorder-pyo3 = { path = "../batchcorder-pyo3" }
+batchcorder-datafusion = { path = "../batchcorder-datafusion" }
+
+pyo3 = { workspace = true, features = ["extension-module"] }
+arrow-array = { workspace = true, features = ["ffi"] }
+arrow-schema = { workspace = true }
+arrow-pyarrow = { workspace = true }
+
+# The FFI structs are only compatible within one DataFusion major; this must
+# match the datafusion-python version pinned in pyproject.toml.
+datafusion = { version = "55", default-features = false }
+datafusion-ffi = "55"
+# Only for the `LogicalExtensionCodec` trait (already a datafusion-ffi dependency).
+datafusion-proto = { version = "55", default-features = false }
+tokio = { version = "1", features = ["rt-multi-thread"] }
+
+[lints.rust]
+# Py_GIL_DISABLED is a cfg set by pyo3's build script to indicate free-threaded Python.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(Py_GIL_DISABLED)'] }

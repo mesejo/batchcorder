@@ -13,38 +13,50 @@ path = "src/bin/stub_gen.rs"
 
 [dependencies]
 # Python bindings
-pyo3 = { version = "0.29", features = [
-  "extension-module",
-  "abi3",
-  "abi3-py310",
-] }
+pyo3 = { workspace = true, features = ["extension-module"] }
 pyo3-stub-gen = { version = "0.23", default-features = false }
 
-# Cache, readers and eviction (no PyO3)
+# Cache, readers and eviction (no PyO3), and the PyO3 glue shared with the
+# batchcorder-datafusion extension (GIL handling, Python upstream)
 batchcorder-core = { path = "crates/batchcorder-core" }
+batchcorder-pyo3 = { path = "crates/batchcorder-pyo3" }
 
 # Arrow types and the C Data / C Stream FFI used at the Python boundary
 arrow-array = { workspace = true, features = ["ffi"] }
-arrow-pyarrow = "59"
+arrow-pyarrow = { workspace = true }
 arrow-schema = { workspace = true }
 
-# The root package is the PyO3 extension that maturin builds; the pure-Rust
-# cache lives in crates/batchcorder-core and the DataFusion table provider in
-# crates/batchcorder-datafusion.  All are default members, so a bare
-# `cargo test` / `cargo clippy` at the root covers them too.  The extension
-# does not depend on the DataFusion crate, so wheels do not pull DataFusion in.
+# The root package is the `batchcorder` PyO3 extension that maturin builds.
+#   crates/batchcorder-core           pure-Rust cache (no PyO3)
+#   crates/batchcorder-pyo3           PyO3 glue shared by both extensions
+#   crates/batchcorder-datafusion     DataFusion TableProvider (no PyO3)
+#   crates/batchcorder-datafusion-py  the separate `batchcorder-datafusion`
+#                                     wheel (its own pyproject.toml)
+# All are default members, so a bare `cargo test` / `cargo clippy` at the
+# root covers them.  The `batchcorder` extension does not depend on
+# DataFusion, so its wheel does not pull DataFusion in.
 [workspace]
-members = [".", "crates/batchcorder-core", "crates/batchcorder-datafusion"]
+members = [
+  ".",
+  "crates/batchcorder-core",
+  "crates/batchcorder-pyo3",
+  "crates/batchcorder-datafusion",
+  "crates/batchcorder-datafusion-py",
+]
 default-members = [
   ".",
   "crates/batchcorder-core",
+  "crates/batchcorder-pyo3",
   "crates/batchcorder-datafusion",
+  "crates/batchcorder-datafusion-py",
 ]
 
 [workspace.dependencies]
 arrow-array = "59"
 arrow-schema = "59"
 arrow-ipc = "59"
+arrow-pyarrow = "59"
+pyo3 = { version = "0.29", features = ["abi3", "abi3-py310"] }
 
 # Full DWARF is not needed for the Python test loop. Line tables keep file and
 # line numbers for this crate in panics and backtraces; dependencies carry no

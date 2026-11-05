@@ -35,6 +35,11 @@ uv sync --no-install-project --dev --group docs
 
 # Build the extension
 uv run maturin develop --uv
+
+# Build the separate batchcorder-datafusion wheel (slower: compiles
+# DataFusion).  Needed by its tests, which are skipped without it, and by
+# the pyright and stubtest pre-commit hooks, which fail without it.
+uv run maturin develop --uv -m crates/batchcorder-datafusion-py/Cargo.toml
 ```
 
 ### Environment variables
@@ -66,7 +71,8 @@ uv run pytest tests/test_module.py
 - All changes must be tested
 - Look to see if your tests could go in an existing file before adding a new file
 - Get your tests to pass before committing
-- Run `uv run pre-commit run --all-files` before pushing code
+- Run `uv run pre-commit run --all-files` before pushing code (build both
+  extensions first; see Setup Commands)
 
 ## 📝 Code Style
 

@@ -1,0 +1,30 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "batchcorder-datafusion"
+requires-python = ">=3.10"
+description = "DataFusion table provider that tees one read-once Arrow stream to every scan in a query"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Daniel Mesejo" }]
+classifiers = [
+  "Programming Language :: Rust",
+  "Programming Language :: Python :: Implementation :: CPython",
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: Apache Software License",
+  "Topic :: Scientific/Engineering",
+]
+dynamic = ["version"]
+# datafusion-ffi structs are only compatible within one DataFusion major, so
+# the host must be datafusion-python 55.x (matches datafusion-ffi in Cargo.toml).
+dependencies = ["pyarrow>=18", "datafusion>=55,<56"]
+
+[project.urls]
+Homepage = "https://github.com/mesejo/batchcorder"
+Repository = "https://github.com/mesejo/batchcorder"
+
+[tool.maturin]
+python-source = "python"
+features = ["pyo3/extension-module"]
+module-name = "batchcorder_datafusion._batchcorder_datafusion"

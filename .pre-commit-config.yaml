@@ -117,3 +117,13 @@ repos:
         language: system
         pass_filenames: false
         types_or: [python, pyi]
+
+      # Same check for the separate batchcorder-datafusion wheel.  Requires:
+      # maturin develop --uv -m crates/batchcorder-datafusion-py/Cargo.toml
+      - id: mypy-stubtest-datafusion
+        name: mypy stubtest (batchcorder-datafusion)
+        description: Validate _batchcorder_datafusion.pyi matches the compiled extension at runtime.
+        entry: .venv/bin/python -m mypy.stubtest --mypy-config-file pyproject.toml batchcorder_datafusion._batchcorder_datafusion
+        language: system
+        pass_filenames: false
+        types_or: [python, pyi]

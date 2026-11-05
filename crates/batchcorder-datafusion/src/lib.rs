@@ -38,6 +38,7 @@ use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::stream::RecordBatchReceiverStreamBuilder;
 use datafusion::physical_plan::streaming::{PartitionStream, StreamingTableExec};
+use tokio::runtime::Handle;
 
 /// Batches buffered between the blocking reader task and the consumer.
 /// Small on purpose: a deep buffer lets one scan run ahead of the others,
@@ -71,6 +72,7 @@ impl TeeStats {
 pub struct TeeTableProvider {
     cache: StreamCache,
     stats: Arc<TeeStats>,
+    runtime: Option<Handle>,
 }
 
 impl TeeTableProvider {
@@ -78,7 +80,17 @@ impl TeeTableProvider {
         Self {
             cache,
             stats: Arc::new(TeeStats::default()),
+            runtime: None,
         }
+    }
+
+    /// Run the blocking reader tasks on `runtime` instead of the ambient
+    /// Tokio runtime.  Required when the provider is used across
+    /// `datafusion-ffi`: the host's runtime belongs to another copy of Tokio
+    /// that this library cannot see.
+    pub fn with_runtime(mut self, runtime: Handle) -> Self {
+        self.runtime = Some(runtime);
+        self
     }
 
     /// The underlying cache, e.g. to inspect `ingested_count` or
@@ -97,6 +109,7 @@ impl fmt::Debug for TeeTableProvider {
         f.debug_struct("TeeTableProvider")
             .field("schema", &self.cache.schema())
             .field("stats", &self.stats)
+            .field("runtime", &self.runtime.is_some())
             .finish()
     }
 }
@@ -144,6 +157,7 @@ impl TableProvider for TeeTableProvider {
             cache: self.cache.clone(),
             reader: Mutex::new(Some(reader)),
             stats: self.stats.clone(),
+            runtime: self.runtime.clone(),
         });
         let exec = StreamingTableExec::try_new(
             schema,
@@ -165,6 +179,7 @@ struct TeePartition {
     cache: StreamCache,
     reader: Mutex<Option<StreamCacheReader>>,
     stats: Arc<TeeStats>,
+    runtime: Option<Handle>,
 }
 
 impl fmt::Debug for TeePartition {
@@ -200,13 +215,13 @@ impl PartitionStream for TeePartition {
         self.stats.scans_executed.fetch_add(1, Ordering::Relaxed);
         let mut builder =
             RecordBatchReceiverStreamBuilder::new(self.schema.clone(), CHANNEL_CAPACITY);
-        match self.take_reader() {
+        // Reads block on upstream I/O, disk, other readers' ingest or (for
+        // Python upstreams) the GIL, so they must never run on an async
+        // worker thread.
+        let task: Box<dyn FnOnce() -> Result<()> + Send> = match self.take_reader() {
             Ok(mut reader) => {
                 let tx = builder.tx();
-                // Reads block on upstream I/O, disk, other readers' ingest or
-                // (for Python upstreams) the GIL, so they must never run on an
-                // async worker thread.
-                builder.spawn_blocking(move || {
+                Box::new(move || {
                     for item in reader.by_ref() {
                         let item = item.map_err(DataFusionError::from);
                         let failed = item.is_err();
@@ -218,9 +233,13 @@ impl PartitionStream for TeePartition {
                         }
                     }
                     Ok(())
-                });
+                })
             }
-            Err(e) => builder.spawn_blocking(move || Err(e)),
+            Err(e) => Box::new(move || Err(e)),
+        };
+        match &self.runtime {
+            Some(handle) => builder.spawn_blocking_on(task, handle),
+            None => builder.spawn_blocking(task),
         }
         builder.build()
     }

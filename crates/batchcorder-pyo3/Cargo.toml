@@ -1,0 +1,18 @@
+[package]
+name = "batchcorder-pyo3"
+version = "0.1.0"
+edition = "2024"
+description = "PyO3 glue shared by batchcorder's Python extensions"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+batchcorder-core = { path = "../batchcorder-core" }
+pyo3 = { workspace = true }
+arrow-array = { workspace = true, features = ["ffi"] }
+arrow-schema = { workspace = true }
+arrow-pyarrow = { workspace = true }
+
+[lints.rust]
+# Py_GIL_DISABLED is a cfg set by pyo3's build script to indicate free-threaded Python.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(Py_GIL_DISABLED)'] }
