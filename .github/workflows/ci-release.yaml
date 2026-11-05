@@ -1,7 +1,20 @@
 name: ci-release
 
+# Publishes one package per release.  The release tag names the package:
+#   batchcorder-vX.Y.Z             -> batchcorder
+#   batchcorder-datafusion-vX.Y.Z  -> batchcorder-datafusion
+# so a release can never upload half of a two-project release.
+
 on:
   workflow_dispatch:
+    inputs:
+      package:
+        description: "Package to build and upload"
+        required: true
+        type: choice
+        options:
+          - batchcorder
+          - batchcorder-datafusion
   release:
     types: [published]
 
@@ -16,22 +29,56 @@ permissions:
   contents: read
 
 jobs:
+  which:
+    runs-on: ubuntu-latest
+    outputs:
+      package: ${{ steps.map.outputs.package }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Map the release tag to a package
+        id: map
+        env:
+          EVENT: ${{ github.event_name }}
+          TAG: ${{ github.event.release.tag_name }}
+          INPUT_PACKAGE: ${{ inputs.package }}
+        run: bash scripts/release-package.sh "$EVENT" "$TAG" "$INPUT_PACKAGE" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: which
     uses: ./.github/workflows/build-wheels.yaml
+    with:
+      package: ${{ needs.which.outputs.package }}
 
   release:
     name: Release
     runs-on: ubuntu-latest
-    needs: build
+    needs: [which, build]
+    permissions:
+      contents: read
+      id-token: write  # trusted publishing (batchcorder-datafusion)
     steps:
+      # Only this run's artifacts are visible, and they hold one package.
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
-      - name: Publish to PyPI
+
+      # The project-scoped token can only upload batchcorder.
+      - name: Publish batchcorder to PyPI
+        if: needs.which.outputs.package == 'batchcorder'
         uses: PyO3/maturin-action@v1
         env:
           MATURIN_PYPI_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
         with:
           command: upload
           args: --non-interactive --skip-existing ./dist/*
+
+      # Needs a trusted publisher for this repository and ci-release.yaml on
+      # the batchcorder-datafusion PyPI project.
+      - name: Publish batchcorder-datafusion to PyPI
+        if: needs.which.outputs.package == 'batchcorder-datafusion'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+          skip-existing: true

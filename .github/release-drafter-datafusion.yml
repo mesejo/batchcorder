@@ -1,0 +1,56 @@
+exclude-labels:
+  - ignore
+  - release
+  - dependencies
+# Release notes for the batchcorder-datafusion package; see
+# release-drafter.yml.  Labels come from the autolabeler there, so this file
+# has none.  Keep the categories in sync.
+name-template: 'batchcorder-datafusion unreleased'
+version-template: unreleased
+# The draft's tag is the bare prefix: complete it
+# (batchcorder-datafusion-vX.Y.Z) when publishing.
+tag-prefix: 'batchcorder-datafusion-v'
+tag-template: 'batchcorder-datafusion-v'
+include-paths:
+  - crates/batchcorder-datafusion
+  - crates/batchcorder-datafusion-py
+  - crates/batchcorder-core
+  - crates/batchcorder-pyo3
+
+change-template: '- $TITLE (#$NUMBER)'
+
+categories:
+  - title: 🚀 Performance improvements
+    labels:
+      - performance
+      - perf
+  - title: ✨ Enhancements
+    labels:
+      - feature
+      - enhancement
+  - title: 🐞 Bug fixes
+    labels:
+      - fix
+      - bugfix
+      - bug
+  - title: 📖 Documentation
+    labels:
+      - documentation
+      - docs
+  - title: 📦 Build system
+    labels:
+      - build
+      - ci
+      - chore
+  - title: 🛠️ Other improvements
+    labels:
+      - internal
+      - maintenance
+
+template: |
+  ## Changes
+
+  $CHANGES
+
+  Thank you to all our contributors for making this release possible!
+  $CONTRIBUTORS

@@ -1,13 +1,44 @@
 name: build-wheels
 
+# Builds the wheels and the sdist of one package.  Artifact names carry the
+# package name, so a caller never mixes the two projects.
+
 on:
   workflow_call:
+    inputs:
+      package:
+        description: "batchcorder or batchcorder-datafusion"
+        required: true
+        type: string
 
 permissions:
   contents: read
 
+env:
+  # batchcorder builds from the root pyproject.toml (whose manifest-path
+  # points at crates/batchcorder-py); batchcorder-datafusion has its own.
+  MANIFEST_ARGS: ${{ inputs.package == 'batchcorder-datafusion' && '-m crates/batchcorder-datafusion-py/Cargo.toml' || '' }}
+  # Both extensions are abi3, so one CPython wheel covers every version.
+  # --find-interpreter also builds a PyPy wheel per PyPy interpreter;
+  # datafusion-python ships no PyPy wheels, so batchcorder-datafusion skips
+  # them (and avoids compiling DataFusion once per wheel).
+  INTERPRETER_ARGS: ${{ inputs.package == 'batchcorder-datafusion' && '-i python3.11' || '--find-interpreter' }}
+
 jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check package name
+        env:
+          PACKAGE: ${{ inputs.package }}
+        run: |
+          case "$PACKAGE" in
+            batchcorder | batchcorder-datafusion) ;;
+            *) echo "Unknown package: '$PACKAGE'" >&2; exit 1 ;;
+          esac
+
   linux:
+    needs: check
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -21,20 +52,23 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist --find-interpreter
+          args: --release --out dist ${{ env.INTERPRETER_ARGS }} ${{ env.MANIFEST_ARGS }}
           sccache: 'true'
           manylinux: ${{ matrix.target == 'aarch64' && '2_28' || 'auto' }}
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
-          name: wheel-ubuntu-${{ matrix.target }}
+          name: wheel-${{ inputs.package }}-ubuntu-${{ matrix.target }}
           path: dist
 
   windows:
+    needs: check
     runs-on: windows-latest
     strategy:
       matrix:
-        target: [x64, x86]
+        # datafusion-python ships no win32 wheels, so a 32-bit
+        # batchcorder-datafusion wheel could never be installed with a host.
+        target: ${{ fromJSON(inputs.package == 'batchcorder-datafusion' && '["x64"]' || '["x64", "x86"]') }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -45,15 +79,16 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist --find-interpreter
+          args: --release --out dist ${{ env.INTERPRETER_ARGS }} ${{ env.MANIFEST_ARGS }}
           sccache: 'true'
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
-          name: wheel-windows-${{ matrix.target }}
+          name: wheel-${{ inputs.package }}-windows-${{ matrix.target }}
           path: dist
 
   macos:
+    needs: check
     # Pinned like ci.yaml: macos-latest jobs sat queued without a runner,
     # and macos-14 was retired.
     runs-on: macos-15
@@ -69,15 +104,16 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist --find-interpreter
+          args: --release --out dist ${{ env.INTERPRETER_ARGS }} ${{ env.MANIFEST_ARGS }}
           sccache: 'true'
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
-          name: wheel-macos-${{ matrix.target }}
+          name: wheel-${{ inputs.package }}-macos-${{ matrix.target }}
           path: dist
 
   sdist:
+    needs: check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -85,9 +121,9 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           command: sdist
-          args: --out dist
+          args: --out dist ${{ env.MANIFEST_ARGS }}
       - name: Upload sdist
         uses: actions/upload-artifact@v4
         with:
-          name: sdist
+          name: sdist-${{ inputs.package }}
           path: dist

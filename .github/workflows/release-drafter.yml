@@ -17,8 +17,17 @@ jobs:
       pull-requests: write  # to add labels to PRs
     runs-on: ubuntu-latest
     steps:
+      # batchcorder notes; also runs the autolabeler on pull requests.
       - uses: release-drafter/release-drafter@v6
         with:
           config-name: release-drafter.yml
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # batchcorder-datafusion notes.  The draft only changes on pushes.
+      - uses: release-drafter/release-drafter@v6
+        if: github.event_name == 'push'
+        with:
+          config-name: release-drafter-datafusion.yml
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
