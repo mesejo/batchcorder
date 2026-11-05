@@ -1,0 +1,432 @@
+name: ci
+
+# One workflow for both packages.  The `changes` job decides which package's
+# jobs run on a pull request; `ci-ok` aggregates every job and is the only
+# check branch protection needs.  Per-workflow `paths:` filters are not used:
+# a required workflow that is skipped leaves its check pending forever.
+
+on:
+  push:
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+      - "*.md"
+      - ".envrc"
+    branches:
+      - main
+    tags:
+      - '*'
+  pull_request:
+  # Nightly run of every job on main, regardless of paths: catches drift the
+  # path filters miss (a batchcorder-core change seen only through the
+  # DataFusion provider, a new dependency release, ...).
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read  # paths-filter lists the PR's files via the API
+    # Only pull requests are filtered; push, schedule and dispatch run all.
+    outputs:
+      batchcorder: ${{ github.event_name != 'pull_request' || steps.filter.outputs.batchcorder == 'true' }}
+      datafusion: ${{ github.event_name != 'pull_request' || steps.filter.outputs.datafusion == 'true' }}
+    steps:
+      - uses: dorny/paths-filter@v3
+        id: filter
+        if: github.event_name == 'pull_request'
+        with:
+          # Shared paths are listed in both filters: the core crates are
+          # statically linked into both wheels, and the locks and workspace
+          # configuration are shared.
+          filters: |
+            shared: &shared
+              - "crates/batchcorder-core/**"
+              - "crates/batchcorder-pyo3/**"
+              - "Cargo.toml"
+              - "Cargo.lock"
+              - "rust-toolchain.toml"
+              - "uv.lock"
+              - ".pre-commit-config.yaml"
+              - ".github/workflows/ci*.yaml"
+            batchcorder:
+              - *shared
+              - "crates/batchcorder-py/**"
+              - "python/**"
+              - "tests/**"
+              - "pyproject.toml"
+              - "conftest.py"
+              - "README.md"
+              - "docs/**"
+            datafusion:
+              - *shared
+              - "crates/batchcorder-datafusion/**"
+              - "crates/batchcorder-datafusion-py/**"
+
+  # Hooks that need no compiled extension.  Always runs.
+  lint-common:
+    runs-on: ubuntu-latest
+    env:
+      UV_NO_SYNC: "1"
+      # Run by lint-batchcorder / lint-datafusion, which build the extensions.
+      SKIP: rust-clippy,pyright,pyright-datafusion,griffe,mypy-stubtest,mypy-stubtest-datafusion
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      # Nightly is required by the `cargo +nightly fmt` pre-commit hook.
+      - name: Install Rust nightly
+        run: rustup toolchain install nightly --profile minimal --component rustfmt --no-self-update
+
+      - name: Install Python dependencies
+        run: uv sync --locked --group dev --no-install-project
+
+      - name: Cache pre-commit environments
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ hashFiles('.pre-commit-config.yaml') }}
+          restore-keys: pre-commit-
+
+      - name: Run pre-commit
+        run: uv run pre-commit run --all-files
+
+  test-batchcorder:
+    needs: changes
+    if: needs.changes.outputs.batchcorder == 'true'
+    runs-on: ${{ matrix.os }}
+    env:
+      UV_NO_SYNC: "1"
+    strategy:
+      fail-fast: false
+      matrix:
+        # requires-python = ">=3.10"; test the floor and the latest stable.
+        include:
+          - {os: ubuntu-latest, python-version: "3.10", coverage: true}
+          - {os: ubuntu-latest, python-version: "3.13", coverage: true}
+          - {os: windows-latest, python-version: "3.13", coverage: true}
+          # Pinned: macos-latest jobs sat queued without a runner (Nov 2026).
+          - {os: macos-14, python-version: "3.10", coverage: false}
+          - {os: macos-14, python-version: "3.13", coverage: false}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Update Rust stable
+        shell: bash
+        run: |
+          rustup update stable
+          if [ "${{ matrix.coverage }}" = "true" ]; then
+            rustup component add llvm-tools-preview
+          fi
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install cargo-llvm-cov
+        if: matrix.coverage
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            ./target/
+          # abi3-py310 produces a single binary regardless of Python version,
+          # so the cache key does not include python-version.
+          key: cargo-${{ github.job }}-${{ runner.os }}-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock') }}
+          restore-keys: cargo-${{ github.job }}-${{ runner.os }}-
+
+      # --no-install-project: maturin develop handles the batchcorder install.
+      - name: Install Python dependencies
+        run: uv sync --locked --group dev --no-install-project
+
+      - name: Build and test with coverage
+        if: matrix.coverage
+        shell: bash
+        env:
+          CARGO_INCREMENTAL: "1"
+        run: |
+          eval "$(cargo llvm-cov show-env --export-prefix)"
+          cargo llvm-cov clean --workspace
+          cargo test -p batchcorder -p batchcorder-core -p batchcorder-pyo3
+          uv run maturin develop --uv
+          uv run pytest --import-mode=importlib --cov --cov-report=xml
+          cargo llvm-cov report --lcov --output-path coverage.lcov
+
+      - name: Upload coverage to Codecov
+        if: matrix.coverage
+        uses: codecov/codecov-action@v5.4.0
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: coverage.xml,coverage.lcov
+          flags: batchcorder
+
+      - name: Build extension
+        if: ${{ !matrix.coverage }}
+        uses: PyO3/maturin-action@v1
+        with:
+          command: develop
+          args: --release --strip --uv
+          sccache: 'true'
+
+      - name: Run tests
+        if: ${{ !matrix.coverage }}
+        run: uv run pytest --import-mode=importlib
+
+  lint-batchcorder:
+    needs: changes
+    if: needs.changes.outputs.batchcorder == 'true'
+    runs-on: ubuntu-latest
+    # sccache-action sets RUSTC_WRAPPER=sccache; all cargo sub-processes
+    # (maturin develop, cargo clippy) pick it up.
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
+      UV_NO_SYNC: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            ./target/
+          key: cargo-${{ github.job }}-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock') }}
+          restore-keys: cargo-${{ github.job }}-
+
+      - name: Install Python dependencies
+        run: uv sync --locked --group dev --no-install-project
+
+      # Same flags as the rust-clippy pre-commit hook, limited to the crates
+      # in the batchcorder wheel.
+      - name: Clippy
+        run: >-
+          cargo clippy -p batchcorder -p batchcorder-core -p batchcorder-pyo3
+          --all-targets --all-features --
+          -Dclippy::all -D warnings -Aclippy::redundant_closure
+
+      # The pyright, griffe, and mypy-stubtest hooks import the compiled
+      # extension, so build it first.
+      - name: Build extension
+        uses: PyO3/maturin-action@v1
+        with:
+          command: develop
+          args: --uv
+          sccache: 'true'
+          manylinux: 'off'
+
+      - name: Run pre-commit hooks that need the extension
+        run: |
+          uv run pre-commit run --all-files pyright
+          uv run pre-commit run --all-files griffe
+          uv run pre-commit run --all-files mypy-stubtest
+
+  test-datafusion:
+    needs: changes
+    if: needs.changes.outputs.datafusion == 'true'
+    runs-on: ${{ matrix.os }}
+    env:
+      UV_NO_SYNC: "1"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: ubuntu-latest, python-version: "3.10", coverage: true}
+          - {os: ubuntu-latest, python-version: "3.13", coverage: true}
+          - {os: windows-latest, python-version: "3.13", coverage: true}
+          # Pinned: macos-latest jobs sat queued without a runner (Nov 2026).
+          - {os: macos-14, python-version: "3.10", coverage: false}
+          - {os: macos-14, python-version: "3.13", coverage: false}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Update Rust stable
+        shell: bash
+        run: |
+          rustup update stable
+          if [ "${{ matrix.coverage }}" = "true" ]; then
+            rustup component add llvm-tools-preview
+          fi
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install cargo-llvm-cov
+        if: matrix.coverage
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            ./target/
+          key: cargo-${{ github.job }}-${{ runner.os }}-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock') }}
+          restore-keys: cargo-${{ github.job }}-${{ runner.os }}-
+
+      # The datafusion group is the host the provider is tested against.
+      - name: Install Python dependencies
+        run: uv sync --locked --group dev --group datafusion --no-install-project
+
+      - name: Build and test with coverage
+        if: matrix.coverage
+        shell: bash
+        env:
+          CARGO_INCREMENTAL: "1"
+        run: |
+          eval "$(cargo llvm-cov show-env --export-prefix)"
+          cargo llvm-cov clean --workspace
+          cargo test -p batchcorder-datafusion -p batchcorder-datafusion-py
+          uv run maturin develop --uv -m crates/batchcorder-datafusion-py/Cargo.toml
+          uv run pytest crates/batchcorder-datafusion-py/tests --import-mode=importlib \
+            --cov=batchcorder_datafusion --cov-report=xml
+          cargo llvm-cov report --lcov --output-path coverage.lcov
+
+      - name: Upload coverage to Codecov
+        if: matrix.coverage
+        uses: codecov/codecov-action@v5.4.0
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: coverage.xml,coverage.lcov
+          flags: datafusion
+
+      - name: Build extension
+        if: ${{ !matrix.coverage }}
+        uses: PyO3/maturin-action@v1
+        with:
+          command: develop
+          args: --release --strip --uv -m crates/batchcorder-datafusion-py/Cargo.toml
+          sccache: 'true'
+
+      - name: Run tests
+        if: ${{ !matrix.coverage }}
+        run: uv run pytest crates/batchcorder-datafusion-py/tests --import-mode=importlib
+
+  lint-datafusion:
+    needs: changes
+    if: needs.changes.outputs.datafusion == 'true'
+    runs-on: ubuntu-latest
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
+      UV_NO_SYNC: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            ./target/
+          key: cargo-${{ github.job }}-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock') }}
+          restore-keys: cargo-${{ github.job }}-
+
+      # pyright resolves `datafusion` in the provider tests.
+      - name: Install Python dependencies
+        run: uv sync --locked --group dev --group datafusion --no-install-project
+
+      # Same flags as the rust-clippy pre-commit hook, limited to the crates
+      # in the batchcorder-datafusion wheel.
+      - name: Clippy
+        run: >-
+          cargo clippy -p batchcorder-datafusion -p batchcorder-datafusion-py
+          --all-targets --all-features --
+          -Dclippy::all -D warnings -Aclippy::redundant_closure
+
+      - name: Build extension
+        uses: PyO3/maturin-action@v1
+        with:
+          command: develop
+          args: --uv -m crates/batchcorder-datafusion-py/Cargo.toml
+          sccache: 'true'
+          manylinux: 'off'
+
+      - name: Run pre-commit hooks that need the extension
+        run: |
+          uv run pre-commit run --all-files pyright-datafusion
+          uv run pre-commit run --all-files mypy-stubtest-datafusion
+
+  # The single required status check.  Skipped jobs (package not changed)
+  # count as success; failed or cancelled ones fail it.
+  ci-ok:
+    if: always()
+    needs:
+      - changes
+      - lint-common
+      - test-batchcorder
+      - lint-batchcorder
+      - test-datafusion
+      - lint-datafusion
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check needed jobs
+        env:
+          FAILED: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+        run: |
+          if [ "$FAILED" = "true" ]; then
+            echo "A needed job failed or was cancelled." >&2
+            exit 1
+          fi

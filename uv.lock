@@ -184,9 +184,11 @@ dependencies = [
 ]
 
 [package.dev-dependencies]
+datafusion = [
+    { name = "datafusion" },
+]
 dev = [
     { name = "coverage", extra = ["toml"] },
-    { name = "datafusion" },
     { name = "duckdb" },
     { name = "griffe" },
     { name = "hypothesis" },
@@ -219,9 +221,9 @@ docs = [
 requires-dist = [{ name = "pyarrow", specifier = ">=18" }]
 
 [package.metadata.requires-dev]
+datafusion = [{ name = "datafusion", specifier = ">=55,<56" }]
 dev = [
     { name = "coverage", extras = ["toml"], specifier = ">=7.13.4" },
-    { name = "datafusion", specifier = ">=55,<56" },
     { name = "duckdb", specifier = ">=1.5" },
     { name = "griffe", specifier = ">=1.0" },
     { name = "hypothesis", specifier = ">=6" },

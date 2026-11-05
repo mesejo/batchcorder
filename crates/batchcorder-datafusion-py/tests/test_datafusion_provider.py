@@ -1,7 +1,8 @@
 """Tests for the batchcorder-datafusion wheel (TeeTableProvider over datafusion-ffi).
 
-Skipped unless both datafusion-python and the batchcorder_datafusion extension
-are installed (``maturin develop -m crates/batchcorder-datafusion-py/Cargo.toml``).
+Needs the extension (``maturin develop --uv -m
+crates/batchcorder-datafusion-py/Cargo.toml``) and the ``datafusion``
+dependency group (``uv sync --group datafusion``).
 """
 
 import gc
@@ -10,13 +11,9 @@ import sys
 
 import pyarrow as pa
 import pytest
-
-
-datafusion = pytest.importorskip("datafusion")
-batchcorder_datafusion = pytest.importorskip("batchcorder_datafusion")
+from datafusion import SessionContext
 
 from batchcorder_datafusion import TeeTableProvider
-from datafusion import SessionContext
 
 
 N_ROWS = 1000

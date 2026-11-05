@@ -28,3 +28,7 @@ Repository = "https://github.com/mesejo/batchcorder"
 python-source = "python"
 features = ["pyo3/extension-module"]
 module-name = "batchcorder_datafusion._batchcorder_datafusion"
+
+# Checked separately from batchcorder: pyright -p crates/batchcorder-datafusion-py
+[tool.pyright]
+include = ["python", "tests"]

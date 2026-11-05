@@ -29,7 +29,9 @@ The Rust core implements the `StreamCache` functionality using:
 ### Setup Commands
 
 ```bash
-# Install dependencies without building the extension
+# Install dependencies without building the extension.  Add
+# `--group datafusion` when working on batchcorder-datafusion: it installs
+# the datafusion host its tests run against.
 uv sync --no-install-project --dev
 
 # For docs development, include docs group
@@ -39,8 +41,8 @@ uv sync --no-install-project --dev --group docs
 uv run maturin develop --uv
 
 # Build the separate batchcorder-datafusion wheel (slower: compiles
-# DataFusion).  Needed by its tests, which are skipped without it, and by
-# the pyright and stubtest pre-commit hooks, which fail without it.
+# DataFusion).  Needed by its tests and by the pyright-datafusion and
+# mypy-stubtest-datafusion pre-commit hooks, which fail without it.
 uv run maturin develop --uv -m crates/batchcorder-datafusion-py/Cargo.toml
 ```
 
@@ -61,12 +63,22 @@ permanent for this project.
 ### Run Tests
 
 ```bash
-# Run all tests
+# Run the batchcorder tests (tests/ and the README examples)
 uv run pytest
 
 # Run specific test files or modules
 uv run pytest tests/test_module.py
+
+# Run the batchcorder-datafusion tests (needs its wheel and the datafusion
+# group; see Setup Commands)
+uv run pytest crates/batchcorder-datafusion-py/tests
 ```
+
+CI runs each package's tests and lint only when a pull request touches that
+package, or code both share (`crates/batchcorder-core`,
+`crates/batchcorder-pyo3`, the lock files, the workspace configuration); see
+the `changes` job in `.github/workflows/ci.yaml`.  The `ci-ok` job sums up the
+result.
 
 ### Testing Guidelines
 
