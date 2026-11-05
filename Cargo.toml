@@ -13,19 +13,19 @@ path = "src/bin/stub_gen.rs"
 
 [dependencies]
 # Python bindings
-pyo3 = { version = "0.28", features = [
+pyo3 = { version = "0.29", features = [
   "extension-module",
   "abi3",
   "abi3-py310",
 ] }
-pyo3-stub-gen = { version = "0.19", default-features = false }
+pyo3-stub-gen = { version = "0.23", default-features = false }
 
 # Cache, readers and eviction (no PyO3)
 batchcorder-core = { path = "crates/batchcorder-core" }
 
 # Arrow types and the C Data / C Stream FFI used at the Python boundary
 arrow-array = { workspace = true, features = ["ffi"] }
-arrow-pyarrow = "58"
+arrow-pyarrow = "59"
 arrow-schema = { workspace = true }
 
 # The root package is the PyO3 extension that maturin builds; the pure-Rust
@@ -42,9 +42,9 @@ default-members = [
 ]
 
 [workspace.dependencies]
-arrow-array = "58"
-arrow-schema = "58"
-arrow-ipc = "58"
+arrow-array = "59"
+arrow-schema = "59"
+arrow-ipc = "59"
 
 # Full DWARF is not needed for the Python test loop. Line tables keep file and
 # line numbers for this crate in panics and backtraces; dependencies carry no

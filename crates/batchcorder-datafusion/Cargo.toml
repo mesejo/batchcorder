@@ -9,13 +9,13 @@ publish = false
 [dependencies]
 batchcorder-core = { path = "../batchcorder-core" }
 
-# Pinned to the DataFusion major whose Arrow major matches the workspace (58).
+# Pinned to the DataFusion major whose Arrow major matches the workspace (59).
 # Default features are off: the provider needs only the catalog and physical
 # plan APIs, not SQL, Parquet or the expression function libraries.
-datafusion = { version = "53", default-features = false }
+datafusion = { version = "55", default-features = false }
 async-trait = "0.1"
 
 [dev-dependencies]
 # SQL is only needed to drive the provider from tests.
-datafusion = { version = "53", default-features = false, features = ["sql"] }
+datafusion = { version = "55", default-features = false, features = ["sql"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
