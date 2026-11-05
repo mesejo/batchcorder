@@ -5,12 +5,13 @@
 use std::sync::Arc;
 
 use batchcorder_core::{Bounding, CacheConfig, StreamCache};
-use batchcorder_datafusion::{TeeStats, TeeTableProvider, sealed_provider};
+use batchcorder_datafusion::{TeeFanoutRule, TeeStats, TeeTableProvider, sealed_provider};
 use datafusion::arrow::array::{Int64Array, RecordBatch};
 use datafusion::arrow::compute::concat_batches;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::error::ArrowError;
 use datafusion::datasource::MemTable;
+use datafusion::execution::SessionStateBuilder;
 use datafusion::prelude::SessionContext;
 
 const N_BATCHES: i64 = 50;
@@ -44,10 +45,17 @@ fn upstream() -> Box<dyn batchcorder_core::Upstream> {
 
 /// A context with `t` backed by a fresh sealed tee, plus handles to inspect it.
 fn tee_ctx(config: CacheConfig) -> (SessionContext, StreamCache, Arc<TeeStats>) {
+    tee_ctx_in(SessionContext::new(), config)
+}
+
+/// Register `t` as a fresh sealed tee in `ctx`.
+fn tee_ctx_in(
+    ctx: SessionContext,
+    config: CacheConfig,
+) -> (SessionContext, StreamCache, Arc<TeeStats>) {
     let provider = sealed_provider(upstream(), schema(), config).expect("provider");
     let cache = provider.cache().clone();
     let stats = provider.stats();
-    let ctx = SessionContext::new();
     ctx.register_table("t", Arc::new(provider))
         .expect("register");
     (ctx, cache, stats)
@@ -264,4 +272,145 @@ async fn disk_tier_self_join() {
     assert_eq!(run(&ctx, sql).await.expect("query"), reference(sql).await);
     assert_eq!(stats.scans_planned(), 2);
     cache.close().expect("close");
+}
+
+// ── recursive queries and TeeFanoutRule ──────────────────────────────────────
+
+/// The tee scan sits in the recursive term, so it re-executes per iteration.
+const RECURSIVE_SCAN_SQL: &str = "with recursive r(n) as (select 0 as n union all \
+     select r.n + 1 from r join (select max(k) as m from t) s on r.n < s.m) \
+     select n from r order by n";
+
+const SELF_JOIN_SQL: &str =
+    "select a.k, count(*) as c from t a join t b on a.k = b.k group by a.k order by a.k";
+
+/// A context with [`TeeFanoutRule`] in the physical optimizer.
+fn rule_session() -> SessionContext {
+    let state = SessionStateBuilder::new()
+        .with_default_features()
+        .with_physical_optimizer_rule(Arc::new(TeeFanoutRule))
+        .build();
+    SessionContext::new_with_state(state)
+}
+
+/// Like [`tee_ctx`], with [`TeeFanoutRule`] in the physical optimizer.
+fn tee_ctx_with_rule() -> (SessionContext, StreamCache, Arc<TeeStats>) {
+    tee_ctx_in(rule_session(), CacheConfig::default())
+}
+
+fn assert_all_evicted(cache: &StreamCache) {
+    let ingested = cache.ingested_count().expect("ok");
+    assert!(ingested > 0, "nothing was read");
+    assert_eq!(cache.evicted_count().expect("ok"), ingested);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recursive_scan_without_rule_fails_clearly() {
+    let (ctx, _cache, _stats) = tee_ctx(CacheConfig::default());
+    let err = run(&ctx, RECURSIVE_SCAN_SQL)
+        .await
+        .expect_err("second iteration re-reads an evicted cache");
+    let msg = err.to_string();
+    assert!(msg.contains("TeeFanoutRule"), "unexpected error: {msg}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rule_makes_recursive_scan_rereadable() {
+    let (ctx, cache, stats) = tee_ctx_with_rule();
+    let got = run(&ctx, RECURSIVE_SCAN_SQL).await.expect("tee query");
+    assert_eq!(got, reference(RECURSIVE_SCAN_SQL).await);
+    assert_eq!(got.num_rows(), 7, "max(k) = 6, so n runs 0..=6");
+    // One planned scan, re-executed once per iteration that reaches it.
+    assert_eq!(stats.scans_planned(), 1);
+    assert!(stats.scans_executed() > 1, "{}", stats.scans_executed());
+    // The pin went with the plan, so the cache still evicted everything.
+    assert_all_evicted(&cache);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pin_holds_eviction_only_while_the_plan_lives() {
+    let (ctx, cache, _stats) = tee_ctx_with_rule();
+    let plan = ctx
+        .sql(RECURSIVE_SCAN_SQL)
+        .await
+        .expect("sql")
+        .create_physical_plan()
+        .await
+        .expect("plan");
+    // A pinned cache serves fresh from-start readers even after a full read.
+    let first = cache.reader(true).expect("reader");
+    assert_eq!(first.count(), N_BATCHES as usize);
+    assert_eq!(cache.evicted_count().expect("ok"), 0, "pinned");
+    assert!(cache.reader(true).is_ok(), "pinned cache can be re-read");
+    drop(plan);
+    assert_all_evicted(&cache);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn explain_of_recursive_query_does_not_unbound_the_cache() {
+    let (ctx, cache, _stats) = tee_ctx_with_rule();
+    ctx.sql(&format!("explain {RECURSIVE_SCAN_SQL}"))
+        .await
+        .expect("sql")
+        .collect()
+        .await
+        .expect("explain");
+    // A later, ordinary query on the same provider still evicts.
+    let got = run(&ctx, SELF_JOIN_SQL).await.expect("tee query");
+    assert_eq!(got, reference(SELF_JOIN_SQL).await);
+    assert_all_evicted(&cache);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_pin_releases_pins_already_taken() {
+    // `t` can be pinned; `u` allows a single reader, which its own scan
+    // takes, so pinning it fails and planning errors out.
+    let (ctx, t_cache, _stats) = tee_ctx_in(rule_session(), CacheConfig::default());
+    let u_cache = StreamCache::try_new(
+        upstream(),
+        schema(),
+        CacheConfig {
+            bounding: Bounding::Counted { max: 1 },
+            ..CacheConfig::default()
+        },
+    )
+    .expect("cache");
+    ctx.register_table("u", Arc::new(TeeTableProvider::new(u_cache)))
+        .expect("register");
+    let sql = "with recursive r(n) as (select 0 as n union all \
+               select r.n + 1 from r join (select max(t.k) as m from t join u on t.x = u.x) s \
+               on r.n < s.m) select n from r";
+    let err = run(&ctx, sql).await.expect_err("u cannot be pinned");
+    assert!(
+        err.to_string().contains("Register a new provider"),
+        "unexpected error: {err}"
+    );
+    // The failed plan was dropped with every pin it held: `t` still evicts.
+    let got = run(&ctx, SELF_JOIN_SQL).await.expect("tee query");
+    assert_eq!(got, reference(SELF_JOIN_SQL).await);
+    assert_all_evicted(&t_cache);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rule_leaves_scan_in_static_term_alone() {
+    let sql = "with recursive r(n) as (select min(x) as n from t union all \
+               select n + 1 from r where n < 5) select n from r order by n";
+    let (ctx, cache, stats) = tee_ctx_with_rule();
+    assert_eq!(
+        run(&ctx, sql).await.expect("tee query"),
+        reference(sql).await
+    );
+    assert_eq!(stats.scans_executed(), 1);
+    assert_all_evicted(&cache);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rule_leaves_non_recursive_query_alone() {
+    let (ctx, cache, stats) = tee_ctx_with_rule();
+    assert_eq!(
+        run(&ctx, SELF_JOIN_SQL).await.expect("tee query"),
+        reference(SELF_JOIN_SQL).await
+    );
+    assert_eq!(stats.scans_planned(), 2);
+    assert_all_evicted(&cache);
 }

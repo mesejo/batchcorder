@@ -21,10 +21,24 @@
 //! the same provider into a second query after the first one has started
 //! evicting fails with a clear error.  Register a fresh provider per query,
 //! or use [`Bounding::Unbounded`] when the table must be re-read.
+//!
+//! # Recursive queries
+//!
+//! A recursive CTE re-executes its recursive term on every iteration, so a
+//! scan inside it re-reads the stream after a sealed cache has evicted it.
+//! Hosts that link this crate directly can add [`TeeFanoutRule`] to the
+//! session's physical optimizer: it pins every tee scan inside a recursive
+//! term at the start of the stream, so nothing is evicted while that plan is
+//! alive.  Without it, such a query fails with a clear error instead.
 
+mod fanout;
+
+pub use fanout::TeeFanoutRule;
+
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use async_trait::async_trait;
 use batchcorder_core::{Bounding, StreamCache, StreamCacheReader};
@@ -121,7 +135,9 @@ fn reader_error(e: ArrowError, during: &str) -> DataFusionError {
             "TeeTableProvider cannot add a scan {during}: {msg}. A tee provider \
              serves the scans planned before its first execution; register a \
              new provider per query, or build the cache with Bounding::Unbounded \
-             for tables that are re-read (re-run plans, recursive CTEs)"
+             for tables that are re-read (re-run plans). For recursive CTEs, \
+             hosts that link batchcorder-datafusion can add TeeFanoutRule to \
+             the physical optimizer instead"
         )),
         other => DataFusionError::from(other),
     }
@@ -152,13 +168,16 @@ impl TableProvider for TeeTableProvider {
             .map_err(|e| reader_error(e, "while planning"))?;
         self.stats.scans_planned.fetch_add(1, Ordering::Relaxed);
         let schema = self.cache.schema();
-        let partition: Arc<dyn PartitionStream> = Arc::new(TeePartition {
+        let partition = Arc::new(TeePartition {
             schema: schema.clone(),
             cache: self.cache.clone(),
             reader: Mutex::new(Some(reader)),
+            pin: Mutex::new(None),
             stats: self.stats.clone(),
             runtime: self.runtime.clone(),
         });
+        register_partition(&partition);
+        let partition: Arc<dyn PartitionStream> = partition;
         let exec = StreamingTableExec::try_new(
             schema,
             vec![partition],
@@ -171,6 +190,40 @@ impl TableProvider for TeeTableProvider {
     }
 }
 
+/// Every live [`TeePartition`], so that [`TeeFanoutRule`] can recognise tee
+/// scans in a physical plan: DataFusion's [`PartitionStream`] cannot be
+/// downcast.  Holding a `Weak` keeps the allocation (and so its address)
+/// reserved, so a match by address is never a different, newer partition.
+/// Only touched at planning time.
+static PARTITIONS: Mutex<Vec<Weak<TeePartition>>> = Mutex::new(Vec::new());
+
+/// The registry, even after a panic elsewhere poisoned its lock: entries are
+/// only pushed and pruned, so the list is always valid.
+fn partitions() -> MutexGuard<'static, Vec<Weak<TeePartition>>> {
+    PARTITIONS.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn register_partition(partition: &Arc<TeePartition>) {
+    let mut live = partitions();
+    live.retain(|w| w.strong_count() > 0);
+    live.push(Arc::downgrade(partition));
+}
+
+/// Live tee partitions keyed by address, taken under one lock.  Dead entries
+/// are pruned on the way.
+fn live_partitions() -> HashMap<usize, Arc<TeePartition>> {
+    let mut live = partitions();
+    live.retain(|w| w.strong_count() > 0);
+    live.iter()
+        .filter_map(|w| Some((Weak::as_ptr(w).addr(), w.upgrade()?)))
+        .collect()
+}
+
+/// Key of `partition` in [`live_partitions`].
+fn partition_key(partition: &Arc<dyn PartitionStream>) -> usize {
+    Arc::as_ptr(partition).cast::<()>().addr()
+}
+
 /// One scan's replay of the cache.  Holds the reader reserved at planning
 /// time until the partition executes; dropping an unexecuted plan drops the
 /// reader and releases its hold on eviction.
@@ -178,6 +231,10 @@ struct TeePartition {
     schema: SchemaRef,
     cache: StreamCache,
     reader: Mutex<Option<StreamCacheReader>>,
+    /// Set by [`TeeFanoutRule`] when the plan re-executes this partition: an
+    /// unpolled from-start reader that keeps every batch replayable while the
+    /// plan is alive.  Dropped with the plan, which lets eviction resume.
+    pin: Mutex<Option<StreamCacheReader>>,
     stats: Arc<TeeStats>,
     runtime: Option<Handle>,
 }
@@ -191,6 +248,17 @@ impl fmt::Debug for TeePartition {
 }
 
 impl TeePartition {
+    /// Hold the cache at the start of the stream for as long as this
+    /// partition lives, so re-executions can read from the start.  Fails
+    /// once anything has been evicted.  Idempotent.
+    fn pin(&self) -> std::result::Result<(), ArrowError> {
+        let mut pin = self.pin.lock().unwrap_or_else(PoisonError::into_inner);
+        if pin.is_none() {
+            *pin = Some(self.cache.reader(true)?);
+        }
+        Ok(())
+    }
+
     /// The reader reserved at planning time, or a fresh from-start reader
     /// when this partition executes again (re-run plan, recursive CTE).  A
     /// fresh reader only succeeds while nothing has been evicted.
