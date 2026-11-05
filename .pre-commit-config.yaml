@@ -89,10 +89,23 @@ repos:
         pass_filenames: false
         types: [file, rust]
 
+      # batchcorder only; [tool.pyright] in pyproject.toml excludes the
+      # datafusion crate, which pyright-datafusion checks with its own config.
       - id: pyright
         name: pyright
         description: Static type-checking for Python code and stubs.
         entry: .venv/bin/pyright
+        language: system
+        pass_filenames: false
+        types_or: [python, pyi]
+
+      # Requires the batchcorder-datafusion extension and the datafusion
+      # group: uv sync --group datafusion, then
+      # maturin develop --uv -m crates/batchcorder-datafusion-py/Cargo.toml
+      - id: pyright-datafusion
+        name: pyright (batchcorder-datafusion)
+        description: Static type-checking for the batchcorder-datafusion wheel and its tests.
+        entry: .venv/bin/pyright -p crates/batchcorder-datafusion-py
         language: system
         pass_filenames: false
         types_or: [python, pyi]

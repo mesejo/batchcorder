@@ -53,8 +53,12 @@ dev = [
   "pytest-cov>=7.0.0",
   "coverage[toml]>=7.13.4",
   "sybil>=9.0",
-  "datafusion>=55,<56",
 ]
+# Host for the batchcorder-datafusion tests; not needed for batchcorder.
+# The FFI structs are only compatible within one DataFusion major, so this
+# must match the datafusion-ffi version in
+# crates/batchcorder-datafusion-py/Cargo.toml.
+datafusion = ["datafusion>=55,<56"]
 docs = [
   "jupyter>=1.1.1",
   "myst-parser>=5.0.0; python_version >= '3.11'",
@@ -110,13 +114,14 @@ extend-select = [
 [tool.ruff.lint.per-file-ignores]
 # D/DOC: docstring section structure is not enforced in tests.
 "tests/**" = ["D", "DOC"]
+"crates/*/tests/**" = ["D", "DOC"]
 "conftest.py" = ["D", "DOC"]
 # DOC502: the wrappers in __init__.py document exceptions raised inside the
 # Rust delegate, which pydoclint cannot see across the FFI boundary.
 "python/batchcorder/__init__.py" = ["DOC502"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["batchcorder"]
+known-first-party = ["batchcorder", "batchcorder_datafusion"]
 section-order = [
   "future",
   "standard-library",
@@ -125,6 +130,24 @@ section-order = [
   "local-folder",
 ]
 lines-after-imports = 2
+
+[tool.pytest.ini_options]
+# batchcorder only.  The batchcorder-datafusion tests live with their crate
+# and run separately: pytest crates/batchcorder-datafusion-py/tests
+testpaths = ["tests", "README.md"]
+
+[tool.pyright]
+# batchcorder only.  The batchcorder-datafusion wheel has its own config:
+# pyright -p crates/batchcorder-datafusion-py
+# Setting exclude replaces pyright's defaults, so they are repeated here.
+exclude = [
+  "**/node_modules",
+  "**/__pycache__",
+  "**/.*",
+  "drafts",
+  "target",
+  "crates/batchcorder-datafusion-py",
+]
 
 [tool.mypy]
 
