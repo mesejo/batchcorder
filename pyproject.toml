@@ -31,6 +31,8 @@ Repository = "https://github.com/mesejo/batchcorder"
 Documentation = "https://batchcorder.readthedocs.io"
 
 [tool.maturin]
+# The Rust crate lives in a member of the virtual Cargo workspace.
+manifest-path = "crates/batchcorder-py/Cargo.toml"
 python-source = "python"
 features = ["pyo3/extension-module"]
 module-name = "batchcorder._batchcorder"

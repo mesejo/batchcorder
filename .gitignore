@@ -85,7 +85,7 @@ docs/source/_autoapi/
 
 .envrc
 
-!src/bin
+!crates/batchcorder-py/src/bin
 
 site
 

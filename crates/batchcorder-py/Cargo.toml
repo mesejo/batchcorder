@@ -1,0 +1,33 @@
+[package]
+name = "batchcorder"
+version = "0.1.3"
+edition = "2024"
+description = "Python bindings for batchcorder (the batchcorder wheel)"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+name = "_batchcorder"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "stub_gen"
+path = "src/bin/stub_gen.rs"
+
+[dependencies]
+# Python bindings
+pyo3 = { workspace = true, features = ["extension-module"] }
+pyo3-stub-gen = { version = "0.23", default-features = false }
+
+# Cache, readers and eviction (no PyO3), and the PyO3 glue shared with the
+# batchcorder-datafusion extension (GIL handling, Python upstream)
+batchcorder-core = { path = "../batchcorder-core" }
+batchcorder-pyo3 = { path = "../batchcorder-pyo3" }
+
+# Arrow types and the C Data / C Stream FFI used at the Python boundary
+arrow-array = { workspace = true, features = ["ffi"] }
+arrow-pyarrow = { workspace = true }
+arrow-schema = { workspace = true }
+
+[lints]
+workspace = true

@@ -7,7 +7,9 @@ This repository contains batchcorder, a Rust-backed Python library for caching A
 The project consists of:
 
 - **Python API** (`python/`): Python interface and bindings
-- **Rust Core** (`src/`): Core implementation in Rust using PyO3 for Python bindings
+- **Rust bindings** (`crates/batchcorder-py/src/`): the `batchcorder` PyO3 extension
+- **Rust Core** (`crates/batchcorder-core/`): the cache itself, in pure Rust (no PyO3)
+- **DataFusion provider** (`crates/batchcorder-datafusion*/`): the separate `batchcorder-datafusion` wheel
 - **Tests** (`tests/`): Test suite for verifying functionality
 - **Documentation** (`docs/`): Project documentation
 
@@ -124,7 +126,13 @@ def process(x):
 ```
 batchcorder/
 ├── python/          # Python API and bindings
-├── src/             # Rust core implementation
+├── Cargo.toml       # Virtual Cargo workspace (shared configuration only)
+├── crates/
+│   ├── batchcorder-py/             # `batchcorder` PyO3 extension
+│   ├── batchcorder-core/           # Rust cache (no PyO3)
+│   ├── batchcorder-pyo3/           # PyO3 glue shared by both extensions
+│   ├── batchcorder-datafusion/     # DataFusion TableProvider (no PyO3)
+│   └── batchcorder-datafusion-py/  # `batchcorder-datafusion` wheel
 ├── tests/           # Test suite
 ├── docs/            # Documentation
 ├── CONTRIBUTING.md  # Contribution guidelines (this file)
@@ -254,14 +262,14 @@ docs/
 ### For Coding Agents
 
 - You are a Rust/Python developer working on the batchcorder project
-- Focus on the Rust core (`src/`) and Python bindings (`python/`)
+- Focus on the Rust crates (`crates/`) and Python bindings (`python/`)
 - Follow the existing architecture and patterns
 - Never modify files outside the project scope
 
 ### For Documentation Agents
 
 - You are a technical writer for the batchcorder project
-- Read code from `src/` and `python/` to understand functionality
+- Read code from `crates/` and `python/` to understand functionality
 - Write documentation in `docs/quarto/` using Quarto format
 - Follow the documentation guidelines above
 

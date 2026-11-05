@@ -23,7 +23,7 @@
 #               pre-commit hook) -> maturin develop, with no source change.
 #               Every step should be a no-op; on main each step recompiles
 #               pyo3 and everything above it.
-#   edit        append a one-line function to src/cached_dataset.rs, run
+#   edit        append a one-line function to crates/batchcorder-py/src/cached_dataset.rs, run
 #               `maturin develop`, remove it, run `maturin develop` again.
 #   sizes       size of the debug .so and of the debug target directory.
 set -euo pipefail
@@ -45,7 +45,7 @@ esac
 export UV_NO_SYNC=1
 
 cd "$(git rev-parse --show-toplevel)"
-src=src/cached_dataset.rs
+src=crates/batchcorder-py/src/cached_dataset.rs
 backup=$(mktemp)
 log=$(mktemp)
 cp "$src" "$backup"

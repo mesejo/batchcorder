@@ -19,10 +19,12 @@ fi
 echo "Step 1: Switching to upstream main..."
 git switch main && git pull
 
-# Step 2: Bump the version in Cargo.toml
+# Step 2: Bump the version in crates/batchcorder-py/Cargo.toml.  The root
+# Cargo.toml is a virtual workspace, so name the package explicitly.
 echo "Step 2: Bumping $bump_type version..."
-cargo set-version --bump "$bump_type"
-version_number=$(grep '^version' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+cargo set-version --package batchcorder --bump "$bump_type"
+# pkgid prints e.g. path+file:///.../crates/batchcorder-py#batchcorder@0.1.4
+version_number=$(cargo pkgid --package batchcorder | sed 's/.*[@#]//')
 echo "New version: $version_number"
 
 # Step 3: Create a release branch
