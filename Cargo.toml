@@ -29,11 +29,17 @@ arrow-pyarrow = "58"
 arrow-schema = { workspace = true }
 
 # The root package is the PyO3 extension that maturin builds; the pure-Rust
-# cache lives in crates/batchcorder-core.  Both are default members, so a bare
-# `cargo test` / `cargo clippy` at the root covers the core crate too.
+# cache lives in crates/batchcorder-core and the DataFusion table provider in
+# crates/batchcorder-datafusion.  All are default members, so a bare
+# `cargo test` / `cargo clippy` at the root covers them too.  The extension
+# does not depend on the DataFusion crate, so wheels do not pull DataFusion in.
 [workspace]
-members = [".", "crates/batchcorder-core"]
-default-members = [".", "crates/batchcorder-core"]
+members = [".", "crates/batchcorder-core", "crates/batchcorder-datafusion"]
+default-members = [
+  ".",
+  "crates/batchcorder-core",
+  "crates/batchcorder-datafusion",
+]
 
 [workspace.dependencies]
 arrow-array = "58"
