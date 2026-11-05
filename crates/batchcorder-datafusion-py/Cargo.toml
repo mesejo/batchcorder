@@ -28,6 +28,5 @@ datafusion-ffi = "55"
 datafusion-proto = { version = "55", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread"] }
 
-[lints.rust]
-# Py_GIL_DISABLED is a cfg set by pyo3's build script to indicate free-threaded Python.
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(Py_GIL_DISABLED)'] }
+[lints]
+workspace = true

@@ -13,6 +13,5 @@ arrow-array = { workspace = true, features = ["ffi"] }
 arrow-schema = { workspace = true }
 arrow-pyarrow = { workspace = true }
 
-[lints.rust]
-# Py_GIL_DISABLED is a cfg set by pyo3's build script to indicate free-threaded Python.
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(Py_GIL_DISABLED)'] }
+[lints]
+workspace = true

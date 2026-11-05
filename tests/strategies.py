@@ -3,7 +3,7 @@
 Each strategy models the valid input space for ``StreamCache`` construction —
 the source stream plus the storage/eviction parameters accepted by
 ``StreamCache.__init__`` (see ``python/batchcorder/__init__.py`` and the
-constructor in ``src/cached_dataset.rs``).
+constructor in ``crates/batchcorder-py/src/cached_dataset.rs``).
 
 The strategies stay strictly on the *happy path*: every value they produce is
 one the constructor is designed to accept without raising.  Error paths
@@ -19,7 +19,7 @@ from hypothesis import strategies as st
 
 # -- Atomic strategies ------------------------------------------------------
 
-# The two accepted write policies (src/cached_dataset.rs:982).  Both apply only
+# The two accepted write policies (crates/batchcorder-py/src/cached_dataset.rs:982).  Both apply only
 # to the disk tier; the constructor still accepts either for a memory-only
 # cache (where it is ignored).
 write_policies = st.sampled_from(["on_insertion", "on_eviction"])
@@ -29,7 +29,7 @@ write_policies = st.sampled_from(["on_insertion", "on_eviction"])
 # stay on the happy path.  256 MiB >> the few-MiB ceiling of `arrow_table`.
 LARGE_DISK_CAPACITY = 256 * 1024 * 1024
 
-# Disk hot-layer budget.  A *soft* eviction budget (src/cached_dataset.rs:395):
+# Disk hot-layer budget.  A *soft* eviction budget (crates/batchcorder-py/src/cached_dataset.rs:395):
 # the range spans from 1 byte (every batch evicted to disk immediately) up to
 # 64 MiB (the whole stream fits in the hot layer and nothing is ever evicted),
 # driving eviction across its full 0%..100% range.  ``None`` uses the
@@ -40,7 +40,7 @@ disk_hot_capacities = st.one_of(
 )
 
 # Memory-only tier capacity.  Unlike the disk hot layer this is a *hard cap*
-# (src/cached_dataset.rs:385): inserting a batch that would exceed it raises
+# (crates/batchcorder-py/src/cached_dataset.rs:385): inserting a batch that would exceed it raises
 # ``MemoryError`` rather than evicting.  So the valid happy-path range is only
 # values large enough to hold any table ``arrow_table`` can produce (well under
 # 1 MiB), plus ``None`` for the default.  64 MiB is a comfortable floor.
@@ -114,7 +114,7 @@ def table_and_chunksize(draw: st.DrawFn) -> tuple[pa.Table, int]:
 # Reader-count cap (``max_readers``).  Small counts keep interleaving schedules
 # tractable while covering the single-reader and several-reader regimes; the
 # constructor accepts any value >= 1 (``register_reader`` in
-# src/cached_dataset.rs enforces the cap, not the magnitude).
+# crates/batchcorder-py/src/cached_dataset.rs enforces the cap, not the magnitude).
 max_readers_counts = st.integers(min_value=1, max_value=5)
 
 # Every public operation that creates — and therefore counts against the cap —
