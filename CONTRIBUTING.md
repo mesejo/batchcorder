@@ -194,6 +194,13 @@ with the tag `<package>-v<version>` (for example `batchcorder-v0.2.0` or
 `batchcorder-datafusion-v55.0.1`). The tag selects the package that
 `ci-release.yaml` builds and uploads, and must match the crate version.
 
+Uploads use PyPI trusted publishing; the workflows hold no API token. Each
+PyPI project (`batchcorder`, `batchcorder-datafusion`) has a trusted publisher
+for this repository, `ci-release.yaml` and the `pypi` GitHub environment; the
+TestPyPI projects have one for `ci-pre-release.yaml` and the `testpypi`
+environment. The `pypi` environment only deploys from release tags, so run a
+manual `ci-release.yaml` dispatch against a tag, not a branch.
+
 Versioning rules:
 - The major version of `batchcorder-datafusion` is the DataFusion major it is
   built on. Moving to a new DataFusion major sets it explicitly
