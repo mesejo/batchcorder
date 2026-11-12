@@ -18,7 +18,9 @@ on:
   release:
     types: [published]
 
-# we do not want more than one release workflow executing at the same time, ever
+# One release at a time.  GitHub keeps only the newest pending run of a
+# group, so ci-pre-release uses its own group: a pre-release queued behind a
+# release awaiting approval must not cancel a pending release.
 concurrency:
   group: release
   # cancelling in the middle of a release would create incomplete releases
@@ -40,7 +42,9 @@ jobs:
         id: map
         env:
           EVENT: ${{ github.event_name }}
-          TAG: ${{ github.event.release.tag_name }}
+          # A dispatch on a tag checks out that tag; on a branch, TAG is empty
+          # and the script fails here, before the wheel matrix builds.
+          TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || (github.ref_type == 'tag' && github.ref_name || '') }}
           INPUT_PACKAGE: ${{ inputs.package }}
         run: bash scripts/release-package.sh "$EVENT" "$TAG" "$INPUT_PACKAGE" >> "$GITHUB_OUTPUT"
 
@@ -71,7 +75,7 @@ jobs:
       # Both PyPI projects trust this repository, ci-release.yaml and the
       # pypi environment; no API token is involved.
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086  # v1.14.3
         with:
           packages-dir: dist/
           skip-existing: true

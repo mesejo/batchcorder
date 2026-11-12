@@ -198,8 +198,11 @@ Uploads use PyPI trusted publishing; the workflows hold no API token. Each
 PyPI project (`batchcorder`, `batchcorder-datafusion`) has a trusted publisher
 for this repository, `ci-release.yaml` and the `pypi` GitHub environment; the
 TestPyPI projects have one for `ci-pre-release.yaml` and the `testpypi`
-environment. The `pypi` environment only deploys from release tags, so run a
-manual `ci-release.yaml` dispatch against a tag, not a branch.
+environment. The `pypi` environment only deploys from release tags, and a
+manual `ci-release.yaml` dispatch must run on a release tag whose package
+matches the one chosen; the `which` job checks both before any wheel builds.
+The `testpypi` environment deploys from `main` and `release-*` branches, so
+`ci-pre-release.yaml` can test a release branch before its PR merges.
 
 Versioning rules:
 - The major version of `batchcorder-datafusion` is the DataFusion major it is

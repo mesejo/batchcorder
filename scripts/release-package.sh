@@ -3,11 +3,14 @@
 #
 # Usage: release-package.sh <event> <tag> <input-package>
 #
-# A published release maps its tag to a package and checks that the tag's
-# version matches the crate version:
+# Maps a release tag to a package and checks that the tag's version matches
+# the crate version:
 #   batchcorder-vX.Y.Z             -> batchcorder
 #   batchcorder-datafusion-vX.Y.Z  -> batchcorder-datafusion
-# Any other event (workflow_dispatch) uses <input-package> as given.
+# <tag> is the published release's tag, or for a workflow_dispatch the tag the
+# run was dispatched on (empty when dispatched on a branch).  A dispatch must
+# run on a release tag, and <input-package> must be the package the tag names,
+# so a dispatch publishes exactly what a release of that tag would.
 set -euo pipefail
 
 event="$1"
@@ -23,10 +26,9 @@ crate_of() {
     esac
 }
 
-if [ "$event" != "release" ]; then
-    crate_of "$input_package" > /dev/null
-    echo "package=$input_package"
-    exit 0
+if [ "$event" != "release" ] && [ -z "$tag" ]; then
+    echo "Dispatch ci-release.yaml on a release tag, not a branch" >&2
+    exit 1
 fi
 
 # The longer prefix first: batchcorder-v* does not match
@@ -40,6 +42,12 @@ case "$tag" in
         exit 1
         ;;
 esac
+
+if [ "$event" != "release" ] && [ "$input_package" != "$package" ]; then
+    echo "Tag '$tag' releases $package, but the dispatch asked for" \
+        "'$input_package'" >&2
+    exit 1
+fi
 
 tag_version="${tag#"$package"-v}"
 crate=$(crate_of "$package")

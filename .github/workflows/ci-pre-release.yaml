@@ -13,9 +13,11 @@ on:
           - batchcorder
           - batchcorder-datafusion
 
-# we do not want more than one release workflow executing at the same time, ever
+# One pre-release at a time, in a group apart from ci-release: GitHub keeps
+# only the newest pending run of a group, so sharing one would let a
+# pre-release cancel a pending release.
 concurrency:
-  group: release
+  group: pre-release
   # cancelling in the middle of a release would create incomplete releases
   # so cancel-in-progress is false
   cancel-in-progress: false
@@ -48,7 +50,7 @@ jobs:
       # Both TestPyPI projects trust this repository, ci-pre-release.yaml and
       # the testpypi environment; no API token is involved.
       - name: Publish to TestPyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086  # v1.14.3
         with:
           repository-url: https://test.pypi.org/legacy/
           packages-dir: dist/
