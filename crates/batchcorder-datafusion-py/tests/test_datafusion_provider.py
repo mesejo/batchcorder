@@ -272,17 +272,53 @@ def _session_from(module: str) -> object:
     return type("SessionContext", (), {"__module__": module})()
 
 
+# Versions are built from SUPPORTED_HOSTS, so moving a host to a new range
+# (a new DataFusion major) needs no change here.
+
+
+def _bounds(dist: str) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    return _hosts.SUPPORTED_HOSTS[dist]
+
+
+def _inside(dist: str, *tail: int, suffix: str = "") -> str:
+    # A supported version: the lower bound, extended by `tail` and `suffix`
+    # (datafusion: 55 -> "55.9.1"; xorq-datafusion: 0.3 -> "0.3.12rc1").
+    low, _ = _bounds(dist)
+    return _hosts._format(low + tail) + suffix
+
+
+def _above(dist: str) -> str:
+    # The (exclusive) upper bound: the first unsupported version.
+    _, high = _bounds(dist)
+    return _hosts._format(high)
+
+
+def _below(dist: str) -> str:
+    # The last version before the lower bound: 55 -> 54.99, 0.3 -> 0.2.99.
+    low, _ = _bounds(dist)
+    last = max(i for i, part in enumerate(low) if part > 0)
+    return _hosts._format((*low[:last], low[last] - 1, 99))
+
+
+def _needs(dist: str) -> str:
+    low, high = _bounds(dist)
+    return re.escape(f"{dist}>={_hosts._format(low)},<{_hosts._format(high)}")
+
+
 @pytest.mark.parametrize(
     ("module", "installed"),
     [
-        ("datafusion", {"datafusion": "55.0.0"}),
-        ("datafusion.context", {"datafusion": "55.9.1"}),
-        ("xorq_datafusion", {"xorq-datafusion": "0.3.0"}),
-        ("xorq_datafusion._internal", {"xorq-datafusion": "0.3.12rc1"}),
+        ("datafusion", {"datafusion": _inside("datafusion", 0, 0)}),
+        ("datafusion.context", {"datafusion": _inside("datafusion", 9, 1)}),
+        ("xorq_datafusion", {"xorq-datafusion": _inside("xorq-datafusion", 0)}),
+        (
+            "xorq_datafusion._internal",
+            {"xorq-datafusion": _inside("xorq-datafusion", 12, suffix="rc1")},
+        ),
         # Host identified but not installed as a distribution: nothing to check.
         ("datafusion", {}),
         # Unknown host: left to the datafusion-ffi version check.
-        ("some_other_host", {"datafusion": "56.0.0"}),
+        ("some_other_host", {"datafusion": _above("datafusion")}),
     ],
 )
 def test_check_host_accepts(module, installed):
@@ -290,29 +326,18 @@ def test_check_host_accepts(module, installed):
 
 
 @pytest.mark.parametrize(
-    ("module", "installed", "match"),
+    ("module", "dist", "installed"),
     [
-        (
-            "datafusion",
-            {"datafusion": "56.0.0"},
-            r"datafusion 56\.0\.0.*datafusion>=55,<56",
-        ),
-        (
-            "datafusion",
-            {"datafusion": "54.1.0"},
-            r"datafusion 54\.1\.0.*datafusion>=55,<56",
-        ),
-        # 0.2.x is the DataFusion 53 line.
-        (
-            "xorq_datafusion",
-            {"xorq-datafusion": "0.2.11"},
-            r"xorq-datafusion 0\.2\.11.*xorq-datafusion>=0\.3,<0\.4",
-        ),
+        ("datafusion", "datafusion", _above("datafusion")),
+        ("datafusion", "datafusion", _below("datafusion")),
+        ("xorq_datafusion", "xorq-datafusion", _below("xorq-datafusion")),
+        ("xorq_datafusion", "xorq-datafusion", _above("xorq-datafusion")),
     ],
 )
-def test_check_host_rejects(module, installed, match):
+def test_check_host_rejects(module, dist, installed):
+    match = f"{re.escape(f'{dist} {installed}')}.*{_needs(dist)}"
     with pytest.raises(RuntimeError, match=match):
-        _hosts.check_host(_session_from(module), _fake_versions(installed))
+        _hosts.check_host(_session_from(module), _fake_versions({dist: installed}))
 
 
 def _native_host_session(monkeypatch, package: str) -> object:
@@ -325,44 +350,40 @@ def _native_host_session(monkeypatch, package: str) -> object:
     return cls()
 
 
-def _xorq_versions() -> tuple[str, str, str]:
-    # Versions from the table, so a range bump needs no test change: the
-    # lower bound is supported, the (exclusive) upper bound is not.
-    low, high = _hosts.SUPPORTED_HOSTS["xorq-datafusion"]
-    inside, outside = _hosts._format(low), _hosts._format(high)
-    return inside, outside, re.escape(f"xorq-datafusion>={inside},<{outside}")
-
-
 def test_check_host_identifies_host_by_exported_class(monkeypatch):
-    inside, outside, needs = _xorq_versions()
+    dist = "xorq-datafusion"
     session = _native_host_session(monkeypatch, "xorq_datafusion")
-    _hosts.check_host(session, _fake_versions({"xorq-datafusion": inside}))
-    with pytest.raises(RuntimeError, match=needs):
-        _hosts.check_host(session, _fake_versions({"xorq-datafusion": outside}))
+    _hosts.check_host(session, _fake_versions({dist: _inside(dist)}))
+    with pytest.raises(RuntimeError, match=_needs(dist)):
+        _hosts.check_host(session, _fake_versions({dist: _above(dist)}))
 
 
 def test_check_host_ignores_class_no_host_exports(monkeypatch):
     # The same native class, exported by a package that is not a known host:
     # even an unsupported xorq-datafusion is not checked against it.
-    _, outside, _ = _xorq_versions()
     session = _native_host_session(monkeypatch, "some_other_host")
-    _hosts.check_host(session, _fake_versions({"xorq-datafusion": outside}))
+    _hosts.check_host(
+        session, _fake_versions({"xorq-datafusion": _above("xorq-datafusion")})
+    )
 
 
 def test_check_host_ignores_codec_capsule():
     # A codec capsule does not say which host it came from.
     capsule = SessionContext().__datafusion_logical_extension_codec__()
-    _hosts.check_host(capsule, _fake_versions({"datafusion": "56.0.0"}))
+    _hosts.check_host(capsule, _fake_versions({"datafusion": _above("datafusion")}))
 
 
 def test_register_with_mismatched_host_raises(monkeypatch):
-    # The installed datafusion (55.x) against a table that expects 56: the
-    # real registration path must fail with the guard's error.
+    # The installed datafusion (inside its range) against a table that
+    # expects the next major: the real registration path must fail with the
+    # guard's error.
+    _, high = _bounds("datafusion")
+    next_range = (high, (*high[:-1], high[-1] + 1))
     monkeypatch.setattr(
         _hosts,
         "SUPPORTED_HOSTS",
-        {**_hosts.SUPPORTED_HOSTS, "datafusion": ((56,), (57,))},
+        {**_hosts.SUPPORTED_HOSTS, "datafusion": next_range},
     )
     ctx = SessionContext()
-    with pytest.raises(RuntimeError, match=r"needs datafusion>=56,<57"):
+    with pytest.raises(RuntimeError, match=f"needs {_needs('datafusion')}"):
         ctx.register_table("t", _provider())
