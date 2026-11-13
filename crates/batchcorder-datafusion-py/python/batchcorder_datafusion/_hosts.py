@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import sys
 from importlib.metadata import PackageNotFoundError, version
 from typing import TYPE_CHECKING
 
@@ -22,7 +23,9 @@ SUPPORTED_HOSTS: dict[str, tuple[tuple[int, ...], tuple[int, ...]]] = {
     "xorq-datafusion": ((0, 3), (0, 4)),
 }
 
-# Top-level Python package of each host's session class -> its distribution.
+# Top-level Python package of each host -> its distribution.  A session class
+# belongs to a host when its module is in the package, or when the package
+# exports it (see `_host_distribution`).
 HOST_PACKAGES: dict[str, str] = {
     "datafusion": "datafusion",
     "xorq_datafusion": "xorq-datafusion",
@@ -56,6 +59,66 @@ def _format(release: tuple[int, ...]) -> str:
     return ".".join(map(str, release))
 
 
+def _exports(package: str, cls: type) -> bool:
+    """
+    Tell whether ``package`` or one of its imported submodules exports ``cls``.
+
+    Parameters
+    ----------
+    package
+        A host's top-level Python package.
+    cls
+        The class of the session the host passed.
+
+    Returns
+    -------
+    bool
+        ``True`` if an imported module of ``package`` has ``cls`` as an
+        attribute.
+
+    """
+    prefix = package + "."
+    # Only modules already imported: the host imported its own package to
+    # build the session, and importing one here could have side effects.
+    for name, module in list(sys.modules.items()):
+        if module is None or not (name == package or name.startswith(prefix)):
+            continue
+        if any(value is cls for value in vars(module).values()):
+            return True
+    return False
+
+
+def _host_distribution(session: object) -> str | None:
+    """
+    Return the distribution of the host that ``session`` belongs to.
+
+    Parameters
+    ----------
+    session
+        The ``session`` argument the host passed to
+        ``__datafusion_table_provider__``.
+
+    Returns
+    -------
+    str | None
+        The host's distribution, or ``None`` for an unknown host.
+
+    """
+    cls = type(session)
+    dist = HOST_PACKAGES.get(cls.__module__.partition(".")[0])
+    if dist is not None or cls.__module__ in sys.modules:
+        return dist
+    # A native (PyO3) class reports the module name given at build time,
+    # which need not be a real module: xorq-datafusion's SessionContext says
+    # `let`.  Find the host package that exports the class itself.  A class
+    # from a real module (a capsule is `builtins.PyCapsule`, which hosts
+    # re-export) is never looked up this way.
+    for package, dist in HOST_PACKAGES.items():
+        if _exports(package, cls):
+            return dist
+    return None
+
+
 def check_host(
     session: object,
     get_version: Callable[[str], str] = version,
@@ -65,9 +128,10 @@ def check_host(
 
     Called by ``TeeTableProvider.__datafusion_table_provider__`` before any
     FFI struct of the host is touched.  The host is identified by the package
-    of the session's class.  A codec capsule, or a session from an unknown
-    host, cannot be identified here; the provider then checks the
-    datafusion-ffi version of the host's codec instead.
+    of the session's class, or by the host package that exports that class.
+    A codec capsule, or a session from an unknown host, cannot be identified
+    here; the provider then checks the datafusion-ffi version of the host's
+    codec instead.
 
     Parameters
     ----------
@@ -85,8 +149,7 @@ def check_host(
         If the host's installed version is outside its supported range.
 
     """
-    package = type(session).__module__.partition(".")[0]
-    dist = HOST_PACKAGES.get(package)
+    dist = _host_distribution(session)
     if dist is None:
         return
     try:
