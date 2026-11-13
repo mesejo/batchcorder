@@ -8,6 +8,7 @@ dependency group (``uv sync --group datafusion``).
 import gc
 import subprocess
 import sys
+import types
 from importlib.metadata import PackageNotFoundError
 
 import pyarrow as pa
@@ -311,6 +312,29 @@ def test_check_host_accepts(module, installed):
 def test_check_host_rejects(module, installed, match):
     with pytest.raises(RuntimeError, match=match):
         _hosts.check_host(_session_from(module), _fake_versions(installed))
+
+
+def _native_host_session(monkeypatch, package: str) -> object:
+    # Like xorq-datafusion's SessionContext: a native class whose module name
+    # (`let`) is not its package's, exported by the (fake) host package.
+    cls = type("SessionContext", (), {"__module__": "let"})
+    host = types.ModuleType(package)
+    host.SessionContext = cls  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, package, host)
+    return cls()
+
+
+def test_check_host_identifies_host_by_exported_class(monkeypatch):
+    session = _native_host_session(monkeypatch, "xorq_datafusion")
+    _hosts.check_host(session, _fake_versions({"xorq-datafusion": "0.3.0"}))
+    with pytest.raises(RuntimeError, match=r"xorq-datafusion>=0\.3,<0\.4"):
+        _hosts.check_host(session, _fake_versions({"xorq-datafusion": "0.4.0"}))
+
+
+def test_check_host_ignores_class_no_host_exports(monkeypatch):
+    # The same native class, exported by a package that is not a known host.
+    session = _native_host_session(monkeypatch, "some_other_host")
+    _hosts.check_host(session, _fake_versions({"xorq-datafusion": "0.4.0"}))
 
 
 def test_check_host_ignores_codec_capsule():
