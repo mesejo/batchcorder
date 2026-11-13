@@ -6,6 +6,7 @@ dependency group (``uv sync --group datafusion``).
 """
 
 import gc
+import re
 import subprocess
 import sys
 import types
@@ -324,17 +325,28 @@ def _native_host_session(monkeypatch, package: str) -> object:
     return cls()
 
 
+def _xorq_versions() -> tuple[str, str, str]:
+    # Versions from the table, so a range bump needs no test change: the
+    # lower bound is supported, the (exclusive) upper bound is not.
+    low, high = _hosts.SUPPORTED_HOSTS["xorq-datafusion"]
+    inside, outside = _hosts._format(low), _hosts._format(high)
+    return inside, outside, re.escape(f"xorq-datafusion>={inside},<{outside}")
+
+
 def test_check_host_identifies_host_by_exported_class(monkeypatch):
+    inside, outside, needs = _xorq_versions()
     session = _native_host_session(monkeypatch, "xorq_datafusion")
-    _hosts.check_host(session, _fake_versions({"xorq-datafusion": "0.3.0"}))
-    with pytest.raises(RuntimeError, match=r"xorq-datafusion>=0\.3,<0\.4"):
-        _hosts.check_host(session, _fake_versions({"xorq-datafusion": "0.4.0"}))
+    _hosts.check_host(session, _fake_versions({"xorq-datafusion": inside}))
+    with pytest.raises(RuntimeError, match=needs):
+        _hosts.check_host(session, _fake_versions({"xorq-datafusion": outside}))
 
 
 def test_check_host_ignores_class_no_host_exports(monkeypatch):
-    # The same native class, exported by a package that is not a known host.
+    # The same native class, exported by a package that is not a known host:
+    # even an unsupported xorq-datafusion is not checked against it.
+    _, outside, _ = _xorq_versions()
     session = _native_host_session(monkeypatch, "some_other_host")
-    _hosts.check_host(session, _fake_versions({"xorq-datafusion": "0.4.0"}))
+    _hosts.check_host(session, _fake_versions({"xorq-datafusion": outside}))
 
 
 def test_check_host_ignores_codec_capsule():
