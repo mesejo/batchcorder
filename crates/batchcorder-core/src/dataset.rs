@@ -22,6 +22,7 @@
 //! 3. **Evicted batches are dropped outside locks.**  See
 //!    [`crate::tier::ReleasedBatches`].
 
+use std::fmt::Debug;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -32,6 +33,7 @@ use arrow_schema::{ArrowError, SchemaRef};
 
 use crate::tier::{CacheTier, ReleasedBatches, WritePolicy, other_arrow_err, poisoned_lock_err};
 use crate::{Upstream, WaitHook};
+use std::fmt;
 
 // ── bounding ─────────────────────────────────────────────────────────────────
 
@@ -471,6 +473,30 @@ impl StreamCache {
     }
 }
 
+impl fmt::Debug for StreamCache {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> std::fmt::Result {
+        let (guard, poisoned) = match self.shared.state.lock() {
+            Ok(guard) => (guard, false),
+            Err(e) => (e.into_inner(), true),
+        };
+
+        let bounding = guard.bounding;
+        let ingested_count = guard.ingested_count;
+        let upstream_exhausted = guard.upstream_exhausted;
+        drop(guard);
+
+        let mut debug = f.debug_struct("StreamCache");
+        debug
+            .field("bounding", &bounding)
+            .field("ingested_count", &ingested_count)
+            .field("upstream_exhausted", &upstream_exhausted);
+        if poisoned {
+            debug.field("poisoned", &true);
+        }
+        debug.finish_non_exhaustive()
+    }
+}
+
 // ── StreamCacheReader ──────────────────────────────────────────────────────
 
 /// An independent replay cursor over a [`StreamCache`].
@@ -821,8 +847,7 @@ mod tests {
         };
         let upstream: Vec<Result<RecordBatch, ArrowError>> = Vec::new();
         let err = StreamCache::try_new(Box::new(upstream.into_iter()), schema(), config)
-            .err()
-            .expect("rejected");
+            .expect_err("rejected");
         assert!(matches!(err, ArrowError::InvalidArgumentError(_)));
     }
 
@@ -1314,5 +1339,50 @@ mod tests {
         }
         assert_eq!(pulls.load(Ordering::SeqCst), N as usize + 1);
         assert_eq!(evicted_up_to(&cache), N as u64);
+    }
+
+    fn debug_test_cache() -> StreamCache {
+        let upstream: Vec<Result<RecordBatch, ArrowError>> = vec![
+            Ok(make_batch(&[0])),
+            Ok(make_batch(&[1])),
+            Ok(make_batch(&[2])),
+        ];
+        let config = CacheConfig {
+            bounding: Bounding::Sealed,
+            ..CacheConfig::default()
+        };
+        let cache =
+            StreamCache::try_new(Box::new(upstream.into_iter()), schema(), config).expect("cache");
+        cache.ingest_all().expect("ingest");
+        cache
+    }
+
+    #[test]
+    fn debug_shows_bounding_count_and_exhaustion() {
+        let s = format!("{:?}", debug_test_cache());
+        assert!(s.starts_with("StreamCache {"), "{s}");
+        assert!(s.contains("bounding: Sealed"), "{s}");
+        assert!(s.contains("ingested_count: 3"), "{s}");
+        assert!(s.contains("upstream_exhausted: true"), "{s}");
+        assert!(!s.contains("poisoned"), "{s}");
+        assert!(s.ends_with(", .. }"), "{s}");
+    }
+
+    #[test]
+    fn debug_reports_poisoned_lock_without_panicking() {
+        let cache = debug_test_cache();
+        let shared = cache.shared.clone();
+        let poisoner = thread::spawn(move || {
+            let _guard = shared.state.lock();
+            panic!("poison the cache lock");
+        });
+        assert!(poisoner.join().is_err());
+        assert!(cache.shared.state.is_poisoned());
+
+        let s = format!("{cache:?}");
+        assert!(s.contains("poisoned: true"), "{s}");
+        // The real state, not made-up defaults.
+        assert!(s.contains("ingested_count: 3"), "{s}");
+        assert!(s.contains("upstream_exhausted: true"), "{s}");
     }
 }
