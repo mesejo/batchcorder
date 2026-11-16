@@ -22,7 +22,7 @@
 //! 3. **Evicted batches are dropped outside locks.**  See
 //!    [`crate::tier::ReleasedBatches`].
 
-use std::fmt::Debug;
+use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -33,7 +33,6 @@ use arrow_schema::{ArrowError, SchemaRef};
 
 use crate::tier::{CacheTier, ReleasedBatches, WritePolicy, other_arrow_err, poisoned_lock_err};
 use crate::{Upstream, WaitHook};
-use std::fmt;
 
 // ── bounding ─────────────────────────────────────────────────────────────────
 
@@ -474,7 +473,7 @@ impl StreamCache {
 }
 
 impl fmt::Debug for StreamCache {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let (guard, poisoned) = match self.shared.state.lock() {
             Ok(guard) => (guard, false),
             Err(e) => (e.into_inner(), true),
