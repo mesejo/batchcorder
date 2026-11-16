@@ -486,21 +486,20 @@ impl fmt::Debug for StreamCache {
         let upstream_exhausted = guard.upstream_exhausted;
         let upstream_panicked = guard.upstream_panicked;
         let closed = guard.closed;
+        // Unlock before writing: the formatter may block on I/O.
         drop(guard);
 
-        let mut debug = f.debug_struct("StreamCache");
-        debug
+        f.debug_struct("StreamCache")
+            .field("schema", &self.schema)
             .field("bounding", &bounding)
             .field("sealed", &sealed)
             .field("ingested_count", &ingested_count)
             .field("evicted_count", &evicted_count)
             .field("upstream_exhausted", &upstream_exhausted)
             .field("upstream_panicked", &upstream_panicked)
-            .field("closed", &closed);
-        if poisoned {
-            debug.field("poisoned", &true);
-        }
-        debug.finish_non_exhaustive()
+            .field("closed", &closed)
+            .field("poisoned", &poisoned)
+            .finish_non_exhaustive()
     }
 }
 
@@ -1363,12 +1362,13 @@ mod tests {
     fn debug_shows_bounding_count_and_exhaustion() {
         let s = format!("{:?}", debug_test_cache());
         assert!(s.starts_with("StreamCache {"), "{s}");
+        assert!(s.contains("schema: Schema"), "{s}");
         assert!(s.contains("bounding: Sealed"), "{s}");
         // Ingesting does not seal; only a reader's first poll (or seal()) does.
         assert!(s.contains("sealed: false"), "{s}");
         assert!(s.contains("ingested_count: 3"), "{s}");
         assert!(s.contains("upstream_exhausted: true"), "{s}");
-        assert!(!s.contains("poisoned"), "{s}");
+        assert!(s.contains("poisoned: false"), "{s}");
         assert!(s.ends_with(", .. }"), "{s}");
     }
 
