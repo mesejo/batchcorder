@@ -26,7 +26,7 @@ use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, TryLockError, Weak};
 
 use arrow_array::RecordBatch;
 use arrow_schema::{ArrowError, SchemaRef};
@@ -474,9 +474,24 @@ impl StreamCache {
 
 impl fmt::Debug for StreamCache {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let (guard, poisoned) = match self.shared.state.lock() {
+        // One lock for every field, so they all describe the same instant.
+        // `try_lock`, not `lock`: the mutex is not reentrant, so formatting a
+        // cache from code that already holds it would deadlock.  Like std's
+        // and parking_lot's `Mutex` Debug, make one attempt and print
+        // `<locked>` if it fails.  Other readers take the lock on every poll,
+        // so under load that can happen even though no one holds it for long.
+        let (guard, poisoned) = match self.shared.state.try_lock() {
             Ok(guard) => (guard, false),
-            Err(e) => (e.into_inner(), true),
+            Err(TryLockError::Poisoned(e)) => (e.into_inner(), true),
+            Err(TryLockError::WouldBlock) => {
+                return f
+                    .debug_struct("StreamCache")
+                    .field("schema", &self.schema)
+                    .field("state", &format_args!("<locked>"))
+                    // Readable without the lock.
+                    .field("poisoned", &self.shared.state.is_poisoned())
+                    .finish_non_exhaustive();
+            }
         };
 
         let bounding = guard.bounding;
@@ -1400,5 +1415,20 @@ mod tests {
         assert!(s.contains("evicted_count: 3"), "{s}");
         assert!(s.contains("sealed: true"), "{s}");
         assert!(s.contains("closed: true"), "{s}");
+    }
+
+    #[test]
+    fn debug_does_not_deadlock_while_lock_is_held() {
+        let cache = debug_test_cache();
+        let _guard = cache.shared.lock().expect("lock");
+        // Format on another thread so a regression to `lock()` fails at the
+        // timeout instead of hanging the test run.
+        let c = cache.clone();
+        let s = spawn(move || format!("{c:?}"))
+            .recv_timeout(TIMEOUT)
+            .expect("Debug blocked on the held lock");
+        assert!(s.contains("state: <locked>"), "{s}");
+        assert!(!s.contains("ingested_count"), "{s}");
+        assert!(s.contains("poisoned: false"), "{s}");
     }
 }
