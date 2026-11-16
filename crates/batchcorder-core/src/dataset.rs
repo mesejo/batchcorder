@@ -1340,18 +1340,9 @@ mod tests {
         assert_eq!(evicted_up_to(&cache), N as u64);
     }
 
+    /// A Sealed cache over `[0], [1], [2]`, fully ingested.
     fn debug_test_cache() -> StreamCache {
-        let upstream: Vec<Result<RecordBatch, ArrowError>> = vec![
-            Ok(make_batch(&[0])),
-            Ok(make_batch(&[1])),
-            Ok(make_batch(&[2])),
-        ];
-        let config = CacheConfig {
-            bounding: Bounding::Sealed,
-            ..CacheConfig::default()
-        };
-        let cache =
-            StreamCache::try_new(Box::new(upstream.into_iter()), schema(), config).expect("cache");
+        let cache = sealed_cache(3);
         cache.ingest_all().expect("ingest");
         cache
     }
