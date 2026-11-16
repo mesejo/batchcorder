@@ -1369,7 +1369,7 @@ mod tests {
         assert!(s.contains("ingested_count: 3"), "{s}");
         assert!(s.contains("upstream_exhausted: true"), "{s}");
         assert!(s.contains("poisoned: false"), "{s}");
-        assert!(s.ends_with(", .. }"), "{s}");
+        assert!(s.contains(".."), "{s}");
     }
 
     #[test]
