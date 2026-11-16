@@ -480,15 +480,23 @@ impl fmt::Debug for StreamCache {
         };
 
         let bounding = guard.bounding;
+        let sealed = guard.sealed;
         let ingested_count = guard.ingested_count;
+        let evicted_count = guard.evicted_up_to;
         let upstream_exhausted = guard.upstream_exhausted;
+        let upstream_panicked = guard.upstream_panicked;
+        let closed = guard.closed;
         drop(guard);
 
         let mut debug = f.debug_struct("StreamCache");
         debug
             .field("bounding", &bounding)
+            .field("sealed", &sealed)
             .field("ingested_count", &ingested_count)
-            .field("upstream_exhausted", &upstream_exhausted);
+            .field("evicted_count", &evicted_count)
+            .field("upstream_exhausted", &upstream_exhausted)
+            .field("upstream_panicked", &upstream_panicked)
+            .field("closed", &closed);
         if poisoned {
             debug.field("poisoned", &true);
         }
@@ -1081,6 +1089,10 @@ mod tests {
         let err = b.next().expect("some").expect_err("still failing");
         assert!(err.to_string().contains("panicked"));
         assert_eq!(g.pulls.load(Ordering::SeqCst), 1);
+        // A dead upstream must not look like a live one with more to come.
+        let s = format!("{:?}", g.cache);
+        assert!(s.contains("upstream_panicked: true"), "{s}");
+        assert!(s.contains("upstream_exhausted: false"), "{s}");
     }
 
     static HOOK_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -1352,6 +1364,8 @@ mod tests {
         let s = format!("{:?}", debug_test_cache());
         assert!(s.starts_with("StreamCache {"), "{s}");
         assert!(s.contains("bounding: Sealed"), "{s}");
+        // Ingesting does not seal; only a reader's first poll (or seal()) does.
+        assert!(s.contains("sealed: false"), "{s}");
         assert!(s.contains("ingested_count: 3"), "{s}");
         assert!(s.contains("upstream_exhausted: true"), "{s}");
         assert!(!s.contains("poisoned"), "{s}");
@@ -1374,5 +1388,17 @@ mod tests {
         // The real state, not made-up defaults.
         assert!(s.contains("ingested_count: 3"), "{s}");
         assert!(s.contains("upstream_exhausted: true"), "{s}");
+    }
+
+    #[test]
+    fn debug_shows_eviction_and_close() {
+        let cache = sealed_cache(3);
+        assert_eq!(collect(cache.reader(true).expect("reader")), expected(3));
+        assert_eq!(evicted_up_to(&cache), 3);
+        cache.close().expect("close");
+        let s = format!("{cache:?}");
+        assert!(s.contains("evicted_count: 3"), "{s}");
+        assert!(s.contains("sealed: true"), "{s}");
+        assert!(s.contains("closed: true"), "{s}");
     }
 }
