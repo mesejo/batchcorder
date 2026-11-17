@@ -23,6 +23,7 @@
 //!    [`crate::tier::ReleasedBatches`].
 
 use std::fmt;
+use std::num::NonZeroU64;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -91,10 +92,12 @@ impl FromStr for Bounding {
             "sealed" => Ok(Self::Sealed),
             _ => {
                 if let Some(n) = s.strip_prefix("counted:") {
+                    // `Counted { max: 0 }` would fail later at construction;
+                    // reject it here so every parsed value is usable.
                     let max = n
-                        .parse::<u64>()
+                        .parse::<NonZeroU64>()
                         .map_err(|_| ParseBoundingError(s.to_owned()))?;
-                    Ok(Self::Counted { max })
+                    Ok(Self::Counted { max: max.get() })
                 } else {
                     Err(ParseBoundingError(s.to_owned()))
                 }
@@ -1511,6 +1514,8 @@ mod tests {
             "counted",
             "counted:",
             "counted:x",
+            "counted:0",
+            "counted:-1",
             "countedXYZ:3",
             "Sealed",
         ] {
