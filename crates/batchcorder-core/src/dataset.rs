@@ -1522,4 +1522,20 @@ mod tests {
             assert!(bad.parse::<Bounding>().is_err(), "{bad:?} parsed");
         }
     }
+
+    #[test]
+    fn bounding_round_trips() {
+        for b in [
+            Bounding::Unbounded,
+            Bounding::Sealed,
+            Bounding::Counted { max: 1 },
+            Bounding::Counted { max: u64::MAX },
+        ] {
+            // Exhaustiveness guard: a new variant fails to compile here until listed above.
+            match b {
+                Bounding::Unbounded | Bounding::Sealed | Bounding::Counted { .. } => {}
+            }
+            assert_eq!(b.to_string().parse::<Bounding>(), Ok(b));
+        }
+    }
 }
