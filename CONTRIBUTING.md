@@ -29,13 +29,19 @@ The Rust core implements the `StreamCache` functionality using:
 ### Setup Commands
 
 ```bash
-# Install dependencies without building the extension.  Add
-# `--group datafusion` when working on batchcorder-datafusion: it installs
-# the datafusion host its tests run against.
+# Install dependencies without building the extension.
 uv sync --no-install-project --dev
+
+# When working on batchcorder-datafusion, sync the datafusion group as well:
+# it installs the datafusion host its tests run against.
+uv sync --no-install-project --dev --group datafusion
 
 # For docs development, include docs group
 uv sync --no-install-project --dev --group docs
+
+# `uv sync` removes packages from groups it is not given, so list every group
+# you need in a single call, e.g.:
+uv sync --no-install-project --dev --group datafusion --group docs
 
 # Build the extension
 uv run maturin develop --uv
@@ -69,8 +75,10 @@ uv run pytest
 # Run specific test files or modules
 uv run pytest tests/test_module.py
 
-# Run the batchcorder-datafusion tests (needs its wheel and the datafusion
-# group; see Setup Commands)
+# Run the batchcorder-datafusion tests.  Needs the datafusion group
+# (`uv sync --no-install-project --dev --group datafusion`) and the
+# batchcorder-datafusion wheel; see Setup Commands.  Without the group,
+# collection fails with `ModuleNotFoundError: No module named 'datafusion'`.
 uv run pytest crates/batchcorder-datafusion-py/tests
 ```
 
