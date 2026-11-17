@@ -15,8 +15,10 @@ mod tier;
 use arrow_array::RecordBatch;
 use arrow_schema::ArrowError;
 
-pub use dataset::{Bounding, CacheConfig, DiskConfig, StreamCache, StreamCacheReader};
-pub use tier::WritePolicy;
+pub use dataset::{
+    Bounding, CacheConfig, DiskConfig, ParseBoundingError, StreamCache, StreamCacheReader,
+};
+pub use tier::{ParseWritePolicyError, WritePolicy};
 
 /// A source of record batches that can be read only once.
 ///

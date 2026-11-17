@@ -129,11 +129,10 @@ fn check_ffi_version(codec: &FFI_LogicalExtensionCodec) -> PyResult<()> {
 }
 
 fn parse_bounding(bounding: &str) -> PyResult<Bounding> {
-    match bounding {
-        "sealed" => Ok(Bounding::Sealed),
-        "unbounded" => Ok(Bounding::Unbounded),
-        other => Err(PyValueError::new_err(format!(
-            "bounding must be 'sealed' or 'unbounded', got {other:?}"
+    match bounding.parse::<Bounding>() {
+        Ok(b @ (Bounding::Sealed | Bounding::Unbounded)) => Ok(b),
+        Ok(Bounding::Counted { .. }) | Err(_) => Err(PyValueError::new_err(format!(
+            "bounding must be 'sealed' or 'unbounded', got {bounding:?}"
         ))),
     }
 }

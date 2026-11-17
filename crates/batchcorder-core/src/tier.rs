@@ -9,8 +9,10 @@
 //!   budget are read back from disk via positional I/O (no seek lock needed).
 
 use std::collections::VecDeque;
+use std::fmt;
 use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, RwLock};
 
@@ -60,6 +62,44 @@ pub enum WritePolicy {
     /// hot layer is large enough, nothing ever hits disk.  Higher memory use for
     /// hot entries; far less I/O for small-to-medium streams.
     OnEviction,
+}
+
+/// Error returned when a string does not name a [`WritePolicy`]; holds the
+/// rejected input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseWritePolicyError(String);
+
+impl fmt::Display for ParseWritePolicyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "write_policy must be 'on_insertion' or 'on_eviction', got {:?}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for ParseWritePolicyError {}
+
+impl FromStr for WritePolicy {
+    type Err = ParseWritePolicyError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "on_insertion" => Ok(Self::OnInsertion),
+            "on_eviction" => Ok(Self::OnEviction),
+            _ => Err(ParseWritePolicyError(s.to_owned())),
+        }
+    }
+}
+
+impl fmt::Display for WritePolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OnInsertion => f.write_str("on_insertion"),
+            Self::OnEviction => f.write_str("on_eviction"),
+        }
+    }
 }
 
 // ── cache tiers ──────────────────────────────────────────────────────────────
@@ -1132,5 +1172,36 @@ mod tests {
         assert!(tier.get(2).expect("ok").is_some());
         assert!(tier.get(3).expect("ok").is_some());
         tier.cleanup_disk();
+    }
+
+    #[test]
+    fn parse_and_display_write_policy_works() {
+        for (s, p) in [
+            ("on_insertion", WritePolicy::OnInsertion),
+            ("on_eviction", WritePolicy::OnEviction),
+        ] {
+            assert_eq!(s.parse::<WritePolicy>(), Ok(p));
+            assert_eq!(p.to_string(), s);
+        }
+    }
+
+    #[test]
+    fn write_policy_round_trips() {
+        for p in [WritePolicy::OnInsertion, WritePolicy::OnEviction] {
+            // Exhaustiveness guard: a new variant fails to compile here until listed above.
+            match p {
+                WritePolicy::OnInsertion | WritePolicy::OnEviction => {}
+            }
+            assert_eq!(p.to_string().parse::<WritePolicy>(), Ok(p));
+        }
+    }
+
+    #[test]
+    fn parse_write_policy_errors_properly() {
+        let err = "on_foo".parse::<WritePolicy>().expect_err("should fail");
+        assert_eq!(
+            err.to_string(),
+            r#"write_policy must be 'on_insertion' or 'on_eviction', got "on_foo""#
+        );
     }
 }

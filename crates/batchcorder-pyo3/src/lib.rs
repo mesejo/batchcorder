@@ -54,13 +54,9 @@ pub fn arrow_to_py_err(e: ArrowError) -> PyErr {
 
 /// Parse the `write_policy` constructor argument.
 pub fn parse_write_policy(write_policy: &str) -> PyResult<WritePolicy> {
-    match write_policy {
-        "on_insertion" => Ok(WritePolicy::OnInsertion),
-        "on_eviction" => Ok(WritePolicy::OnEviction),
-        other => Err(PyValueError::new_err(format!(
-            "write_policy must be 'on_insertion' or 'on_eviction', got {other:?}"
-        ))),
-    }
+    write_policy
+        .parse::<WritePolicy>()
+        .map_err(|e| PyValueError::new_err(e.to_string()))
 }
 
 /// Combine the `disk_path` / `disk_capacity` constructor arguments, which

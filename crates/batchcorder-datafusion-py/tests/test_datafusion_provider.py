@@ -202,6 +202,9 @@ def test_schema_and_metadata():
         ({"bounding": "counted"}, "bounding must be"),
         ({"write_policy": "sometimes"}, "write_policy must be"),
         ({"disk_path": "/tmp"}, "disk_path and disk_capacity"),
+        # Core parses "counted:<n>", but the provider only takes the two
+        # bounding modes a query plan can use.
+        ({"bounding": "counted:2"}, 'got "counted:2"'),
     ],
 )
 def test_invalid_arguments(kwargs, match):
