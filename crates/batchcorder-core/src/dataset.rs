@@ -75,7 +75,7 @@ impl fmt::Display for ParseBoundingError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "bounding must be 'unbounded', 'sealed' or 'counted:<n>', got {:?}",
+            "bounding must be 'unbounded', 'sealed' or 'counted:<n>' with n >= 1, got {:?}",
             self.0
         )
     }
@@ -1502,7 +1502,7 @@ mod tests {
         let err = "foo".parse::<Bounding>().expect_err("should fail");
         assert_eq!(
             err.to_string(),
-            r#"bounding must be 'unbounded', 'sealed' or 'counted:<n>', got "foo""#
+            r#"bounding must be 'unbounded', 'sealed' or 'counted:<n>' with n >= 1, got "foo""#
         );
     }
 
