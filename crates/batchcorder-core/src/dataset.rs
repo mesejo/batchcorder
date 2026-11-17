@@ -25,6 +25,7 @@
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, TryLockError, Weak};
 
@@ -62,6 +63,42 @@ pub enum Bounding {
     /// never polled holds eviction back — a memory cost, never a wrong
     /// result.
     Sealed,
+}
+
+/// Error returned when a string does not name a [`Bounding`]; holds the
+/// rejected input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseBoundingError(String);
+
+impl FromStr for Bounding {
+    type Err = ParseBoundingError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "unbounded" => Ok(Self::Unbounded),
+            "sealed" => Ok(Self::Sealed),
+            _ => {
+                if let Some(n) = s.strip_prefix("counted:") {
+                    let max = n
+                        .parse::<u64>()
+                        .map_err(|_| ParseBoundingError(s.to_owned()))?;
+                    Ok(Self::Counted { max })
+                } else {
+                    Err(ParseBoundingError(s.to_owned()))
+                }
+            }
+        }
+    }
+}
+
+impl fmt::Display for Bounding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unbounded => f.write_str("unbounded"),
+            Self::Counted { max } => write!(f, "counted:{max}"),
+            Self::Sealed => f.write_str("sealed"),
+        }
+    }
 }
 
 // ── shared ingestion state ───────────────────────────────────────────────────
@@ -1430,5 +1467,38 @@ mod tests {
         assert!(s.contains("state: <locked>"), "{s}");
         assert!(!s.contains("ingested_count"), "{s}");
         assert!(s.contains("poisoned: false"), "{s}");
+    }
+
+    #[test]
+    fn parse_and_display_bounding_works() {
+        assert_eq!("sealed".parse::<Bounding>().unwrap().to_string(), "sealed");
+        assert_eq!(
+            "unbounded".parse::<Bounding>().unwrap().to_string(),
+            "unbounded"
+        );
+        assert_eq!(
+            "counted:4".parse::<Bounding>().unwrap().to_string(),
+            "counted:4"
+        );
+    }
+
+    #[test]
+    fn parse_bounding_errors_properly() {
+        "foo".parse::<Bounding>().expect_err("should fail");
+    }
+
+    #[test]
+    fn bounding_rejects_malformed() {
+        for bad in [
+            "",
+            "foo",
+            "counted",
+            "counted:",
+            "counted:x",
+            "countedXYZ:3",
+            "Sealed",
+        ] {
+            assert!(bad.parse::<Bounding>().is_err(), "{bad:?} parsed");
+        }
     }
 }
