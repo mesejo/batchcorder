@@ -1486,15 +1486,14 @@ mod tests {
 
     #[test]
     fn parse_and_display_bounding_works() {
-        assert_eq!("sealed".parse::<Bounding>().unwrap().to_string(), "sealed");
-        assert_eq!(
-            "unbounded".parse::<Bounding>().unwrap().to_string(),
-            "unbounded"
-        );
-        assert_eq!(
-            "counted:4".parse::<Bounding>().unwrap().to_string(),
-            "counted:4"
-        );
+        for (s, b) in [
+            ("sealed", Bounding::Sealed),
+            ("unbounded", Bounding::Unbounded),
+            ("counted:4", Bounding::Counted { max: 4 }),
+        ] {
+            assert_eq!(s.parse::<Bounding>(), Ok(b));
+            assert_eq!(b.to_string(), s);
+        }
     }
 
     #[test]

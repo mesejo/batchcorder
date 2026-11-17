@@ -1176,14 +1176,13 @@ mod tests {
 
     #[test]
     fn parse_and_display_write_policy_works() {
-        assert_eq!(
-            "on_insertion".parse::<WritePolicy>().unwrap().to_string(),
-            "on_insertion"
-        );
-        assert_eq!(
-            "on_eviction".parse::<WritePolicy>().unwrap().to_string(),
-            "on_eviction"
-        );
+        for (s, p) in [
+            ("on_insertion", WritePolicy::OnInsertion),
+            ("on_eviction", WritePolicy::OnEviction),
+        ] {
+            assert_eq!(s.parse::<WritePolicy>(), Ok(p));
+            assert_eq!(p.to_string(), s);
+        }
     }
 
     #[test]
