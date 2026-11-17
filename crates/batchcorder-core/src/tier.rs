@@ -69,6 +69,18 @@ pub enum WritePolicy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseWritePolicyError(String);
 
+impl fmt::Display for ParseWritePolicyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "write_policy must be 'on_insertion' or 'on_eviction', got {:?}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for ParseWritePolicyError {}
+
 impl FromStr for WritePolicy {
     type Err = ParseWritePolicyError;
 
@@ -1187,6 +1199,10 @@ mod tests {
 
     #[test]
     fn parse_write_policy_errors_properly() {
-        "on_foo".parse::<WritePolicy>().expect_err("should fail");
+        let err = "on_foo".parse::<WritePolicy>().expect_err("should fail");
+        assert_eq!(
+            err.to_string(),
+            r#"write_policy must be 'on_insertion' or 'on_eviction', got "on_foo""#
+        );
     }
 }

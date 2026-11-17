@@ -22,7 +22,8 @@ use arrow_array::RecordBatchReader;
 use arrow_array::ffi_stream::ArrowArrayStreamReader;
 use arrow_schema::ArrowError;
 use batchcorder_core::{
-    Bounding, CacheConfig, DiskConfig, StreamCache, Upstream, WaitHook, WritePolicy,
+    Bounding, CacheConfig, DiskConfig, ParseWritePolicyError, StreamCache, Upstream, WaitHook,
+    WritePolicy,
 };
 use pyo3::exceptions::{PyIOError, PyMemoryError, PyValueError};
 use pyo3::prelude::*;
@@ -54,11 +55,9 @@ pub fn arrow_to_py_err(e: ArrowError) -> PyErr {
 
 /// Parse the `write_policy` constructor argument.
 pub fn parse_write_policy(write_policy: &str) -> PyResult<WritePolicy> {
-    write_policy.parse::<WritePolicy>().map_err(|_| {
-        PyValueError::new_err(format!(
-            "write_policy must be 'on_insertion' or 'on_eviction', got {write_policy:?}"
-        ))
-    })
+    write_policy
+        .parse()
+        .map_err(|e: ParseWritePolicyError| PyValueError::new_err(e.to_string()))
 }
 
 /// Combine the `disk_path` / `disk_capacity` constructor arguments, which

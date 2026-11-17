@@ -70,6 +70,18 @@ pub enum Bounding {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseBoundingError(String);
 
+impl fmt::Display for ParseBoundingError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "bounding must be 'unbounded', 'sealed' or 'counted:<n>', got {:?}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for ParseBoundingError {}
+
 impl FromStr for Bounding {
     type Err = ParseBoundingError;
 
@@ -1484,7 +1496,11 @@ mod tests {
 
     #[test]
     fn parse_bounding_errors_properly() {
-        "foo".parse::<Bounding>().expect_err("should fail");
+        let err = "foo".parse::<Bounding>().expect_err("should fail");
+        assert_eq!(
+            err.to_string(),
+            r#"bounding must be 'unbounded', 'sealed' or 'counted:<n>', got "foo""#
+        );
     }
 
     #[test]
