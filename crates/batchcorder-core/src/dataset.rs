@@ -91,16 +91,16 @@ impl FromStr for Bounding {
             "unbounded" => Ok(Self::Unbounded),
             "sealed" => Ok(Self::Sealed),
             _ => {
-                if let Some(n) = s.strip_prefix("counted:") {
-                    // `Counted { max: 0 }` would fail later at construction;
-                    // reject it here so every parsed value is usable.
-                    let max = n
-                        .parse::<NonZeroU64>()
-                        .map_err(|_| ParseBoundingError(s.to_owned()))?;
-                    Ok(Self::Counted { max: max.get() })
-                } else {
-                    Err(ParseBoundingError(s.to_owned()))
-                }
+                // Digits only: `u64::from_str` also takes a leading `+`,
+                // which `Display` never writes.  `Counted { max: 0 }` would
+                // fail later at construction; `NonZeroU64` rejects it here so
+                // every parsed value is usable.
+                let max = s
+                    .strip_prefix("counted:")
+                    .filter(|n| n.bytes().all(|b| b.is_ascii_digit()))
+                    .and_then(|n| n.parse::<NonZeroU64>().ok())
+                    .ok_or_else(|| ParseBoundingError(s.to_owned()))?;
+                Ok(Self::Counted { max: max.get() })
             }
         }
     }
@@ -1516,6 +1516,8 @@ mod tests {
             "counted:x",
             "counted:0",
             "counted:-1",
+            "counted:+3",
+            "counted: 3",
             "countedXYZ:3",
             "Sealed",
         ] {
