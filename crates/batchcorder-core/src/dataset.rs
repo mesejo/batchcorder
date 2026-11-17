@@ -22,10 +22,11 @@
 //! 3. **Evicted batches are dropped outside locks.**  See
 //!    [`crate::tier::ReleasedBatches`].
 
+use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, TryLockError, Weak};
 
 use arrow_array::RecordBatch;
 use arrow_schema::{ArrowError, SchemaRef};
@@ -471,6 +472,52 @@ impl StreamCache {
     }
 }
 
+impl fmt::Debug for StreamCache {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // One lock for every field, so they all describe the same instant.
+        // `try_lock`, not `lock`: the mutex is not reentrant, so formatting a
+        // cache from code that already holds it would deadlock.  Like std's
+        // and parking_lot's `Mutex` Debug, make one attempt and print
+        // `<locked>` if it fails.  Other readers take the lock on every poll,
+        // so under load that can happen even though no one holds it for long.
+        let (guard, poisoned) = match self.shared.state.try_lock() {
+            Ok(guard) => (guard, false),
+            Err(TryLockError::Poisoned(e)) => (e.into_inner(), true),
+            Err(TryLockError::WouldBlock) => {
+                return f
+                    .debug_struct("StreamCache")
+                    .field("schema", &self.schema)
+                    .field("state", &format_args!("<locked>"))
+                    // Readable without the lock.
+                    .field("poisoned", &self.shared.state.is_poisoned())
+                    .finish_non_exhaustive();
+            }
+        };
+
+        let bounding = guard.bounding;
+        let sealed = guard.sealed;
+        let ingested_count = guard.ingested_count;
+        let evicted_count = guard.evicted_up_to;
+        let upstream_exhausted = guard.upstream_exhausted;
+        let upstream_panicked = guard.upstream_panicked;
+        let closed = guard.closed;
+        // Unlock before writing: the formatter may block on I/O.
+        drop(guard);
+
+        f.debug_struct("StreamCache")
+            .field("schema", &self.schema)
+            .field("bounding", &bounding)
+            .field("sealed", &sealed)
+            .field("ingested_count", &ingested_count)
+            .field("evicted_count", &evicted_count)
+            .field("upstream_exhausted", &upstream_exhausted)
+            .field("upstream_panicked", &upstream_panicked)
+            .field("closed", &closed)
+            .field("poisoned", &poisoned)
+            .finish_non_exhaustive()
+    }
+}
+
 // ── StreamCacheReader ──────────────────────────────────────────────────────
 
 /// An independent replay cursor over a [`StreamCache`].
@@ -821,8 +868,7 @@ mod tests {
         };
         let upstream: Vec<Result<RecordBatch, ArrowError>> = Vec::new();
         let err = StreamCache::try_new(Box::new(upstream.into_iter()), schema(), config)
-            .err()
-            .expect("rejected");
+            .expect_err("rejected");
         assert!(matches!(err, ArrowError::InvalidArgumentError(_)));
     }
 
@@ -1057,6 +1103,10 @@ mod tests {
         let err = b.next().expect("some").expect_err("still failing");
         assert!(err.to_string().contains("panicked"));
         assert_eq!(g.pulls.load(Ordering::SeqCst), 1);
+        // A dead upstream must not look like a live one with more to come.
+        let s = format!("{:?}", g.cache);
+        assert!(s.contains("upstream_panicked: true"), "{s}");
+        assert!(s.contains("upstream_exhausted: false"), "{s}");
     }
 
     static HOOK_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -1314,5 +1364,71 @@ mod tests {
         }
         assert_eq!(pulls.load(Ordering::SeqCst), N as usize + 1);
         assert_eq!(evicted_up_to(&cache), N as u64);
+    }
+
+    /// A Sealed cache over `[0], [1], [2]`, fully ingested.
+    fn debug_test_cache() -> StreamCache {
+        let cache = sealed_cache(3);
+        cache.ingest_all().expect("ingest");
+        cache
+    }
+
+    #[test]
+    fn debug_shows_bounding_count_and_exhaustion() {
+        let s = format!("{:?}", debug_test_cache());
+        assert!(s.starts_with("StreamCache {"), "{s}");
+        assert!(s.contains("schema: Schema"), "{s}");
+        assert!(s.contains("bounding: Sealed"), "{s}");
+        // Ingesting does not seal; only a reader's first poll (or seal()) does.
+        assert!(s.contains("sealed: false"), "{s}");
+        assert!(s.contains("ingested_count: 3"), "{s}");
+        assert!(s.contains("upstream_exhausted: true"), "{s}");
+        assert!(s.contains("poisoned: false"), "{s}");
+        assert!(s.contains(".."), "{s}");
+    }
+
+    #[test]
+    fn debug_reports_poisoned_lock_without_panicking() {
+        let cache = debug_test_cache();
+        let shared = cache.shared.clone();
+        let poisoner = thread::spawn(move || {
+            let _guard = shared.state.lock();
+            panic!("poison the cache lock");
+        });
+        assert!(poisoner.join().is_err());
+        assert!(cache.shared.state.is_poisoned());
+
+        let s = format!("{cache:?}");
+        assert!(s.contains("poisoned: true"), "{s}");
+        // The real state, not made-up defaults.
+        assert!(s.contains("ingested_count: 3"), "{s}");
+        assert!(s.contains("upstream_exhausted: true"), "{s}");
+    }
+
+    #[test]
+    fn debug_shows_eviction_and_close() {
+        let cache = sealed_cache(3);
+        assert_eq!(collect(cache.reader(true).expect("reader")), expected(3));
+        assert_eq!(evicted_up_to(&cache), 3);
+        cache.close().expect("close");
+        let s = format!("{cache:?}");
+        assert!(s.contains("evicted_count: 3"), "{s}");
+        assert!(s.contains("sealed: true"), "{s}");
+        assert!(s.contains("closed: true"), "{s}");
+    }
+
+    #[test]
+    fn debug_does_not_deadlock_while_lock_is_held() {
+        let cache = debug_test_cache();
+        let _guard = cache.shared.lock().expect("lock");
+        // Format on another thread so a regression to `lock()` fails at the
+        // timeout instead of hanging the test run.
+        let c = cache.clone();
+        let s = spawn(move || format!("{c:?}"))
+            .recv_timeout(TIMEOUT)
+            .expect("Debug blocked on the held lock");
+        assert!(s.contains("state: <locked>"), "{s}");
+        assert!(!s.contains("ingested_count"), "{s}");
+        assert!(s.contains("poisoned: false"), "{s}");
     }
 }
