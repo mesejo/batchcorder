@@ -98,10 +98,6 @@ struct StagedEviction {
     batch_idx: u64,
     /// Shared handle to the batch still held by the hot layer; no data is copied.
     batch: Arc<RecordBatch>,
-    /// Number of front hot slots to pop to evict this batch and every batch
-    /// staged before it.  It can exceed the staged count, because staging skips
-    /// `None` slots without returning them.
-    slots: usize,
 }
 
 /// FIFO in-memory read cache for the disk tier.
@@ -178,8 +174,8 @@ impl HotLayer {
     /// batch would be neither in hot nor on disk.
     ///
     /// Used by the `OnEviction` policy: the caller writes each returned batch to
-    /// disk, then calls `commit_evictions` with the `slots` of the last batch it
-    /// wrote.  If a write fails, the caller commits the batches written so far
+    /// disk, then calls `commit_evictions` with the index just past the last batch
+    /// it wrote.  If a write fails, the caller commits the batches written so far
     /// and calls [`Self::unstage_newcomer`].
     fn stage_evictions(
         &mut self,
@@ -199,7 +195,6 @@ impl HotLayer {
                         evicted.push(StagedEviction {
                             batch_idx: self.head_batch_idx + cursor as u64,
                             batch: Arc::clone(arc),
-                            slots: cursor + 1,
                         });
                         freed += len;
                     }
@@ -227,11 +222,17 @@ impl HotLayer {
         }
     }
 
-    /// Pop the first `n` slots after their disk writes have been confirmed.
-    /// `n` is the [`StagedEviction::slots`] of the last batch written, not the
-    /// number of staged batches: the two differ when `None` slots were skipped.
-    fn commit_evictions(&mut self, n: usize) {
-        for _ in 0..n {
+    /// Pop every front slot below global batch index `end` after their disk
+    /// writes have been confirmed.  `end` is one past the last batch written.
+    ///
+    /// The bound is a global index, not a slot count taken at staging time:
+    /// between staging and commit the index lock is released, and low-water-mark
+    /// eviction ([`CacheTier::evict_below`]) may advance `head_batch_idx`.  A
+    /// stale count would then pop slots past the written batches, dropping a
+    /// batch that has no disk copy.  Skipped `None` slots below `end` are popped
+    /// too, since they lie between written batches.
+    fn commit_evictions(&mut self, end: u64) {
+        while self.head_batch_idx < end {
             match self.entries.pop_front() {
                 None => break,
                 Some(evicted) => {
@@ -404,26 +405,37 @@ impl DiskCacheTier {
             .sum();
         let batch_arc = Arc::new(batch);
 
-        // Phase 1: stage evictions and append the placeholder slot, under the lock.
-        let evicted = {
-            let mut idx = self.index.write().map_err(poisoned_lock_err)?;
-            let batch_idx = idx.entries.len() as u64;
-            let evicted = idx.hot.stage_evictions(batch_idx, batch_arc, mem_size);
-            idx.entries.push(None); // "in hot, not yet on disk"
-            evicted
-        }; // lock released — evicted batches remain in hot for readers
+        let evicted = self.stage_on_eviction(batch_arc, mem_size)?;
+        let (disk_entries, written) = self.write_staged(&evicted);
+        self.commit_staged(disk_entries, written)
+    }
 
-        // Phase 2: write each evicted batch to disk (no lock held).  Stop at the
-        // first failure, keeping the batches already written: their bytes are
-        // on disk and counted in `disk_used`, so Phase 3 must record them.
+    /// Phase 1 of `insert_on_eviction`: stage evictions and append the
+    /// newcomer's placeholder slot, under the lock.  The lock is released on
+    /// return; the staged batches stay in hot for readers.
+    fn stage_on_eviction(
+        &self,
+        batch: Arc<RecordBatch>,
+        mem_size: usize,
+    ) -> Result<Vec<StagedEviction>, ArrowError> {
+        let mut idx = self.index.write().map_err(poisoned_lock_err)?;
+        let batch_idx = idx.entries.len() as u64;
+        let evicted = idx.hot.stage_evictions(batch_idx, batch, mem_size);
+        idx.entries.push(None); // "in hot, not yet on disk"
+        Ok(evicted)
+    }
+
+    /// Phase 2 of `insert_on_eviction`: write each staged batch to disk, with
+    /// no lock held.  Stops at the first failure, keeping the batches already
+    /// written: their bytes are on disk and counted in `disk_used`, so Phase 3
+    /// must record them.  Returns the written entries and the write outcome.
+    fn write_staged(
+        &self,
+        evicted: &[StagedEviction],
+    ) -> (Vec<(u64, DiskEntry)>, Result<(), ArrowError>) {
         let mut disk_entries: Vec<(u64, DiskEntry)> = Vec::with_capacity(evicted.len());
-        let mut committed_slots = 0usize;
         let written = evicted.iter().try_for_each(|staged| {
-            let StagedEviction {
-                batch_idx,
-                batch,
-                slots,
-            } = staged;
+            let StagedEviction { batch_idx, batch } = staged;
             let bytes = serialize_batch(batch)?;
             let length = bytes.len();
             let checksum = xxh3_64(&bytes);
@@ -437,16 +449,31 @@ impl DiskCacheTier {
                     checksum,
                 },
             ));
-            committed_slots = *slots;
             Ok::<(), ArrowError>(())
         });
+        (disk_entries, written)
+    }
 
-        // Phase 3: pop the written entries from hot and record their disk slots,
-        // atomically under one write lock so readers never see a gap.
+    /// Phase 3 of `insert_on_eviction`: pop the written batches from hot and
+    /// record their disk slots, atomically under one write lock so readers
+    /// never see a gap.  On a failed write, also roll back the newcomer.
+    fn commit_staged(
+        &self,
+        disk_entries: Vec<(u64, DiskEntry)>,
+        written: Result<(), ArrowError>,
+    ) -> Result<(), ArrowError> {
         let mut idx = self.index.write().map_err(poisoned_lock_err)?;
-        idx.hot.commit_evictions(committed_slots);
+        // Batches below the hot head were removed by low-water-mark eviction
+        // while the lock was released: no reader can reach them, and
+        // `evict_below` already nulled their disk slots, so leave those null.
+        let head = idx.hot.head_batch_idx;
+        if let Some(&(last_idx, _)) = disk_entries.last() {
+            idx.hot.commit_evictions(last_idx + 1);
+        }
         for (evicted_idx, disk_entry) in disk_entries {
-            idx.entries[evicted_idx as usize] = Some(disk_entry);
+            if evicted_idx >= head {
+                idx.entries[evicted_idx as usize] = Some(disk_entry);
+            }
         }
         if written.is_err() {
             // The caller does not count a failed insert, so drop the newcomer's
@@ -936,14 +963,13 @@ mod tests {
         let evicted = hot.stage_evictions(2, Arc::new(make_batch(&[2])), 16);
         assert_eq!(evicted.len(), 1);
         assert_eq!(evicted[0].batch_idx, 0);
-        assert_eq!(evicted[0].slots, 1);
         let held = hot.get(0).expect("staged-but-not-committed stays readable");
         assert!(
             Arc::ptr_eq(&evicted[0].batch, &held),
             "staging shares the hot layer's Arc instead of copying the batch"
         );
         // Commit removes it.
-        hot.commit_evictions(evicted[0].slots);
+        hot.commit_evictions(evicted[0].batch_idx + 1);
         assert!(hot.get(0).is_none());
         assert!(hot.get(2).is_some());
     }
@@ -951,7 +977,8 @@ mod tests {
     #[test]
     fn hot_layer_commit_counts_skipped_none_slots() {
         // A `None` front slot is skipped by staging but still occupies a slot,
-        // so commit must pop by `slots`, not by the number of staged batches.
+        // so commit must pop through the last batch's index, not by the number
+        // of staged batches.
         let mut hot = HotLayer::new(40);
         hot.entries.push_back(None);
         hot.try_insert(1, Arc::new(make_batch(&[1])), 16);
@@ -959,11 +986,29 @@ mod tests {
         let evicted = hot.stage_evictions(3, Arc::new(make_batch(&[3])), 16);
         assert_eq!(evicted.len(), 1);
         assert_eq!(evicted[0].batch_idx, 1);
-        assert_eq!(evicted[0].slots, 2);
-        hot.commit_evictions(evicted[0].slots);
+        hot.commit_evictions(evicted[0].batch_idx + 1);
         assert!(hot.get(1).is_none(), "batch 1 left hot");
         assert_eq!(hot.used, 32, "only batches 2 and 3 remain");
         assert_eq!(hot.head_batch_idx, 2);
+    }
+
+    #[test]
+    fn hot_layer_commit_after_head_advanced_keeps_newcomer() {
+        // Regression: low-water-mark eviction can pop the staged batch while the
+        // lock is released.  Commit must stop at the written batch's index, not
+        // pop a stale slot count, which would drop the newcomer (no disk copy).
+        let mut hot = HotLayer::new(16);
+        hot.try_insert(0, Arc::new(make_batch(&[0])), 16);
+        let evicted = hot.stage_evictions(1, Arc::new(make_batch(&[1])), 16);
+        assert_eq!(evicted.len(), 1);
+        // What `evict_below(1)` does to the hot layer.
+        hot.entries.pop_front();
+        hot.used -= 16;
+        hot.head_batch_idx = 1;
+        hot.commit_evictions(evicted[0].batch_idx + 1);
+        assert_eq!(hot.head_batch_idx, 1);
+        assert!(hot.get(1).is_some(), "newcomer stays hot");
+        assert_eq!(hot.used, 16);
     }
 
     #[test]
@@ -979,8 +1024,8 @@ mod tests {
 
     #[test]
     fn hot_layer_commit_more_than_present_is_safe() {
-        // Exercises the `None => break` arm of commit_evictions: asking to commit
-        // more entries than exist must stop at empty instead of underflowing.
+        // Exercises the `None => break` arm of commit_evictions: committing past
+        // the last entry must stop at empty instead of underflowing.
         let mut hot = HotLayer::new(1024);
         hot.try_insert(0, Arc::new(make_batch(&[0])), 16);
         hot.commit_evictions(5); // only 1 present
@@ -1050,6 +1095,37 @@ mod tests {
             tier.get(2).expect("ok").expect("present").as_ref(),
             &make_batch(&[3])
         );
+        tier.cleanup_disk();
+    }
+
+    #[test]
+    fn disk_on_eviction_lwm_eviction_between_stage_and_commit() {
+        // Regression: with a one-batch hot budget, inserting batch 1 stages
+        // batch 0.  A slow reader then finishes batch 0 and `evict_below(1)`
+        // runs while the disk write is in flight.  The commit must not pop
+        // batch 1, which is only in hot, and must not resurrect batch 0's
+        // nulled disk slot.
+        let first = make_batch(&[0]);
+        let second = make_batch(&[1]);
+        let mem = batch_mem_size(&first);
+        let tier = CacheTier::Disk(temp_disk_tier(1 << 20, mem, WritePolicy::OnEviction));
+        tier.insert(first).expect("insert 0");
+        let CacheTier::Disk(d) = &tier else {
+            panic!("disk tier");
+        };
+        let evicted = d
+            .stage_on_eviction(Arc::new(second.clone()), batch_mem_size(&second))
+            .expect("stage");
+        assert_eq!(evicted.len(), 1);
+        let (disk_entries, written) = d.write_staged(&evicted);
+        drop(tier.evict_below(1).expect("evict_below"));
+        d.commit_staged(disk_entries, written).expect("commit");
+
+        assert_eq!(
+            tier.get(1).expect("ok").expect("batch 1 present").as_ref(),
+            &second
+        );
+        assert!(tier.get(0).expect("ok").is_none(), "batch 0 stays evicted");
         tier.cleanup_disk();
     }
 
