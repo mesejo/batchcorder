@@ -1,5 +1,5 @@
-//! End-to-end tests of `tee_register` / `tee_scan` / `tee_drop` against an
-//! in-process DuckDB.
+//! End-to-end tests of `tee_register` / `tee_scan` / `tee_drop` /
+//! `tee_stats` against an in-process DuckDB.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -289,7 +289,8 @@ fn nested_columns_in_a_batch_larger_than_a_vector() {
 
     let con = connect();
     let mut upstream = Upstream::new(vec![batch]);
-    register(&con, "t", &mut upstream);
+    // Read twice below.
+    register_bounded(&con, "t", &mut upstream, "unbounded");
 
     let bad: i64 = con
         .query_row(
@@ -305,4 +306,187 @@ fn nested_columns_in_a_batch_larger_than_a_vector() {
         .query_row("SELECT count(*) FROM tee_scan('t')", [], |r| r.get(0))
         .expect("count");
     assert_eq!(count, i64::from(total));
+}
+
+// ── Sealed and unbounded tees ───────────────────────────────────────────────
+
+/// `tee_register` with an explicit `bounding`.
+fn register_bounded(con: &Connection, name: &str, upstream: &mut Upstream, bounding: &str) {
+    let sql = format!(
+        "CALL tee_register('{name}', {}::UBIGINT, bounding := '{bounding}')",
+        upstream.ptr()
+    );
+    con.execute_batch(&sql).expect("tee_register");
+}
+
+/// `(ingested, evicted, sealed)` from `tee_stats`.
+fn stats(con: &Connection, name: &str) -> (u64, u64, bool) {
+    con.query_row(&format!("CALL tee_stats('{name}')"), [], |r| {
+        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+    })
+    .expect("tee_stats")
+}
+
+fn query_error(con: &Connection, sql: &str) -> String {
+    con.query_row(sql, [], |r| r.get::<_, i64>(0))
+        .expect_err(sql)
+        .to_string()
+}
+
+const UNION_ALL: &str =
+    "SELECT id, m FROM (SELECT * FROM {t} UNION ALL SELECT * FROM {t}) ORDER BY id";
+
+#[test]
+fn sealed_is_the_default() {
+    let con = connect();
+    let mut upstream = Upstream::new(id_batches(2, 10));
+    register(&con, "t", &mut upstream);
+    assert_eq!(stats(&con, "t"), (0, 0, false));
+    con.query_row("SELECT count(*) FROM tee_scan('t')", [], |r| {
+        r.get::<_, i64>(0)
+    })
+    .expect("scan");
+    assert!(stats(&con, "t").2, "the first read seals the cache");
+}
+
+/// Two scans read side by side; each batch is evicted once both have read
+/// it, so by the end nearly every batch is gone.
+#[test]
+fn union_all_evicts_behind_both_scans() {
+    let con = connect();
+    let mut upstream = Upstream::new(id_batches(50, 1000));
+    register(&con, "t", &mut upstream);
+    assert_matches_reference(&con, UNION_ALL, 50_000);
+    let (ingested, evicted, sealed) = stats(&con, "t");
+    assert_eq!((ingested, sealed), (50, true));
+    assert!(evicted >= 48, "evicted {evicted} of 50");
+    assert_eq!(upstream.pulls(), 50);
+}
+
+/// A CTE referenced twice is materialized by DuckDB: one scan, one reader.
+/// `NOT MATERIALIZED` gives two scans and two readers.  Both read the
+/// upstream once.
+#[test]
+fn cte_referenced_twice() {
+    for kind in ["", "NOT MATERIALIZED"] {
+        let con = connect();
+        let mut upstream = Upstream::new(id_batches(10, 1000));
+        register(&con, "t", &mut upstream);
+        let query = format!(
+            "WITH c AS {kind} (SELECT * FROM {{t}}) \
+             SELECT x.id, y.m FROM c x JOIN c y USING (id) ORDER BY x.id"
+        );
+        assert_matches_reference(&con, &query, 10_000);
+        assert_eq!(upstream.pulls(), 10, "{kind}");
+    }
+}
+
+/// A scan the optimizer prunes releases its reservation before the query
+/// runs, so the surviving scan still evicts.
+#[test]
+fn pruned_scan_releases_its_reservation() {
+    let con = connect();
+    let mut upstream = Upstream::new(id_batches(10, 1000));
+    register(&con, "t", &mut upstream);
+    assert_matches_reference(
+        &con,
+        "SELECT id, m FROM (SELECT * FROM {t} UNION ALL SELECT * FROM {t} WHERE false) ORDER BY id",
+        10_000,
+    );
+    let (_, evicted, _) = stats(&con, "t");
+    assert!(evicted >= 9, "evicted {evicted} of 10");
+}
+
+#[test]
+fn sealed_tee_cannot_serve_a_second_query() {
+    let con = connect();
+    let mut upstream = Upstream::new(id_batches(10, 1000));
+    register(&con, "t", &mut upstream);
+    con.query_row("SELECT count(*) FROM tee_scan('t')", [], |r| {
+        r.get::<_, i64>(0)
+    })
+    .expect("first query");
+    let err = query_error(&con, "SELECT count(*) FROM tee_scan('t')");
+    assert!(err.contains("cannot read tee 't' from the start"), "{err}");
+    assert!(err.contains("bounding := 'unbounded'"), "{err}");
+}
+
+#[test]
+fn unbounded_tee_serves_any_number_of_queries() {
+    let con = connect();
+    let mut upstream = Upstream::new(id_batches(10, 1000));
+    register_bounded(&con, "t", &mut upstream, "unbounded");
+    for _ in 0..3 {
+        assert_matches_reference(&con, UNION_ALL, 10_000);
+    }
+    assert_eq!(stats(&con, "t"), (10, 0, false));
+    assert_eq!(upstream.pulls(), 10);
+}
+
+/// DuckDB re-binds a prepared statement on every execution, so each run
+/// reserves fresh readers: fine for an unbounded tee, an error for a sealed
+/// one once the first run has evicted.
+#[test]
+fn prepared_statement_executed_twice() {
+    for (bounding, second_ok) in [("unbounded", true), ("sealed", false)] {
+        let con = connect();
+        let mut upstream = Upstream::new(id_batches(10, 1000));
+        register_bounded(&con, "t", &mut upstream, bounding);
+        let mut stmt = con
+            .prepare("SELECT count(*) FROM tee_scan('t') a JOIN tee_scan('t') b USING (id)")
+            .expect("prepare");
+        let first: i64 = stmt.query_row([], |r| r.get(0)).expect("first execution");
+        assert_eq!(first, 10_000, "{bounding}");
+        let second = stmt.query_row([], |r| r.get::<_, i64>(0));
+        match second {
+            Ok(n) => assert!(second_ok && n == 10_000, "{bounding}: {n}"),
+            Err(e) => {
+                let err = e.to_string();
+                assert!(!second_ok, "{bounding}: {err}");
+                assert!(err.contains("cannot read tee 't' from the start"), "{err}");
+            }
+        }
+    }
+}
+
+/// A recursive CTE re-initialises its scan once per iteration.  An
+/// unbounded tee replays it; a sealed one has evicted by then and says so.
+#[test]
+fn recursive_cte_needs_an_unbounded_tee() {
+    let query = "WITH RECURSIVE r(n) AS (SELECT 0 UNION ALL \
+                   SELECT r.n + 1 FROM r JOIN tee_scan('t') p ON p.id = r.n WHERE r.n < 3) \
+                 SELECT count(*) FROM r";
+    let con = connect();
+    let mut upstream = Upstream::new(id_batches(10, 1000));
+    register_bounded(&con, "t", &mut upstream, "unbounded");
+    let n: i64 = con.query_row(query, [], |r| r.get(0)).expect("unbounded");
+    assert_eq!(n, 4);
+
+    let con = connect();
+    let mut upstream = Upstream::new(id_batches(10, 1000));
+    register(&con, "t", &mut upstream);
+    let err = query_error(&con, query);
+    assert!(err.contains("recursive CTE"), "{err}");
+}
+
+/// `bounding` is checked at bind time, before the stream is taken.
+#[test]
+fn bad_bounding_is_rejected_and_leaves_the_stream() {
+    let con = connect();
+    for bounding in ["'counted:2'", "'nope'", "NULL"] {
+        let mut upstream = Upstream::new(id_batches(1, 10));
+        let sql = format!(
+            "CALL tee_register('t', {}::UBIGINT, bounding := {bounding})",
+            upstream.ptr()
+        );
+        let err = con.execute_batch(&sql).expect_err(&sql).to_string();
+        assert!(
+            err.contains("bounding must be 'sealed' or 'unbounded'"),
+            "{err}"
+        );
+        assert!(
+            upstream.stream.release.is_some(),
+            "{bounding}: stream untouched"
+        );
+    }
 }

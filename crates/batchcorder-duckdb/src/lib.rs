@@ -2,18 +2,34 @@
 //! scan of it in a query, the DuckDB counterpart of
 //! `batchcorder-datafusion`'s `TeeTableProvider`.
 //!
-//! [`register`] adds three functions to a database:
+//! [`register`] adds four functions to a database:
 //!
-//! - `CALL tee_register(name, stream_ptr)` takes ownership of the
-//!   `ArrowArrayStream` at address `stream_ptr` and wraps it in a
-//!   `StreamCache` stored under `name`.
+//! - `CALL tee_register(name, stream_ptr, bounding := 'sealed')` takes
+//!   ownership of the `ArrowArrayStream` at address `stream_ptr` and wraps it
+//!   in a `StreamCache` stored under `name`.
 //! - `SELECT * FROM tee_scan(name)` replays the stream from its first batch;
 //!   every scan reads the same cache, so the upstream is read once.
 //! - `CALL tee_drop(name)` forgets the name.  Scans still running keep the
 //!   cache alive until they finish.
+//! - `CALL tee_stats(name)` reports how many batches were ingested and
+//!   evicted, and whether the cache is sealed.
+//!
+//! # Sealed and unbounded
+//!
+//! A `'sealed'` tee (the default) serves the scans of one query and evicts
+//! each batch once all of them have read it, exactly like
+//! `TeeTableProvider`.  Every `tee_scan` reserves its reader when DuckDB binds
+//! it, before anything is read; the cache seals on the first read, and from
+//! then on evicts behind the slowest reader.  A scan the optimizer prunes
+//! drops its bind data, and with it the reservation, before the query runs,
+//! so it never holds eviction back.  Once a batch has been evicted, a new
+//! scan cannot start from the beginning: reusing the tee in a later query,
+//! re-executing a prepared statement, or a recursive CTE that re-reads it
+//! fails with an error that says so.  An `'unbounded'` tee never evicts and
+//! can be scanned any number of times.
 //!
 //! The registry is per database: each [`register`] call creates one, shared
-//! by the three functions it adds and freed with the database.
+//! by the four functions it adds and freed with the database.
 //!
 //! # Stream ownership
 //!
@@ -41,7 +57,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use arrow_array::RecordBatchReader as _;
 use arrow_array::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
-use batchcorder_core::{CacheConfig, StreamCache, StreamCacheReader};
+use arrow_schema::ArrowError as CacheError;
+use batchcorder_core::{Bounding, CacheConfig, StreamCache, StreamCacheReader};
 use duckdb::Connection;
 use duckdb::arrow::array::{ArrayRef, MutableArrayData, RecordBatch, make_array};
 use duckdb::arrow::compute::cast;
@@ -55,13 +72,14 @@ use duckdb::vtab::{
 
 use crate::bridge::BoxError;
 
-/// Add `tee_register`, `tee_scan` and `tee_drop` to `con`'s database, with a
-/// fresh registry of tees.
+/// Add `tee_register`, `tee_scan`, `tee_drop` and `tee_stats` to `con`'s
+/// database, with a fresh registry of tees.
 pub fn register(con: &Connection) -> duckdb::Result<()> {
     let registry = Registry::default();
     con.register_table_function_with_extra_info::<TeeRegister, _>("tee_register", &registry)?;
     con.register_table_function_with_extra_info::<TeeScan, _>("tee_scan", &registry)?;
     con.register_table_function_with_extra_info::<TeeDrop, _>("tee_drop", &registry)?;
+    con.register_table_function_with_extra_info::<TeeStats, _>("tee_stats", &registry)?;
     Ok(())
 }
 
@@ -92,7 +110,7 @@ impl Registry {
 
     /// Take ownership of the stream at `ptr` and store it under `name`.
     /// Returns the number of columns.
-    fn add(&self, name: &str, ptr: u64) -> Result<usize, BoxError> {
+    fn add(&self, name: &str, ptr: u64, bounding: Bounding) -> Result<usize, BoxError> {
         // A u64 wider than a pointer cannot be an address on this platform;
         // truncating it would point somewhere else entirely.
         let raw = usize::try_from(ptr)
@@ -113,7 +131,11 @@ impl Registry {
         let reader = ArrowArrayStreamReader::try_new(stream)?;
         let arrow_schema = reader.schema();
         let schema = bridge::schema(&arrow_schema)?;
-        let cache = StreamCache::try_new(Box::new(reader), arrow_schema, CacheConfig::default())?;
+        let config = CacheConfig {
+            bounding,
+            ..CacheConfig::default()
+        };
+        let cache = StreamCache::try_new(Box::new(reader), arrow_schema, config)?;
         let mut tees = self.tees();
         if tees.contains_key(name) {
             // The stream is ours by now; dropping `cache` releases it.
@@ -127,9 +149,9 @@ impl Registry {
         Ok(columns)
     }
 
-    fn get(&self, name: &str) -> Result<Tee, BoxError> {
+    fn get(&self, function: &str, name: &str) -> Result<Tee, BoxError> {
         self.tees().get(name).cloned().ok_or_else(|| {
-            format!("tee_scan: no tee named '{name}'; register it with tee_register").into()
+            format!("{function}: no tee named '{name}'; register it with tee_register").into()
         })
     }
 
@@ -179,6 +201,26 @@ struct RegisterBind {
     registry: Registry,
     name: String,
     ptr: u64,
+    bounding: Bounding,
+}
+
+/// The `bounding` named parameter: `'sealed'` (the default) or
+/// `'unbounded'`.  Checked at bind time, before the stream is taken.
+fn bounding_parameter(bind: &BindInfo) -> Result<Bounding, BoxError> {
+    let Some(value) = bind.get_named_parameter("bounding") else {
+        return Ok(Bounding::Sealed);
+    };
+    let text = if value.is_null() {
+        "NULL".to_owned()
+    } else {
+        value.to_string()
+    };
+    match text.parse::<Bounding>() {
+        Ok(bounding @ (Bounding::Sealed | Bounding::Unbounded)) => Ok(bounding),
+        _ => Err(
+            format!("tee_register: bounding must be 'sealed' or 'unbounded', not {text:?}").into(),
+        ),
+    }
 }
 
 impl VTab for TeeRegister {
@@ -195,6 +237,7 @@ impl VTab for TeeRegister {
             registry: Registry::of(bind),
             name: name_parameter(bind, "tee_register")?,
             ptr: parameter(bind, "tee_register", 1, "stream_ptr")?.to_uint64(),
+            bounding: bounding_parameter(bind)?,
         })
     }
 
@@ -212,7 +255,7 @@ impl VTab for TeeRegister {
         }
         let bind = func.get_bind_data();
         // Ownership is taken here, at execution, never in `bind`.
-        let columns = bind.registry.add(&bind.name, bind.ptr)?;
+        let columns = bind.registry.add(&bind.name, bind.ptr, bind.bounding)?;
         output.flat_vector(0).insert(0, bind.name.as_str());
         // SAFETY: column 1 is UBIGINT and the chunk holds at least one row.
         unsafe { output.flat_vector(1).as_mut_slice::<u64>()[0] = columns as u64 };
@@ -225,6 +268,10 @@ impl VTab for TeeRegister {
             varchar(),
             LogicalTypeHandle::from(LogicalTypeId::UBigint),
         ])
+    }
+
+    fn named_parameters() -> Option<Vec<(String, LogicalTypeHandle)>> {
+        Some(vec![("bounding".into(), varchar())])
     }
 }
 
@@ -405,20 +452,75 @@ fn decode_dictionaries(batch: RecordBatch) -> Result<RecordBatch, BoxError> {
     )?)
 }
 
+/// Bind data of one `tee_scan`: the tee, and the reader reserved for this
+/// scan.  The reservation is made at bind time, so a sealed cache knows every
+/// scan of the query before any of them reads.  Dropping the bind data (a
+/// pruned scan, an `EXPLAIN`, DuckDB's planning pass) drops an unclaimed
+/// reservation, which then stops holding eviction back.
+struct ScanBind {
+    name: String,
+    tee: Tee,
+    reserved: Mutex<Option<StreamCacheReader>>,
+}
+
+impl ScanBind {
+    /// A from-start reader of the cache, or the error to show for a scan
+    /// that a sealed tee can no longer serve.
+    fn new_reader(&self) -> Result<StreamCacheReader, BoxError> {
+        self.tee.cache.reader(true).map_err(|e| match e {
+            // Only eviction makes a from-start reader impossible here; any
+            // other refusal (a closed cache) keeps its own message.
+            CacheError::InvalidArgumentError(msg)
+                if self.tee.cache.evicted_count().is_ok_and(|n| n > 0) =>
+            {
+                format!(
+                    "tee_scan: cannot read tee '{}' from the start: {msg}. A sealed tee \
+                 serves the scans of one query; it cannot be read again by a later \
+                 query, a re-executed prepared statement or a recursive CTE. \
+                 Register a new stream with tee_register for each query, or \
+                 register it with bounding := 'unbounded'",
+                    self.name
+                )
+                .into()
+            }
+            other => other.into(),
+        })
+    }
+
+    /// The reservation made at bind time, or a new reader when DuckDB
+    /// initialises this scan again (a recursive CTE re-reads its recursive
+    /// term once per iteration).
+    fn take_reader(&self) -> Result<StreamCacheReader, BoxError> {
+        let reserved = self
+            .reserved
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        reserved.map_or_else(|| self.new_reader(), Ok)
+    }
+}
+
 struct ScanInit {
     cursor: Mutex<Cursor>,
 }
 
 impl VTab for TeeScan {
     type InitData = ScanInit;
-    type BindData = Tee;
+    type BindData = ScanBind;
 
     fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn Error>> {
-        let tee = Registry::of(bind).get(&name_parameter(bind, "tee_scan")?)?;
+        let name = name_parameter(bind, "tee_scan")?;
+        let tee = Registry::of(bind).get("tee_scan", &name)?;
         for field in tee.schema.fields() {
             bind.add_result_column(field.name(), to_duckdb_logical_type_for_field(field)?);
         }
-        Ok(tee)
+        let scan = ScanBind {
+            name,
+            tee,
+            reserved: Mutex::new(None),
+        };
+        *scan.reserved.lock().unwrap_or_else(PoisonError::into_inner) = Some(scan.new_reader()?);
+        Ok(scan)
     }
 
     fn init(init: &InitInfo) -> Result<Self::InitData, Box<dyn Error>> {
@@ -426,7 +528,7 @@ impl VTab for TeeScan {
         init.set_max_threads(1);
         // SAFETY: DuckDB hands init the bind data `bind` returned, which
         // outlives this call.
-        let tee = unsafe { &*init.get_bind_data::<Tee>() };
+        let scan = unsafe { &*init.get_bind_data::<ScanBind>() };
         // SAFETY: a plain getter of DuckDB's compile-time vector size.
         let vector_size = usize::try_from(unsafe { duckdb::ffi::duckdb_vector_size() })?;
         if vector_size == 0 {
@@ -434,7 +536,7 @@ impl VTab for TeeScan {
         }
         Ok(ScanInit {
             cursor: Mutex::new(Cursor {
-                reader: tee.cache.reader(true)?,
+                reader: scan.take_reader()?,
                 vector_size,
                 current: None,
             }),
@@ -454,6 +556,58 @@ impl VTab for TeeScan {
             Some(slice) => record_batch_to_duckdb_data_chunk(&slice, output)?,
             None => output.set_len(0),
         }
+        Ok(())
+    }
+
+    fn parameters() -> Option<Vec<LogicalTypeHandle>> {
+        Some(vec![varchar()])
+    }
+}
+
+// ── tee_stats ───────────────────────────────────────────────────────────────
+
+struct TeeStats;
+
+impl VTab for TeeStats {
+    type InitData = Once;
+    type BindData = Tee;
+
+    fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn Error>> {
+        bind.add_result_column("ingested", LogicalTypeHandle::from(LogicalTypeId::UBigint));
+        bind.add_result_column("evicted", LogicalTypeHandle::from(LogicalTypeId::UBigint));
+        bind.add_result_column("sealed", LogicalTypeHandle::from(LogicalTypeId::Boolean));
+        Registry::of(bind).get("tee_stats", &name_parameter(bind, "tee_stats")?)
+    }
+
+    fn init(_: &InitInfo) -> Result<Self::InitData, Box<dyn Error>> {
+        Ok(Once::default())
+    }
+
+    fn func(
+        func: &TableFunctionInfo<Self>,
+        output: &mut DataChunkHandle,
+    ) -> Result<(), Box<dyn Error>> {
+        if !func.get_init_data().first() {
+            output.set_len(0);
+            return Ok(());
+        }
+        let cache = &func.get_bind_data().cache;
+        // Each count takes the lock on its own while scans may run.  All
+        // three only grow, so reading evicted, then ingested, then sealed
+        // keeps evicted <= ingested and sealed set whenever evicted > 0.
+        let evicted = cache.evicted_count()?;
+        let ingested = cache.ingested_count()?;
+        let sealed = cache.is_sealed()?;
+        let counts = [ingested, evicted];
+        // SAFETY: columns 0 and 1 are UBIGINT, column 2 is BOOLEAN, and the
+        // chunk holds at least one row.
+        unsafe {
+            for (column, count) in counts.into_iter().enumerate() {
+                output.flat_vector(column).as_mut_slice::<u64>()[0] = count;
+            }
+            output.flat_vector(2).as_mut_slice::<bool>()[0] = sealed;
+        }
+        output.set_len(1);
         Ok(())
     }
 
