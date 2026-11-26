@@ -1,0 +1,24 @@
+[package]
+name = "batchcorder-duckdb"
+version = "0.1.0"
+edition = "2024"
+description = "DuckDB table functions that tee one read-once Arrow stream to every scan in a query"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+# Pinned exactly: the VTab trait and the loadable-extension macros change
+# between duckdb-rs releases.  1.20001.0 bundles DuckDB v2.0.1 and uses
+# arrow 60 (the workspace is on 59; batches cross through the C Data
+# Interface).
+duckdb = { version = "=1.20001.0", default-features = false, features = [
+  "vtab-arrow",
+] }
+
+[dev-dependencies]
+# In-process tests need a DuckDB to link against; `bundled` compiles it from
+# source.  Never combine with `loadable-extension` in one feature resolve.
+duckdb = { version = "=1.20001.0", default-features = false, features = [
+  "vtab-arrow",
+  "bundled",
+] }
