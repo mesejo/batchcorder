@@ -65,7 +65,7 @@ def test_functions_are_registered(con: duckdb.DuckDBPyConnection) -> None:
     names = {
         row[0]
         for row in con.execute(
-            "SELECT function_name FROM duckdb_functions() WHERE function_name LIKE 'tee_%'"
+            "SELECT function_name FROM duckdb_functions() WHERE starts_with(function_name, 'tee_')"
         ).fetchall()
     }
     assert names == {"tee_register", "tee_scan", "tee_drop", "tee_stats"}

@@ -107,16 +107,20 @@ def main() -> None:
         )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     tmp = args.output.with_suffix(".tmp")
-    shutil.copyfile(args.library, tmp)
-    with tmp.open("ab") as out:
-        out.write(
-            footer(
-                platform=args.platform,
-                duckdb_version=args.duckdb_version,
-                extension_version=args.extension_version,
+    try:
+        shutil.copyfile(args.library, tmp)
+        with tmp.open("ab") as out:
+            out.write(
+                footer(
+                    platform=args.platform,
+                    duckdb_version=args.duckdb_version,
+                    extension_version=args.extension_version,
+                )
             )
-        )
-    tmp.replace(args.output)
+        tmp.replace(args.output)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
     print(f"wrote {args.output}")
 
 
