@@ -8,7 +8,9 @@
 #                                     wheel (its own pyproject.toml)
 #   crates/batchcorder-duckdb         DuckDB table functions (duckdb-rs);
 #                                     NOT a default member, see below
-# All but batchcorder-duckdb are default members, so a bare `cargo test` /
+#   crates/batchcorder-duckdb-ext     the DuckDB loadable extension;
+#                                     NOT a default member, see below
+# All but the two DuckDB crates are default members, so a bare `cargo test` /
 # `cargo clippy` at the root covers them.  The `batchcorder` extension does
 # not depend on DataFusion, so its wheel does not pull DataFusion in.
 [workspace]
@@ -22,10 +24,13 @@ members = [
   "crates/batchcorder-datafusion",
   "crates/batchcorder-datafusion-py",
   "crates/batchcorder-duckdb",
+  "crates/batchcorder-duckdb-ext",
 ]
-# batchcorder-duckdb is left out: its tests compile DuckDB from source
-# (duckdb/bundled), and a later loadable-extension crate must never share a
-# feature resolve with them.  Build and test it with `-p batchcorder-duckdb`.
+# The DuckDB crates are left out: batchcorder-duckdb's tests compile DuckDB
+# from source (duckdb/bundled), and batchcorder-duckdb-ext's
+# loadable-extension feature must never share a feature resolve with them.
+# Test the first with `-p batchcorder-duckdb`; build the second alone with
+# `make duckdb-ext`.
 default-members = [
   "crates/batchcorder-py",
   "crates/batchcorder-core",
