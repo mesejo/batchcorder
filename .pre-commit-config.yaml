@@ -100,6 +100,17 @@ repos:
         files: ^crates/batchcorder-duckdb/
         types: [file, rust]
 
+      # A separate cargo run: the extension's loadable-extension feature must
+      # not share a feature resolve with the hook above.
+      - id: rust-clippy-duckdb-ext
+        name: Rust clippy (batchcorder-duckdb-ext)
+        description: Run cargo clippy on the DuckDB loadable extension — deny all warnings.
+        entry: cargo clippy -p batchcorder-duckdb-ext -- -Dclippy::all -D warnings -Aclippy::redundant_closure
+        language: system
+        pass_filenames: false
+        files: ^crates/batchcorder-duckdb(-ext)?/
+        types: [file, rust]
+
       # batchcorder only; [tool.pyright] in pyproject.toml excludes the
       # datafusion crate, which pyright-datafusion checks with its own config.
       - id: pyright

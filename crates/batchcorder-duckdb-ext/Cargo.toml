@@ -1,0 +1,24 @@
+[package]
+name = "batchcorder-duckdb-ext"
+version = "0.1.0"
+edition = "2024"
+description = "The batchcorder DuckDB loadable extension (tee_register, tee_scan, tee_drop, tee_stats)"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+name = "batchcorder_duckdb_ext"
+crate-type = ["cdylib"]
+
+[dependencies]
+batchcorder-duckdb = { path = "../batchcorder-duckdb" }
+# loadable-extension: DuckDB is not linked; the C API comes from the host
+# through the function-pointer struct handed to the entrypoint.  It must
+# never share a feature resolve with `bundled` (the in-process tests of
+# batchcorder-duckdb), so build this crate on its own: `make duckdb-ext`.
+duckdb = { version = "=1.20001.0", default-features = false, features = [
+  "loadable-extension",
+] }
+
+[lints]
+workspace = true
