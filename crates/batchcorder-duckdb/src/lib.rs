@@ -29,7 +29,7 @@
 //! can be scanned any number of times.
 //!
 //! The registry is per database: each [`register`] call creates one, shared
-//! by the three functions it adds and freed with the database.
+//! by the four functions it adds and freed with the database.
 //!
 //! # Stream ownership
 //!
@@ -468,15 +468,21 @@ impl ScanBind {
     /// that a sealed tee can no longer serve.
     fn new_reader(&self) -> Result<StreamCacheReader, BoxError> {
         self.tee.cache.reader(true).map_err(|e| match e {
-            CacheError::InvalidArgumentError(msg) => format!(
-                "tee_scan: cannot read tee '{}' from the start: {msg}. A sealed tee \
+            // Only eviction makes a from-start reader impossible here; any
+            // other refusal (a closed cache) keeps its own message.
+            CacheError::InvalidArgumentError(msg)
+                if self.tee.cache.evicted_count().is_ok_and(|n| n > 0) =>
+            {
+                format!(
+                    "tee_scan: cannot read tee '{}' from the start: {msg}. A sealed tee \
                  serves the scans of one query; it cannot be read again by a later \
                  query, a re-executed prepared statement or a recursive CTE. \
                  Register a new stream with tee_register for each query, or \
                  register it with bounding := 'unbounded'",
-                self.name
-            )
-            .into(),
+                    self.name
+                )
+                .into()
+            }
             other => other.into(),
         })
     }
@@ -586,8 +592,13 @@ impl VTab for TeeStats {
             return Ok(());
         }
         let cache = &func.get_bind_data().cache;
-        let counts = [cache.ingested_count()?, cache.evicted_count()?];
+        // Each count takes the lock on its own while scans may run.  All
+        // three only grow, so reading evicted, then ingested, then sealed
+        // keeps evicted <= ingested and sealed set whenever evicted > 0.
+        let evicted = cache.evicted_count()?;
+        let ingested = cache.ingested_count()?;
         let sealed = cache.is_sealed()?;
+        let counts = [ingested, evicted];
         // SAFETY: columns 0 and 1 are UBIGINT, column 2 is BOOLEAN, and the
         // chunk holds at least one row.
         unsafe {

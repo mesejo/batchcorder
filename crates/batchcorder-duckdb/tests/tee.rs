@@ -1,5 +1,5 @@
-//! End-to-end tests of `tee_register` / `tee_scan` / `tee_drop` against an
-//! in-process DuckDB.
+//! End-to-end tests of `tee_register` / `tee_scan` / `tee_drop` /
+//! `tee_stats` against an in-process DuckDB.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -438,7 +438,14 @@ fn prepared_statement_executed_twice() {
         let first: i64 = stmt.query_row([], |r| r.get(0)).expect("first execution");
         assert_eq!(first, 10_000, "{bounding}");
         let second = stmt.query_row([], |r| r.get::<_, i64>(0));
-        assert_eq!(second.is_ok(), second_ok, "{bounding}: {second:?}");
+        match second {
+            Ok(n) => assert!(second_ok && n == 10_000, "{bounding}: {n}"),
+            Err(e) => {
+                let err = e.to_string();
+                assert!(!second_ok, "{bounding}: {err}");
+                assert!(err.contains("cannot read tee 't' from the start"), "{err}");
+            }
+        }
     }
 }
 
