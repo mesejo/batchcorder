@@ -98,3 +98,5 @@ coverage.lcov
 
 # Personal scratch notes and plans
 .scratch/
+# roborev snapshots
+/.roborev/
