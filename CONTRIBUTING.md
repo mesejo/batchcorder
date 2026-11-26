@@ -80,10 +80,16 @@ uv run pytest tests/test_module.py
 # batchcorder-datafusion wheel; see Setup Commands.  Without the group,
 # collection fails with `ModuleNotFoundError: No module named 'datafusion'`.
 uv run pytest crates/batchcorder-datafusion-py/tests
+
+# Run the DuckDB extension tests.  Neither DuckDB crate is a default member:
+# the first compiles DuckDB from source (slow the first time), the second
+# builds the .duckdb_extension and LOADs it into several DuckDB versions.
+cargo test -p batchcorder-duckdb -- --include-ignored
+make test-duckdb-ext
 ```
 
 CI runs each package's tests and lint only when a pull request touches that
-package, or code both share (`crates/batchcorder-core`,
+package (the DuckDB extension counts as one), or code they share (`crates/batchcorder-core`,
 `crates/batchcorder-pyo3`, the lock files, the workspace configuration); see
 the `changes` job in `.github/workflows/ci.yaml`.  The `ci-ok` job sums up the
 result.
