@@ -1,6 +1,6 @@
 name: ci
 
-# One workflow for both packages.  The `changes` job decides which package's
+# One workflow for every package.  The `changes` job decides which package's
 # jobs run on a pull request; `ci-ok` aggregates every job and is the only
 # check branch protection needs.  Per-workflow `paths:` filters are not used:
 # a required workflow that is skipped leaves its check pending forever.
@@ -36,6 +36,7 @@ jobs:
     outputs:
       batchcorder: ${{ github.event_name != 'pull_request' || steps.filter.outputs.batchcorder == 'true' }}
       datafusion: ${{ github.event_name != 'pull_request' || steps.filter.outputs.datafusion == 'true' }}
+      duckdb: ${{ github.event_name != 'pull_request' || steps.filter.outputs.duckdb == 'true' }}
     steps:
       - uses: dorny/paths-filter@v3
         id: filter
@@ -67,14 +68,21 @@ jobs:
               - *shared
               - "crates/batchcorder-datafusion/**"
               - "crates/batchcorder-datafusion-py/**"
+            duckdb:
+              - *shared
+              - "crates/batchcorder-duckdb/**"
+              - "crates/batchcorder-duckdb-ext/**"
+              - "scripts/duckdb_ext/**"
+              - "Makefile"
 
   # Hooks that need no compiled extension.  Always runs.
   lint-common:
     runs-on: ubuntu-latest
     env:
       UV_NO_SYNC: "1"
-      # Run by lint-batchcorder / lint-datafusion, which build the extensions.
-      SKIP: rust-clippy,pyright,pyright-datafusion,griffe,mypy-stubtest,mypy-stubtest-datafusion
+      # Run by lint-batchcorder / lint-datafusion, which build the extensions,
+      # and by duckdb, which lints the DuckDB crates itself.
+      SKIP: rust-clippy,rust-clippy-duckdb,rust-clippy-duckdb-ext,pyright,pyright-datafusion,griffe,mypy-stubtest,mypy-stubtest-datafusion
     steps:
       - uses: actions/checkout@v4
 
@@ -411,6 +419,72 @@ jobs:
           uv run pre-commit run --all-files pyright-datafusion
           uv run pre-commit run --all-files mypy-stubtest-datafusion
 
+  # The DuckDB extension: lint, in-process tests (bundled DuckDB, including
+  # the ignored probes of DuckDB's table-function lifecycle, so a DuckDB
+  # upgrade that changes it fails here), then the loadable artifact, loaded
+  # into every DuckDB in DUCKDB_TEST_VERSIONS.  Linux only; nothing is
+  # published, the artifact is only uploaded to the run.
+  duckdb:
+    needs: changes
+    if: needs.changes.outputs.duckdb == 'true'
+    runs-on: ubuntu-latest
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Update Rust stable
+        run: rustup update stable
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      # Also keeps the bundled DuckDB C++ build, which sccache does not see.
+      - name: Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            ./target/
+          key: cargo-${{ github.job }}-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock') }}
+          restore-keys: cargo-${{ github.job }}-
+
+      # Two cargo runs, never one: the extension's loadable-extension feature
+      # must not share a feature resolve with the bundled test DuckDB.
+      - name: Clippy (batchcorder-duckdb)
+        run: >-
+          cargo clippy -p batchcorder-duckdb --all-targets --
+          -Dclippy::all -D warnings -Aclippy::redundant_closure
+
+      - name: Clippy (batchcorder-duckdb-ext)
+        run: >-
+          cargo clippy -p batchcorder-duckdb-ext --
+          -Dclippy::all -D warnings -Aclippy::redundant_closure
+
+      - name: Test in-process, with the DuckDB lifecycle probes
+        run: cargo test -p batchcorder-duckdb -- --include-ignored
+
+      - name: Build the extension and LOAD it into each supported DuckDB
+        run: make test-duckdb-ext
+
+      - name: Upload the extension
+        uses: actions/upload-artifact@v4
+        with:
+          name: batchcorder-duckdb-extension-linux_amd64
+          path: target/duckdb-extension/batchcorder.duckdb_extension
+          if-no-files-found: error
+
   # The single required status check.  Skipped jobs (package not changed)
   # count as success; failed or cancelled ones fail it.
   ci-ok:
@@ -422,6 +496,7 @@ jobs:
       - lint-batchcorder
       - test-datafusion
       - lint-datafusion
+      - duckdb
     runs-on: ubuntu-latest
     steps:
       - name: Check needed jobs
