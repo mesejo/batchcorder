@@ -1,7 +1,8 @@
 //! Probes of DuckDB's C-API table-function lifecycle.
 //!
-//! A counting table function, `probe()`, logs every `bind`, `init`, scan call
-//! and bind-data drop, tagged with the id of the bind that produced it.  Each
+//! A counting table function, `probe()`, logs every `bind`, `init`, emitted
+//! chunk (`Func`; the final empty call that ends a scan is not logged) and
+//! bind-data drop, tagged with the id of the bind that produced it.  Each
 //! probe runs one query shape and asserts the counts DuckDB 2.0.1 (bundled by
 //! duckdb-rs 1.20001.0) was observed to produce.  They pin the facts the tee
 //! design relies on, so a DuckDB upgrade that changes them fails here first.
@@ -31,6 +32,7 @@ const ROWS: u64 = CHUNK * CHUNKS;
 enum Event {
     Bind(u64),
     Init(u64),
+    /// A scan call that emitted a non-empty chunk.
     Func(u64),
     Drop(u64),
 }
