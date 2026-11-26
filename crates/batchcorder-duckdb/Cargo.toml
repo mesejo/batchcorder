@@ -7,10 +7,16 @@ license = "Apache-2.0"
 publish = false
 
 [dependencies]
+batchcorder-core = { path = "../batchcorder-core" }
+# The cache speaks the workspace's arrow (59); `ffi` is for the
+# ArrowArrayStream handed over by `tee_register` and for the bridge to the
+# arrow that duckdb-rs uses.
+arrow-array = { workspace = true, features = ["ffi"] }
+arrow-schema = { workspace = true }
 # Pinned exactly: the VTab trait and the loadable-extension macros change
 # between duckdb-rs releases.  1.20001.0 bundles DuckDB v2.0.1 and uses
-# arrow 60 (the workspace is on 59; batches cross through the C Data
-# Interface).
+# arrow 60 (re-exported as `duckdb::arrow`); batches cross from 59 through
+# the Arrow C Data Interface, see `bridge`.
 duckdb = { version = "=1.20001.0", default-features = false, features = [
   "vtab-arrow",
 ] }
@@ -22,3 +28,6 @@ duckdb = { version = "=1.20001.0", default-features = false, features = [
   "vtab-arrow",
   "bundled",
 ] }
+
+[lints]
+workspace = true

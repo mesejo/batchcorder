@@ -584,6 +584,9 @@ dependencies = [
 name = "batchcorder-duckdb"
 version = "0.1.0"
 dependencies = [
+ "arrow-array 59.3.2",
+ "arrow-schema 59.3.2",
+ "batchcorder-core",
  "duckdb",
 ]
 
