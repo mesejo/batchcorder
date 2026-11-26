@@ -43,21 +43,17 @@ use arrow_array::RecordBatchReader as _;
 use arrow_array::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use batchcorder_core::{CacheConfig, StreamCache, StreamCacheReader};
 use duckdb::Connection;
-use duckdb::arrow::array::{ArrayRef, RecordBatch};
+use duckdb::arrow::array::{ArrayRef, MutableArrayData, RecordBatch, make_array};
 use duckdb::arrow::compute::cast;
-use duckdb::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use duckdb::arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef};
 use duckdb::arrow::error::ArrowError;
 use duckdb::core::{DataChunkHandle, Inserter, LogicalTypeHandle, LogicalTypeId};
 use duckdb::vtab::{
-    BindInfo, InitInfo, TableFunctionInfo, VTab, record_batch_to_duckdb_data_chunk,
+    BindInfo, InitInfo, TableFunctionInfo, VTab, Value, record_batch_to_duckdb_data_chunk,
     to_duckdb_logical_type_for_field,
 };
 
 use crate::bridge::BoxError;
-
-/// Rows DuckDB accepts per output chunk (its standard vector size).  Cached
-/// batches larger than this are emitted in slices.
-const VECTOR_SIZE: usize = 2048;
 
 /// Add `tee_register`, `tee_scan` and `tee_drop` to `con`'s database, with a
 /// fresh registry of tees.
@@ -97,7 +93,11 @@ impl Registry {
     /// Take ownership of the stream at `ptr` and store it under `name`.
     /// Returns the number of columns.
     fn add(&self, name: &str, ptr: u64) -> Result<usize, BoxError> {
-        let raw = ptr as *mut FFI_ArrowArrayStream;
+        // A u64 wider than a pointer cannot be an address on this platform;
+        // truncating it would point somewhere else entirely.
+        let raw = usize::try_from(ptr)
+            .map_err(|_| format!("tee_register: stream_ptr {ptr:#x} is not an address"))?
+            as *mut FFI_ArrowArrayStream;
         if raw.is_null() {
             return Err("tee_register: stream_ptr is NULL".into());
         }
@@ -142,6 +142,22 @@ fn varchar() -> LogicalTypeHandle {
     LogicalTypeHandle::from(LogicalTypeId::Varchar)
 }
 
+/// Parameter `index` of `function`, which must not be NULL.  Reading a NULL
+/// value as VARCHAR or UBIGINT throws a C++ exception that aborts the
+/// process, so NULL is rejected before any conversion.
+fn parameter(bind: &BindInfo, function: &str, index: u64, what: &str) -> Result<Value, BoxError> {
+    let value = bind.get_parameter(index);
+    if value.is_null() {
+        return Err(format!("{function}: {what} is NULL").into());
+    }
+    Ok(value)
+}
+
+/// The tee name, parameter 0 of every function.
+fn name_parameter(bind: &BindInfo, function: &str) -> Result<String, BoxError> {
+    Ok(parameter(bind, function, 0, "name")?.to_string())
+}
+
 /// Init data of a function that emits one row and then stops.
 #[derive(Default)]
 struct Once {
@@ -177,8 +193,8 @@ impl VTab for TeeRegister {
         );
         Ok(RegisterBind {
             registry: Registry::of(bind),
-            name: bind.get_parameter(0).to_string(),
-            ptr: bind.get_parameter(1).to_uint64(),
+            name: name_parameter(bind, "tee_register")?,
+            ptr: parameter(bind, "tee_register", 1, "stream_ptr")?.to_uint64(),
         })
     }
 
@@ -230,7 +246,7 @@ impl VTab for TeeDrop {
         bind.add_result_column("dropped", LogicalTypeHandle::from(LogicalTypeId::Boolean));
         Ok(DropBind {
             registry: Registry::of(bind),
-            name: bind.get_parameter(0).to_string(),
+            name: name_parameter(bind, "tee_drop")?,
         })
     }
 
@@ -267,20 +283,26 @@ struct TeeScan;
 /// Where one scan is in the stream.
 struct Cursor {
     reader: StreamCacheReader,
+    /// Rows per output chunk: DuckDB's vector size.
+    vector_size: usize,
     /// The batch being emitted, and how many of its rows are out already.
     current: Option<(RecordBatch, usize)>,
 }
 
 impl Cursor {
-    /// The next slice of at most [`VECTOR_SIZE`] rows, or `None` at the end
-    /// of the stream.
+    /// The next slice of at most `vector_size` rows, or `None` at the end of
+    /// the stream.
     fn next_slice(&mut self) -> Result<Option<RecordBatch>, BoxError> {
         loop {
             if let Some((batch, offset)) = &mut self.current
                 && *offset < batch.num_rows()
             {
-                let len = VECTOR_SIZE.min(batch.num_rows() - *offset);
-                let slice = batch.slice(*offset, len);
+                let len = self.vector_size.min(batch.num_rows() - *offset);
+                let slice = if len == batch.num_rows() {
+                    batch.clone()
+                } else {
+                    compact_nested(&batch.slice(*offset, len))?
+                };
                 *offset += len;
                 return Ok(Some(slice));
             }
@@ -292,15 +314,73 @@ impl Cursor {
     }
 }
 
-/// `batch` with each top-level dictionary column decoded to its value type.
-/// duckdb-rs binds a dictionary column as its value type but cannot write
+/// `slice` with its nested columns copied into arrays of their own.
+///
+/// duckdb-rs writes a list (or map) column by copying its whole child array
+/// and pointing each row at its offsets.  A slice keeps the parent's child
+/// array, so without this every chunk of a large batch would copy the child
+/// values of the entire batch: quadratic in the batch's length.
+fn compact_nested(slice: &RecordBatch) -> Result<RecordBatch, BoxError> {
+    if !slice
+        .schema()
+        .fields()
+        .iter()
+        .any(|f| f.data_type().is_nested())
+    {
+        return Ok(slice.clone());
+    }
+    let columns = slice
+        .columns()
+        .iter()
+        .map(|column| {
+            if !column.data_type().is_nested() {
+                return Ok(column.clone());
+            }
+            let data = column.to_data();
+            let mut copy = MutableArrayData::new(vec![&data], false, column.len());
+            copy.try_extend(0, 0, column.len())?;
+            Ok(make_array(copy.freeze()))
+        })
+        .collect::<Result<Vec<_>, ArrowError>>()?;
+    Ok(RecordBatch::try_new(slice.schema(), columns)?)
+}
+
+/// `data_type` with every dictionary, at any depth, replaced by its value
+/// type.
+fn without_dictionaries(data_type: &DataType) -> DataType {
+    let field = |f: &FieldRef| {
+        Arc::new(
+            f.as_ref()
+                .clone()
+                .with_data_type(without_dictionaries(f.data_type())),
+        )
+    };
+    match data_type {
+        DataType::Dictionary(_, value) => without_dictionaries(value),
+        DataType::List(f) => DataType::List(field(f)),
+        DataType::LargeList(f) => DataType::LargeList(field(f)),
+        DataType::FixedSizeList(f, n) => DataType::FixedSizeList(field(f), *n),
+        DataType::Map(f, sorted) => DataType::Map(field(f), *sorted),
+        DataType::Struct(fields) => DataType::Struct(fields.iter().map(field).collect()),
+        other => other.clone(),
+    }
+}
+
+/// `batch` with every dictionary, top-level or nested, decoded to its value
+/// type.  duckdb-rs binds a dictionary as its value type but cannot write
 /// dictionary arrays into a chunk.
 fn decode_dictionaries(batch: RecordBatch) -> Result<RecordBatch, BoxError> {
     let schema = batch.schema();
-    if !schema
+    let decoded: Vec<DataType> = schema
         .fields()
         .iter()
-        .any(|f| matches!(f.data_type(), DataType::Dictionary(..)))
+        .map(|f| without_dictionaries(f.data_type()))
+        .collect();
+    if schema
+        .fields()
+        .iter()
+        .zip(&decoded)
+        .all(|(f, d)| f.data_type() == d)
     {
         return Ok(batch);
     }
@@ -308,15 +388,13 @@ fn decode_dictionaries(batch: RecordBatch) -> Result<RecordBatch, BoxError> {
         .fields()
         .iter()
         .zip(batch.columns())
-        .map(|(field, column)| match field.data_type() {
-            DataType::Dictionary(_, value) => Ok((
-                field
-                    .as_ref()
-                    .clone()
-                    .with_data_type(value.as_ref().clone()),
-                cast(column, value)?,
-            )),
-            _ => Ok((field.as_ref().clone(), column.clone())),
+        .zip(decoded)
+        .map(|((field, column), data_type)| {
+            if field.data_type() == &data_type {
+                return Ok((field.as_ref().clone(), column.clone()));
+            }
+            let column = cast(column, &data_type)?;
+            Ok((field.as_ref().clone().with_data_type(data_type), column))
         })
         .collect::<Result<Vec<_>, ArrowError>>()?
         .into_iter()
@@ -336,7 +414,7 @@ impl VTab for TeeScan {
     type BindData = Tee;
 
     fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn Error>> {
-        let tee = Registry::of(bind).get(&bind.get_parameter(0).to_string())?;
+        let tee = Registry::of(bind).get(&name_parameter(bind, "tee_scan")?)?;
         for field in tee.schema.fields() {
             bind.add_result_column(field.name(), to_duckdb_logical_type_for_field(field)?);
         }
@@ -349,9 +427,15 @@ impl VTab for TeeScan {
         // SAFETY: DuckDB hands init the bind data `bind` returned, which
         // outlives this call.
         let tee = unsafe { &*init.get_bind_data::<Tee>() };
+        // SAFETY: a plain getter of DuckDB's compile-time vector size.
+        let vector_size = usize::try_from(unsafe { duckdb::ffi::duckdb_vector_size() })?;
+        if vector_size == 0 {
+            return Err("tee_scan: DuckDB reports a vector size of 0".into());
+        }
         Ok(ScanInit {
             cursor: Mutex::new(Cursor {
                 reader: tee.cache.reader(true)?,
+                vector_size,
                 current: None,
             }),
         })

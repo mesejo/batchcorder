@@ -113,7 +113,7 @@ fn self_join_reads_upstream_once() {
 }
 
 #[test]
-fn batch_larger_than_a_vector_is_emitted_whole() {
+fn batch_larger_than_a_vector_is_emitted_in_slices() {
     let con = connect();
     let mut upstream = Upstream::new(id_batches(1, 5000));
     register(&con, "t", &mut upstream);
@@ -219,4 +219,90 @@ fn bridge_carries_primitive_nested_and_dictionary_columns() {
             ),
         ]
     );
+}
+
+#[test]
+fn tee_register_rejects_a_duplicate_name() {
+    let con = connect();
+    let mut first = Upstream::new(id_batches(1, 10));
+    register(&con, "t", &mut first);
+    let mut second = Upstream::new(id_batches(1, 10));
+    let sql = format!("CALL tee_register('t', {}::UBIGINT)", second.ptr());
+    let err = con.execute_batch(&sql).expect_err("duplicate name");
+    assert!(err.to_string().contains("already exists"), "{err}");
+    assert!(
+        second.stream.release.is_none(),
+        "the stream is taken even when registration fails"
+    );
+}
+
+#[test]
+fn tee_register_rejects_a_null_or_consumed_stream() {
+    let con = connect();
+    let err = con
+        .execute_batch("CALL tee_register('t', 0::UBIGINT)")
+        .expect_err("NULL stream_ptr");
+    assert!(err.to_string().contains("stream_ptr is NULL"), "{err}");
+
+    let mut upstream = Upstream::new(id_batches(1, 10));
+    register(&con, "t", &mut upstream);
+    let sql = format!("CALL tee_register('u', {}::UBIGINT)", upstream.ptr());
+    let err = con.execute_batch(&sql).expect_err("consumed stream");
+    assert!(err.to_string().contains("already consumed"), "{err}");
+}
+
+#[test]
+fn null_name_is_an_error() {
+    let con = connect();
+    let mut upstream = Upstream::new(id_batches(1, 10));
+    let sql = format!("CALL tee_register(NULL, {}::UBIGINT)", upstream.ptr());
+    let err = con.execute_batch(&sql).expect_err("NULL name");
+    assert!(err.to_string().contains("name is NULL"), "{err}");
+    assert!(upstream.stream.release.is_some(), "the stream is not taken");
+    for sql in ["SELECT * FROM tee_scan(NULL)", "CALL tee_drop(NULL)"] {
+        let err = con.execute_batch(sql).expect_err(sql);
+        assert!(err.to_string().contains("name is NULL"), "{sql}: {err}");
+    }
+}
+
+/// List and dictionary columns nested in a batch larger than a vector: each
+/// chunk carries its own rows' list values, and nested dictionaries are
+/// decoded.
+#[test]
+fn nested_columns_in_a_batch_larger_than_a_vector() {
+    let total = 5000;
+    let mut list = ListBuilder::new(Int32Builder::new());
+    let mut dicts = ListBuilder::new(StringDictionaryBuilder::<Int32Type>::new());
+    for i in 0..total {
+        list.append_value([Some(i), Some(i + 1)]);
+        dicts
+            .values()
+            .append_value(if i % 2 == 0 { "even" } else { "odd" });
+        dicts.append(true);
+    }
+    let columns: Vec<(&str, ArrayRef)> = vec![
+        ("i", Arc::new(Int32Array::from_iter_values(0..total))),
+        ("l", Arc::new(list.finish())),
+        ("d", Arc::new(dicts.finish())),
+    ];
+    let batch = RecordBatch::try_from_iter(columns).expect("batch");
+
+    let con = connect();
+    let mut upstream = Upstream::new(vec![batch]);
+    register(&con, "t", &mut upstream);
+
+    let bad: i64 = con
+        .query_row(
+            "SELECT count(*) FROM tee_scan('t') \
+             WHERE l <> [i, i + 1] \
+                OR d[1] <> CASE WHEN i % 2 = 0 THEN 'even' ELSE 'odd' END",
+            [],
+            |r| r.get(0),
+        )
+        .expect("scan");
+    assert_eq!(bad, 0);
+    let count: i64 = con
+        .query_row("SELECT count(*) FROM tee_scan('t')", [], |r| r.get(0))
+        .expect("count");
+    assert_eq!(count, i64::from(total));
 }
