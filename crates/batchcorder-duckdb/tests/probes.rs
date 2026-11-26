@@ -165,11 +165,14 @@ impl Pass {
             .collect()
     }
 
+    /// Whether the bind's scan was initialised.  Keyed on `Init`, not
+    /// `Func`: a scan that emits no rows (`chunks := 0`) still logs no `Func`.
     fn scanned(&self, bind: u64) -> bool {
-        self.events.contains(&Event::Func(bind))
+        self.events.contains(&Event::Init(bind))
     }
 
-    /// Binds whose scan never ran (pruned, or the pass was not executed).
+    /// Binds whose scan was never initialised (pruned, or the pass was not
+    /// executed).
     fn unscanned(&self) -> Vec<u64> {
         self.bind_ids()
             .into_iter()
@@ -302,7 +305,9 @@ fn assert_planning_only(plan: &Pass, what: &str) {
 // ── P1: binds, inits and drops per query shape ──────────────────────────────
 //
 // One bind per table-function reference, one init per bind, one drop per
-// bind: a reader created in `bind` matches the scans exactly.
+// bind: a reader created in `bind` matches the scans exactly.  The exception
+// is a `NOT MATERIALIZED` CTE, whose extra bind is never initialised and is
+// dropped before any scan runs.
 
 #[test]
 #[ignore = "probe of DuckDB behaviour; run with --ignored"]
@@ -400,6 +405,7 @@ fn p2_limit_zero() {
     assert_eq!(exec.binds(), 1);
     assert_eq!(exec.unscanned().len(), 1);
     assert_eq!(exec.inits_per_bind(), vec![0]);
+    assert_eq!(exec.drops(), 1);
 }
 
 // ── P3: statements that bind without running, or run more than once ─────────
@@ -477,6 +483,7 @@ fn p4_correlated_subquery() {
     );
     assert_eq!(n, 5);
     assert_eq!(exec.inits_per_bind(), vec![1]);
+    assert_eq!(exec.drops(), 1);
 }
 
 // ── P5: do two single-threaded scans run side by side? ──────────────────────
