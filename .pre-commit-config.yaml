@@ -89,6 +89,17 @@ repos:
         pass_filenames: false
         types: [file, rust]
 
+      # batchcorder-duckdb is not a default member, so the hook above skips
+      # it.  Library only: its tests compile DuckDB from source (bundled).
+      - id: rust-clippy-duckdb
+        name: Rust clippy (batchcorder-duckdb)
+        description: Run cargo clippy on the batchcorder-duckdb library — deny all warnings.
+        entry: cargo clippy -p batchcorder-duckdb --lib -- -Dclippy::all -D warnings -Aclippy::redundant_closure
+        language: system
+        pass_filenames: false
+        files: ^crates/batchcorder-duckdb/
+        types: [file, rust]
+
       # batchcorder only; [tool.pyright] in pyproject.toml excludes the
       # datafusion crate, which pyright-datafusion checks with its own config.
       - id: pyright
