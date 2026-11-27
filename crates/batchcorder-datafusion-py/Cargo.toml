@@ -1,6 +1,6 @@
 [package]
 name = "batchcorder-datafusion-py"
-version = "55.0.0"
+version = "56.0.0"
 edition = "2024"
 description = "Python bindings for batchcorder-datafusion (the batchcorder-datafusion wheel)"
 license = "Apache-2.0"
@@ -23,10 +23,10 @@ arrow-pyarrow = { workspace = true }
 # The FFI structs are only compatible within one DataFusion major.  The
 # package's major version and SUPPORTED_HOSTS / DATAFUSION_MAJOR in
 # python/batchcorder_datafusion/_hosts.py must all match it.
-datafusion = { version = "55", default-features = false }
-datafusion-ffi = "55"
+datafusion = { version = "56", default-features = false }
+datafusion-ffi = "56"
 # Only for the `LogicalExtensionCodec` trait (already a datafusion-ffi dependency).
-datafusion-proto = { version = "55", default-features = false }
+datafusion-proto = { version = "56", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread"] }
 
 [lints]

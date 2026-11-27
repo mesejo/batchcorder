@@ -19,8 +19,8 @@ if TYPE_CHECKING:
 #
 # Keep this table and the compatibility table in README.md in sync.
 SUPPORTED_HOSTS: dict[str, tuple[tuple[int, ...], tuple[int, ...]]] = {
-    "datafusion": ((55,), (56,)),
-    "xorq-datafusion": ((0, 3), (0, 4)),
+    "datafusion": ((56,), (57,)),
+    "xorq-datafusion": ((0, 4), (0, 5)),
 }
 
 # Top-level Python package of each host -> its distribution.  A session class
@@ -31,7 +31,7 @@ HOST_PACKAGES: dict[str, str] = {
     "xorq_datafusion": "xorq-datafusion",
 }
 
-DATAFUSION_MAJOR = 55
+DATAFUSION_MAJOR = 56
 
 
 def _release(text: str) -> tuple[int, ...]:

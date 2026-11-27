@@ -9,7 +9,7 @@
 
 use std::sync::{Arc, LazyLock};
 
-use arrow_array::ffi_stream::ArrowArrayStreamReader;
+use arrow_array::ffi_stream::RecordBatchStreamReader;
 use arrow_pyarrow::PyArrowType;
 use arrow_schema::Schema;
 use batchcorder_core::{Bounding, StreamCache};
@@ -179,7 +179,7 @@ impl PyTeeTableProvider {
     #[pyo3(signature = (reader, *, memory_capacity = None, disk_path = None, disk_capacity = None, write_policy = "on_insertion", bounding = "sealed"))]
     fn new(
         py: Python<'_>,
-        reader: PyArrowType<ArrowArrayStreamReader>,
+        reader: PyArrowType<RecordBatchStreamReader>,
         memory_capacity: Option<usize>,
         disk_path: Option<String>,
         disk_capacity: Option<u64>,

@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use arrow_array::RecordBatch;
 use arrow_array::RecordBatchReader;
 use arrow_array::ffi::FFI_ArrowSchema;
-use arrow_array::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
+use arrow_array::ffi_stream::{FFI_ArrowArrayStream, RecordBatchStreamReader};
 use arrow_pyarrow::{IntoPyArrow, PyArrowType};
 use arrow_schema::{Schema, SchemaRef};
 use batchcorder_core::{Bounding, StreamCache, StreamCacheReader};
@@ -246,7 +246,7 @@ impl PyStreamCache {
     pub fn new(
         py: Python<'_>,
         #[gen_stub(override_type(type_repr = "typing.Any", imports = ("typing",)))]
-        reader: PyArrowType<ArrowArrayStreamReader>,
+        reader: PyArrowType<RecordBatchStreamReader>,
         memory_capacity: Option<usize>,
         disk_path: Option<String>,
         disk_capacity: Option<u64>,

@@ -16,8 +16,8 @@ not install a host: install the one you use, in a version from the
 compatibility table below.
 
 ```bash
-pip install batchcorder-datafusion "datafusion>=55,<56"        # datafusion-python
-pip install batchcorder-datafusion "xorq-datafusion>=0.3,<0.4" # xorq-datafusion
+pip install batchcorder-datafusion "datafusion>=56,<57"        # datafusion-python
+pip install batchcorder-datafusion "xorq-datafusion>=0.4,<0.5" # xorq-datafusion
 ```
 
 ## Usage
@@ -59,6 +59,7 @@ the provider and the host must be built on the same one. The major version of
 
 | batchcorder-datafusion | DataFusion | datafusion (datafusion-python) | xorq-datafusion |
 |------------------------|------------|--------------------------------|-----------------|
+| 56.x                   | 56         | `>=56,<57`                     | `>=0.4,<0.5`    |
 | 55.x                   | 55         | `>=55,<56`                     | `>=0.3,<0.4`    |
 
 Registering a `TeeTableProvider` with a host outside these ranges raises
