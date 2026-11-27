@@ -19,7 +19,7 @@ use std::path::PathBuf;
 
 use arrow_array::RecordBatch;
 use arrow_array::RecordBatchReader;
-use arrow_array::ffi_stream::ArrowArrayStreamReader;
+use arrow_array::ffi_stream::RecordBatchStreamReader;
 use arrow_schema::ArrowError;
 use batchcorder_core::{
     Bounding, CacheConfig, DiskConfig, StreamCache, Upstream, WaitHook, WritePolicy,
@@ -161,12 +161,12 @@ pub fn wait_without_gil(wait: &mut dyn FnMut()) {
 /// in Python (e.g. a pyarrow reader over a generator), so every pull holds
 /// the GIL.  Readers call `next_batch` with the GIL released, so this
 /// reacquires it rather than assuming it is held.
-pub struct PyUpstream(ArrowArrayStreamReader);
+pub struct PyUpstream(RecordBatchStreamReader);
 
 impl PyUpstream {
     /// Wrap a stream imported from Python, e.g. the `reader` argument of a
-    /// constructor taking `PyArrowType<ArrowArrayStreamReader>`.
-    pub fn new(reader: ArrowArrayStreamReader) -> Self {
+    /// constructor taking `PyArrowType<RecordBatchStreamReader>`.
+    pub fn new(reader: RecordBatchStreamReader) -> Self {
         Self(reader)
     }
 }
@@ -186,7 +186,7 @@ impl Upstream for PyUpstream {
 /// errors keep each constructor's own precedence.
 pub fn build_cache(
     py: Python<'_>,
-    reader: ArrowArrayStreamReader,
+    reader: RecordBatchStreamReader,
     memory_capacity: Option<usize>,
     disk: Option<DiskConfig>,
     write_policy: WritePolicy,
